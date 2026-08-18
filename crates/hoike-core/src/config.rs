@@ -44,6 +44,27 @@ pub struct CaConfig {
     pub issuer_key_hash: Option<String>,
     /// URL to forward nonce-bearing requests to (for nonce_policy = "forward")
     pub forward_to: Option<String>,
+    /// Revocation source (required for combined/signer mode)
+    pub source: Option<SourceConfig>,
+    /// Batch production interval in seconds (combined/signer mode)
+    #[serde(default = "default_batch_interval")]
+    pub batch_interval: u64,
+    /// OCSP response validity in seconds
+    #[serde(default = "default_validity_secs")]
+    pub validity_secs: u64,
+    /// DER bytes of the issuer DN (for CertID computation in signer mode).
+    /// Base64-encoded in config, decoded on load.
+    pub issuer_name_der_b64: Option<String>,
+    /// Raw issuer public key bytes (for CertID computation in signer mode).
+    /// Base64-encoded in config, decoded on load.
+    pub issuer_key_bytes_b64: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum SourceConfig {
+    #[serde(rename = "crl")]
+    Crl { path: PathBuf },
 }
 
 fn default_mode() -> String {
@@ -67,10 +88,48 @@ fn default_nonce_policy() -> String {
 fn default_completeness() -> String {
     "authoritative-complete".into()
 }
+fn default_batch_interval() -> u64 {
+    3600
+}
+fn default_validity_secs() -> u64 {
+    86400
+}
 
 impl Config {
     pub fn from_file(path: &std::path::Path) -> crate::error::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         toml::from_str(&contents).map_err(|e| crate::error::CoreError::Config(e.to_string()))
+    }
+
+    pub fn is_combined(&self) -> bool {
+        self.server.mode == "combined"
+    }
+
+    pub fn is_signer(&self) -> bool {
+        self.server.mode == "signer"
+    }
+
+    pub fn needs_signing(&self) -> bool {
+        self.is_combined() || self.is_signer()
+    }
+
+    pub fn validate_for_mode(&self) -> crate::error::Result<()> {
+        if self.needs_signing() {
+            for ca in &self.ca {
+                if ca.source.is_none() {
+                    return Err(crate::error::CoreError::Config(format!(
+                        "CA '{}' has no source configured, required for {} mode",
+                        ca.label, self.server.mode
+                    )));
+                }
+            }
+            if self.ca.is_empty() {
+                return Err(crate::error::CoreError::Config(format!(
+                    "{} mode requires at least one [[ca]] with a source",
+                    self.server.mode
+                )));
+            }
+        }
+        Ok(())
     }
 }

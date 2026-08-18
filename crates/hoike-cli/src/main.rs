@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::info;
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "hoike", about = "hoike — OCSP responder for pre-signed ahu bundles")]
@@ -87,14 +88,40 @@ async fn run_server(config_path: PathBuf) {
         std::process::exit(1);
     });
 
-    let listen = config.server.listen.clone();
+    if let Err(e) = config.validate_for_mode() {
+        eprintln!("Configuration error: {e}");
+        std::process::exit(1);
+    }
 
-    let state = hoike_core::ResponderState::load(config).unwrap_or_else(|e| {
+    let listen = config.server.listen.clone();
+    let is_combined = config.is_combined();
+
+    // In combined mode, run an initial signing pass before loading bundles
+    // so there's something to serve immediately.
+    if is_combined {
+        info!("combined mode: running initial bundle production");
+        if let Err(e) = run_signer_pass(&config) {
+            eprintln!("Initial signer pass failed: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    let state = hoike_core::ResponderState::load(config.clone()).unwrap_or_else(|e| {
         eprintln!("Failed to initialize responder: {e}");
         std::process::exit(1);
     });
 
     let app_state = hoike_server::AppState::new(state);
+
+    // In combined mode, start the background signer loop
+    if is_combined {
+        let signer_state = app_state.responder.clone();
+        let signer_config = config.clone();
+        tokio::spawn(async move {
+            run_signer_loop(signer_state, signer_config).await;
+        });
+    }
+
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -104,8 +131,154 @@ async fn run_server(config_path: PathBuf) {
             std::process::exit(1);
         });
 
-    info!(listen = %listen, "hoike OCSP responder starting");
+    info!(listen = %listen, mode = config.server.mode, "hoike OCSP responder starting");
     axum::serve(listener, app).await.unwrap();
+}
+
+fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), String> {
+    use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
+    use p256::ecdsa::SigningKey;
+    use sha2_v010::{Digest, Sha256};
+
+    for ca_config in &config.ca {
+        let source_config = match &ca_config.source {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let source: Box<dyn RevocationSource> = match source_config {
+            hoike_core::config::SourceConfig::Crl { path } => {
+                let crl_data = std::fs::read(path)
+                    .map_err(|e| format!("failed to read CRL {}: {e}", path.display()))?;
+                if crl_data.starts_with(b"-----BEGIN") {
+                    let pem = String::from_utf8(crl_data)
+                        .map_err(|e| format!("CRL not valid UTF-8: {e}"))?;
+                    Box::new(CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?)
+                } else {
+                    Box::new(CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?)
+                }
+            }
+        };
+
+        let ca = CaIdentity {
+            label: ca_config.label.clone(),
+            issuer_name_der: decode_issuer_name(&ca_config),
+            issuer_key_bytes: decode_issuer_key(&ca_config),
+        };
+
+        let snapshot = source
+            .snapshot(&ca)
+            .map_err(|e| format!("snapshot failed for {}: {e}", ca_config.label))?;
+
+        // Epoch increments each pass; use current time as a simple monotonic value
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let gen_config = GenerationConfig {
+            producer_id: format!("hoike-combined"),
+            epoch,
+            validity_secs: ca_config.validity_secs,
+            certid_compat: hoike_sign::CertIdCompat::Dual,
+            ..Default::default()
+        };
+
+        // Ephemeral signing key — production would load from config
+        let secret = [42u8; 32];
+        let mut signing_key =
+            SigningKey::from_bytes((&secret).into()).expect("invalid signing key");
+
+        warn!(ca = ca_config.label, "using ephemeral signing key — not for production");
+
+        let bundle_bytes =
+            hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                &ca,
+                &snapshot,
+                &gen_config,
+                &mut signing_key,
+                |m| Ok(Sha256::digest(m).to_vec()),
+            )
+            .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
+
+        let bundle_path = config
+            .storage
+            .bundle_dir
+            .join(format!("{}.ahu", ca_config.label));
+
+        std::fs::create_dir_all(&config.storage.bundle_dir)
+            .map_err(|e| format!("create bundle_dir: {e}"))?;
+
+        std::fs::write(&bundle_path, &bundle_bytes)
+            .map_err(|e| format!("write bundle: {e}"))?;
+
+        info!(
+            ca = ca_config.label,
+            size = bundle_bytes.len(),
+            path = %bundle_path.display(),
+            entries = snapshot.entries.len(),
+            "bundle produced"
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_signer_loop(
+    state: Arc<hoike_core::ResponderState>,
+    config: hoike_core::Config,
+) {
+    let min_interval = config
+        .ca
+        .iter()
+        .map(|c| c.batch_interval)
+        .min()
+        .unwrap_or(3600);
+
+    info!(
+        interval_secs = min_interval,
+        "combined mode: signer loop starting"
+    );
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(min_interval)).await;
+
+        info!("signer loop: starting production cycle");
+        match run_signer_pass(&config) {
+            Ok(()) => {
+                if let Err(e) = state.reload() {
+                    error!(error = %e, "signer loop: reload failed after production");
+                } else {
+                    info!("signer loop: bundles produced and reloaded");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "signer loop: production failed");
+            }
+        }
+    }
+}
+
+fn decode_issuer_name(ca: &hoike_core::config::CaConfig) -> Vec<u8> {
+    if let Some(b64) = &ca.issuer_name_der_b64 {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap_or_else(|_| format!("CN={}", ca.label).into_bytes())
+    } else {
+        format!("CN={}", ca.label).into_bytes()
+    }
+}
+
+fn decode_issuer_key(ca: &hoike_core::config::CaConfig) -> Vec<u8> {
+    if let Some(b64) = &ca.issuer_key_bytes_b64 {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap_or_else(|_| format!("{}-key", ca.label).into_bytes())
+    } else {
+        format!("{}-key", ca.label).into_bytes()
+    }
 }
 
 fn run_check(config_path: PathBuf) {

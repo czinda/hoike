@@ -474,3 +474,182 @@ async fn cross_ca_miss_returns_unauthorized() {
     let body = resp.bytes().await.unwrap();
     assert_eq!(&body[..], &[0x30, 0x03, 0x0A, 0x01, 0x06]); // unauthorized
 }
+
+// ── Nonce policy tests ──────────────────────────────────────────────
+
+fn build_ocsp_request_with_nonce(cert_id: &CertId, nonce: &[u8]) -> Vec<u8> {
+    use der::asn1::OctetString;
+
+    let nonce_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.2");
+    let nonce_value = OctetString::new(nonce.to_vec()).unwrap();
+    let nonce_ext_value = OctetString::new(nonce_value.to_der().unwrap()).unwrap();
+    let nonce_ext = x509_cert::ext::Extension {
+        extn_id: nonce_oid,
+        critical: false,
+        extn_value: nonce_ext_value,
+    };
+
+    let request = Request {
+        req_cert: cert_id.clone(),
+        single_request_extensions: None,
+    };
+
+    let tbs = TbsRequest {
+        version: Default::default(),
+        requestor_name: None,
+        request_list: vec![request],
+        request_extensions: Some(vec![nonce_ext]),
+    };
+
+    let ocsp_req = OcspRequest {
+        tbs_request: tbs,
+        optional_signature: None,
+    };
+
+    ocsp_req.to_der().expect("OCSPRequest with nonce encode failed")
+}
+
+#[tokio::test]
+async fn nonce_ignored_serves_presigned() {
+    let response_bytes = b"PRESIGNED-RESPONSE-42";
+    let bundle_bytes = build_test_bundle_with_real_certids(&[(42, response_bytes)]);
+    let (port, _dir) = start_test_server(bundle_bytes).await;
+
+    let cert_id = build_certid(42);
+    let nonce = [0xAA; 16]; // 16 bytes = MustAccept per RFC 9654
+    let request_der = build_ocsp_request_with_nonce(&cert_id, &nonce);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/"))
+        .header("Content-Type", "application/ocsp-request")
+        .body(request_der)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    // ignore policy: serves the pre-signed response, no nonce in it
+    assert_eq!(&body[..], response_bytes);
+}
+
+#[tokio::test]
+async fn forward_policy_without_url_rejected_at_startup() {
+    let bundle_bytes = build_test_bundle_with_real_certids(&[(1, b"R")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("test.ahu");
+    std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+
+    let config_toml = format!(
+        r#"
+[server]
+mode = "edge"
+listen = "127.0.0.1:0"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+
+[[ca]]
+label = "bad-forward"
+bundle_file = "{bundle}"
+nonce_policy = "forward"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+    );
+
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    let msg = match hoike_core::ResponderState::load(config) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected config validation error"),
+    };
+    assert!(
+        msg.contains("forward_to"),
+        "expected forward_to error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn live_on_edge_rejected_at_startup() {
+    let bundle_bytes = build_test_bundle_with_real_certids(&[(1, b"R")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("test.ahu");
+    std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+
+    let config_toml = format!(
+        r#"
+[server]
+mode = "edge"
+listen = "127.0.0.1:0"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+
+[[ca]]
+label = "bad-live"
+bundle_file = "{bundle}"
+nonce_policy = "live"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+    );
+
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    let msg = match hoike_core::ResponderState::load(config) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected config validation error"),
+    };
+    assert!(
+        msg.contains("edge") && msg.contains("live"),
+        "expected edge/live error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_nonce_policy_rejected_at_startup() {
+    let bundle_bytes = build_test_bundle_with_real_certids(&[(1, b"R")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("test.ahu");
+    std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+
+    let config_toml = format!(
+        r#"
+[server]
+mode = "edge"
+listen = "127.0.0.1:0"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+
+[[ca]]
+label = "bad-policy"
+bundle_file = "{bundle}"
+nonce_policy = "bogus"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+    );
+
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    let msg = match hoike_core::ResponderState::load(config) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected config validation error"),
+    };
+    assert!(
+        msg.contains("bogus"),
+        "expected unknown policy error, got: {msg}"
+    );
+}

@@ -20,6 +20,7 @@ hoike-core = { path = "../hoike-core" }
 hoike-server = { path = "../hoike-server" }
 hoike-sign = { path = "../hoike-sign" }
 axum = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }

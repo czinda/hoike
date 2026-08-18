@@ -23,6 +23,7 @@ pub struct ScopeEntry {
     pub ca_label: String,
     pub nonce_policy: String,
     pub completeness: String,
+    pub forward_to: Option<String>,
 }
 
 /// The loaded working set: bundles indexed by CA scope for routing.
@@ -37,6 +38,8 @@ pub struct LookupResult {
     pub response_bytes: Vec<u8>,
     pub window: ahu::Window,
     pub ca_label: String,
+    pub nonce_policy: String,
+    pub forward_to: Option<String>,
 }
 
 /// The responder's loaded state: bundles indexed by CA scope.
@@ -78,15 +81,21 @@ impl ResponderState {
             }
         }
 
+        let make_result = |entry: &ScopeEntry, response_bytes: Vec<u8>, window: ahu::Window| {
+            LookupResult {
+                response_bytes,
+                window,
+                ca_label: entry.ca_label.clone(),
+                nonce_policy: entry.nonce_policy.clone(),
+                forward_to: entry.forward_to.clone(),
+            }
+        };
+
         match hits.len() {
             0 => None,
             1 => {
                 let (entry, response_bytes, window) = hits.into_iter().next().unwrap();
-                Some(LookupResult {
-                    response_bytes,
-                    window,
-                    ca_label: entry.ca_label.clone(),
-                })
+                Some(make_result(entry, response_bytes, window))
             }
             n => {
                 warn!(
@@ -96,11 +105,7 @@ impl ResponderState {
                     "multiple scopes hold entry for same serial — answering from first by config order"
                 );
                 let (entry, response_bytes, window) = hits.into_iter().next().unwrap();
-                Some(LookupResult {
-                    response_bytes,
-                    window,
-                    ca_label: entry.ca_label.clone(),
-                })
+                Some(make_result(entry, response_bytes, window))
             }
         }
     }
@@ -158,14 +163,46 @@ impl ResponderState {
     }
 }
 
+fn validate_nonce_config(config: &Config) -> Result<()> {
+    for ca in &config.ca {
+        match ca.nonce_policy.as_str() {
+            "ignore" => {}
+            "live" => {
+                if config.server.mode == "edge" {
+                    return Err(CoreError::Config(format!(
+                        "CA '{}': nonce_policy \"live\" requires signer or combined mode, \
+                         but server.mode is \"edge\" — an edge node holds no signing key",
+                        ca.label
+                    )));
+                }
+            }
+            "forward" => {
+                if ca.forward_to.is_none() {
+                    return Err(CoreError::Config(format!(
+                        "CA '{}': nonce_policy \"forward\" requires a forward_to URL",
+                        ca.label
+                    )));
+                }
+            }
+            other => {
+                return Err(CoreError::Config(format!(
+                    "CA '{}': unknown nonce_policy \"{other}\" (expected: ignore, live, forward)",
+                    ca.label
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_scope_map(config: &Config) -> Result<ScopeMap> {
+    validate_nonce_config(config)?;
+
     let mut bundles: Vec<Arc<Bundle>> = Vec::new();
     let mut entries: HashMap<ScopeKey, Vec<ScopeEntry>> = HashMap::new();
-    // Track which paths we've already loaded to avoid duplicates
     let mut loaded_paths: HashMap<std::path::PathBuf, usize> = HashMap::new();
 
     if config.ca.is_empty() {
-        // Backward compatibility: no [[ca]] blocks, load newest bundle from bundle_dir
         let bundle = load_single_bundle(&config.storage.bundle_dir, None)?;
         let bundle_idx = 0;
         register_bundle_scopes(
@@ -174,6 +211,7 @@ fn load_scope_map(config: &Config) -> Result<ScopeMap> {
             "default",
             "ignore",
             "authoritative-complete",
+            None,
             &mut entries,
         );
         bundles.push(Arc::new(bundle));
@@ -203,6 +241,7 @@ fn load_scope_map(config: &Config) -> Result<ScopeMap> {
                 &ca_config.label,
                 &ca_config.nonce_policy,
                 &ca_config.completeness,
+                ca_config.forward_to.as_deref(),
                 &mut entries,
             );
         }
@@ -221,6 +260,7 @@ fn register_bundle_scopes(
     ca_label: &str,
     nonce_policy: &str,
     completeness: &str,
+    forward_to: Option<&str>,
     entries: &mut HashMap<ScopeKey, Vec<ScopeEntry>>,
 ) {
     for scope in &bundle.manifest.ca_scopes {
@@ -234,6 +274,7 @@ fn register_bundle_scopes(
             ca_label: ca_label.to_string(),
             nonce_policy: nonce_policy.to_string(),
             completeness: completeness.to_string(),
+            forward_to: forward_to.map(|s| s.to_string()),
         };
 
         entries.entry(key).or_default().push(entry);
