@@ -14,11 +14,14 @@ pub struct ParsedRequest {
     pub nonce: Option<Vec<u8>>,
 }
 
-/// A CertID extracted from a request, with its precomputed entry key.
+/// A CertID extracted from a request, with its precomputed entry key
+/// and the issuer hash fields needed for multi-CA routing.
 #[derive(Debug, Clone)]
 pub struct ParsedCertId {
     pub entry_key: [u8; 32],
     pub certid_der: Vec<u8>,
+    pub issuer_name_hash: Vec<u8>,
+    pub issuer_key_hash: Vec<u8>,
     pub serial_number: Vec<u8>,
 }
 
@@ -60,6 +63,8 @@ pub fn parse_ocsp_request(der_bytes: &[u8]) -> Result<ParsedRequest> {
         cert_ids.push(ParsedCertId {
             entry_key,
             certid_der,
+            issuer_name_hash: cert_id.issuer_name_hash.as_bytes().to_vec(),
+            issuer_key_hash: cert_id.issuer_key_hash.as_bytes().to_vec(),
             serial_number: cert_id.serial_number.as_bytes().to_vec(),
         });
     }

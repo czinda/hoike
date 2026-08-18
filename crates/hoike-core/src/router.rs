@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,67 +10,255 @@ use crate::config::Config;
 use crate::error::{CoreError, Result};
 use crate::request::ParsedCertId;
 
-/// The responder's loaded state: one or more bundles serving CA scopes.
-///
-/// For M1 this is a single bundle. Multi-CA routing (M3) will index
-/// bundles by (hashAlg, issuerNameHash, issuerKeyHash).
+/// Routing key: (issuerNameHash, issuerKeyHash).
+/// Both SHA-1 and SHA-256 hash algorithms produce different CertIDs for the
+/// same CA, so both the SHA-1 and SHA-256 hashes from the bundle manifest
+/// are registered as separate scope keys pointing to the same bundle.
+type ScopeKey = (Vec<u8>, Vec<u8>);
+
+/// Metadata about a CA scope within a loaded bundle.
+#[derive(Debug, Clone)]
+pub struct ScopeEntry {
+    pub bundle_idx: usize,
+    pub ca_label: String,
+    pub nonce_policy: String,
+    pub completeness: String,
+}
+
+/// The loaded working set: bundles indexed by CA scope for routing.
+pub struct ScopeMap {
+    entries: HashMap<ScopeKey, Vec<ScopeEntry>>,
+    bundles: Vec<Arc<Bundle>>,
+}
+
+/// Result of a successful lookup — the response bytes plus the window
+/// from the serving bundle for HTTP header generation.
+pub struct LookupResult {
+    pub response_bytes: Vec<u8>,
+    pub window: ahu::Window,
+    pub ca_label: String,
+}
+
+/// The responder's loaded state: bundles indexed by CA scope.
 pub struct ResponderState {
-    bundle: ArcSwap<Bundle>,
+    scope_map: ArcSwap<ScopeMap>,
     pub config: Config,
 }
 
 impl ResponderState {
     pub fn load(config: Config) -> Result<Self> {
-        let bundle = load_bundle(&config)?;
+        let scope_map = load_scope_map(&config)?;
         Ok(ResponderState {
-            bundle: ArcSwap::from_pointee(bundle),
+            scope_map: ArcSwap::from_pointee(scope_map),
             config,
         })
     }
 
-    /// Look up a CertID in the loaded bundle.
+    /// Look up a CertID across all loaded CA scopes.
     ///
-    /// Returns the raw DER bytes of the pre-signed OCSPResponse,
-    /// or None if the entry is not in the working set.
-    pub fn lookup(&self, cert_id: &ParsedCertId) -> Option<Vec<u8>> {
-        let bundle = self.bundle.load();
-        bundle
-            .lookup(&cert_id.entry_key)
-            .map(|bytes| bytes.to_vec())
+    /// Routes by (issuerNameHash, issuerKeyHash) to find candidate bundles,
+    /// then searches each by entry_key. On collision (multiple bundles hold
+    /// an entry for the same serial), logs a warning and returns the first
+    /// by configuration order.
+    pub fn lookup(&self, cert_id: &ParsedCertId) -> Option<LookupResult> {
+        let map = self.scope_map.load();
+        let key = (
+            cert_id.issuer_name_hash.clone(),
+            cert_id.issuer_key_hash.clone(),
+        );
+
+        let scope_entries = map.entries.get(&key)?;
+
+        let mut hits: Vec<(&ScopeEntry, Vec<u8>, ahu::Window)> = Vec::new();
+
+        for entry in scope_entries {
+            let bundle = &map.bundles[entry.bundle_idx];
+            if let Some(response_bytes) = bundle.lookup(&cert_id.entry_key) {
+                hits.push((entry, response_bytes.to_vec(), bundle.manifest.window.clone()));
+            }
+        }
+
+        match hits.len() {
+            0 => None,
+            1 => {
+                let (entry, response_bytes, window) = hits.into_iter().next().unwrap();
+                Some(LookupResult {
+                    response_bytes,
+                    window,
+                    ca_label: entry.ca_label.clone(),
+                })
+            }
+            n => {
+                warn!(
+                    count = n,
+                    serial = hex::encode(&cert_id.serial_number),
+                    issuer_key_hash = hex::encode(&cert_id.issuer_key_hash),
+                    "multiple scopes hold entry for same serial — answering from first by config order"
+                );
+                let (entry, response_bytes, window) = hits.into_iter().next().unwrap();
+                Some(LookupResult {
+                    response_bytes,
+                    window,
+                    ca_label: entry.ca_label.clone(),
+                })
+            }
+        }
     }
 
-    /// Get a snapshot of the current bundle for header computation.
-    pub fn bundle(&self) -> arc_swap::Guard<Arc<Bundle>> {
-        self.bundle.load()
+    /// Get the first loaded bundle's window (for backward compatibility
+    /// with single-CA deployments). Prefer `LookupResult.window` when
+    /// a specific lookup succeeded.
+    pub fn default_window(&self) -> Option<ahu::Window> {
+        let map = self.scope_map.load();
+        map.bundles.first().map(|b| b.manifest.window.clone())
     }
 
-    /// Hot-reload the bundle from disk.
+    /// Total entry count across all loaded bundles.
+    pub fn total_entries(&self) -> u64 {
+        let map = self.scope_map.load();
+        map.bundles.iter().map(|b| b.manifest.entry_count).sum()
+    }
+
+    /// Number of loaded bundles.
+    pub fn bundle_count(&self) -> usize {
+        let map = self.scope_map.load();
+        map.bundles.len()
+    }
+
+    /// Scope count (number of distinct routing keys).
+    pub fn scope_count(&self) -> usize {
+        let map = self.scope_map.load();
+        map.entries.len()
+    }
+
+    /// Get info about all loaded scopes for diagnostics.
+    pub fn scope_info(&self) -> Vec<(String, u64, String)> {
+        let map = self.scope_map.load();
+        let mut info = Vec::new();
+        for entries in map.entries.values() {
+            for entry in entries {
+                let bundle = &map.bundles[entry.bundle_idx];
+                info.push((
+                    entry.ca_label.clone(),
+                    bundle.manifest.ca_scopes.first().map(|s| s.epoch).unwrap_or(0),
+                    entry.completeness.clone(),
+                ));
+            }
+        }
+        info
+    }
+
+    /// Hot-reload all bundles from disk.
     pub fn reload(&self) -> Result<()> {
-        let bundle = load_bundle(&self.config)?;
-        let entry_count = bundle.manifest.entry_count;
-        self.bundle.store(Arc::new(bundle));
-        info!(entry_count, "bundle reloaded");
+        let scope_map = load_scope_map(&self.config)?;
+        let total: u64 = scope_map.bundles.iter().map(|b| b.manifest.entry_count).sum();
+        self.scope_map.store(Arc::new(scope_map));
+        info!(total_entries = total, "all bundles reloaded");
         Ok(())
     }
 }
 
-fn load_bundle(config: &Config) -> Result<Bundle> {
-    let bundle_dir = &config.storage.bundle_dir;
+fn load_scope_map(config: &Config) -> Result<ScopeMap> {
+    let mut bundles: Vec<Arc<Bundle>> = Vec::new();
+    let mut entries: HashMap<ScopeKey, Vec<ScopeEntry>> = HashMap::new();
+    // Track which paths we've already loaded to avoid duplicates
+    let mut loaded_paths: HashMap<std::path::PathBuf, usize> = HashMap::new();
 
-    // If a specific bundle_file is configured for the first CA, use it.
-    // Otherwise, find the newest .ahu file in the bundle directory.
-    let bundle_path = if let Some(ca) = config.ca.first() {
-        if let Some(bf) = &ca.bundle_file {
-            bf.clone()
-        } else {
-            find_newest_bundle(bundle_dir)?
+    if config.ca.is_empty() {
+        // Backward compatibility: no [[ca]] blocks, load newest bundle from bundle_dir
+        let bundle = load_single_bundle(&config.storage.bundle_dir, None)?;
+        let bundle_idx = 0;
+        register_bundle_scopes(
+            &bundle,
+            bundle_idx,
+            "default",
+            "ignore",
+            "authoritative-complete",
+            &mut entries,
+        );
+        bundles.push(Arc::new(bundle));
+    } else {
+        for ca_config in &config.ca {
+            let bundle_path = if let Some(bf) = &ca_config.bundle_file {
+                bf.clone()
+            } else {
+                find_newest_bundle(&config.storage.bundle_dir)?
+            };
+
+            let canonical = bundle_path.canonicalize().unwrap_or(bundle_path.clone());
+
+            let bundle_idx = if let Some(&idx) = loaded_paths.get(&canonical) {
+                idx
+            } else {
+                let bundle = load_and_verify_bundle(&bundle_path)?;
+                let idx = bundles.len();
+                bundles.push(Arc::new(bundle));
+                loaded_paths.insert(canonical, idx);
+                idx
+            };
+
+            register_bundle_scopes(
+                &bundles[bundle_idx],
+                bundle_idx,
+                &ca_config.label,
+                &ca_config.nonce_policy,
+                &ca_config.completeness,
+                &mut entries,
+            );
         }
+    }
+
+    let scope_count = entries.len();
+    let bundle_count = bundles.len();
+    info!(bundles = bundle_count, scopes = scope_count, "scope map loaded");
+
+    Ok(ScopeMap { entries, bundles })
+}
+
+fn register_bundle_scopes(
+    bundle: &Bundle,
+    bundle_idx: usize,
+    ca_label: &str,
+    nonce_policy: &str,
+    completeness: &str,
+    entries: &mut HashMap<ScopeKey, Vec<ScopeEntry>>,
+) {
+    for scope in &bundle.manifest.ca_scopes {
+        let key = (
+            scope.issuer_name_hash.clone(),
+            scope.issuer_key_hash.clone(),
+        );
+
+        let entry = ScopeEntry {
+            bundle_idx,
+            ca_label: ca_label.to_string(),
+            nonce_policy: nonce_policy.to_string(),
+            completeness: completeness.to_string(),
+        };
+
+        entries.entry(key).or_default().push(entry);
+
+        info!(
+            ca = ca_label,
+            epoch = scope.epoch,
+            issuer_key_hash = hex::encode(&scope.issuer_key_hash[..8.min(scope.issuer_key_hash.len())]),
+            "registered CA scope"
+        );
+    }
+}
+
+fn load_single_bundle(bundle_dir: &Path, bundle_file: Option<&Path>) -> Result<Bundle> {
+    let path = if let Some(bf) = bundle_file {
+        bf.to_path_buf()
     } else {
         find_newest_bundle(bundle_dir)?
     };
+    load_and_verify_bundle(&path)
+}
 
-    info!(path = %bundle_path.display(), "loading bundle");
-    let bundle = Bundle::from_file(&bundle_path)?;
+fn load_and_verify_bundle(path: &Path) -> Result<Bundle> {
+    info!(path = %path.display(), "loading bundle");
+    let bundle = Bundle::from_file(path)?;
 
     let result = ahu::verify_structure(&bundle)?;
     if !result.warnings.is_empty() {
@@ -81,6 +270,7 @@ fn load_bundle(config: &Config) -> Result<Bundle> {
     info!(
         entry_count = bundle.manifest.entry_count,
         producer = %bundle.manifest.producer_id,
+        scopes = bundle.manifest.ca_scopes.len(),
         "bundle loaded and verified"
     );
 
@@ -88,7 +278,7 @@ fn load_bundle(config: &Config) -> Result<Bundle> {
 }
 
 fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)?
+    let mut file_entries: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path()
@@ -97,14 +287,14 @@ fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {
         })
         .collect();
 
-    entries.sort_by_key(|e| {
+    file_entries.sort_by_key(|e| {
         e.metadata()
             .ok()
             .and_then(|m| m.modified().ok())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
     });
 
-    entries
+    file_entries
         .last()
         .map(|e| e.path())
         .ok_or_else(|| CoreError::Config(format!("no .ahu files in {}", dir.display())))

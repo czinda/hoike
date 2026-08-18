@@ -36,6 +36,14 @@ pub struct CaConfig {
     pub nonce_policy: String,
     #[serde(default = "default_completeness")]
     pub completeness: String,
+    /// Hex-encoded issuerNameHash for explicit routing.
+    /// If absent, extracted from the bundle manifest on load.
+    pub issuer_name_hash: Option<String>,
+    /// Hex-encoded issuerKeyHash for explicit routing.
+    /// If absent, extracted from the bundle manifest on load.
+    pub issuer_key_hash: Option<String>,
+    /// URL to forward nonce-bearing requests to (for nonce_policy = "forward")
+    pub forward_to: Option<String>,
 }
 
 fn default_mode() -> String {

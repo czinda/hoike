@@ -126,20 +126,11 @@ fn run_check(config_path: PathBuf) {
 
     match hoike_core::ResponderState::load(config) {
         Ok(state) => {
-            let bundle = state.bundle();
-            println!("  Entries:   {}", bundle.manifest.entry_count);
-            println!("  Producer:  {}", bundle.manifest.producer_id);
-            println!("  Scopes:    {}", bundle.manifest.ca_scopes.len());
-            for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
-                println!(
-                    "    [{}] epoch={} completeness={}",
-                    i,
-                    scope.epoch,
-                    match scope.completeness {
-                        ahu::Completeness::AuthoritativeComplete => "authoritative-complete",
-                        ahu::Completeness::Partial => "partial",
-                    }
-                );
+            println!("  Bundles:   {}", state.bundle_count());
+            println!("  Scopes:    {}", state.scope_count());
+            println!("  Entries:   {}", state.total_entries());
+            for (label, epoch, completeness) in state.scope_info() {
+                println!("    [{label}] epoch={epoch} completeness={completeness}");
             }
             println!("\n  All checks passed.");
         }

@@ -8,7 +8,7 @@ use tracing::debug;
 
 use hoike_core::{
     CONTENT_TYPE_OCSP_REQUEST, CONTENT_TYPE_OCSP_RESPONSE, MALFORMED_REQUEST,
-    UNAUTHORIZED, decode_get_path, parse_ocsp_request, validate_nonce, NonceAction,
+    UNAUTHORIZED, LookupResult, decode_get_path, parse_ocsp_request, validate_nonce, NonceAction,
 };
 
 use crate::state::AppState;
@@ -108,18 +108,20 @@ fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
     };
 
     match state.responder.lookup(cert_id) {
-        Some(response_bytes) => {
+        Some(result) => {
             debug!(
                 entry_key = hex::encode(cert_id.entry_key),
-                size = response_bytes.len(),
+                ca = result.ca_label,
+                size = result.response_bytes.len(),
                 "serving pre-signed response"
             );
-            ocsp_success_response(&response_bytes, state)
+            ocsp_success_response(&result)
         }
         None => {
             debug!(
                 entry_key = hex::encode(cert_id.entry_key),
                 serial = hex::encode(&cert_id.serial_number),
+                issuer_key_hash = hex::encode(&cert_id.issuer_key_hash[..8.min(cert_id.issuer_key_hash.len())]),
                 "no entry — returning unauthorized"
             );
             ocsp_error_response(UNAUTHORIZED)
@@ -133,11 +135,10 @@ fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
 ///   Content-Type: application/ocsp-response
 ///   ETag: "<sha256 hex>"
 ///   Cache-Control: max-age=N, public, no-transform, must-revalidate
-fn ocsp_success_response(response_bytes: &[u8], state: &AppState) -> Response {
-    let etag = format!("\"{}\"", hex::encode(Sha256::digest(response_bytes)));
+fn ocsp_success_response(result: &LookupResult) -> Response {
+    let etag = format!("\"{}\"", hex::encode(Sha256::digest(&result.response_bytes)));
 
-    let bundle = state.responder.bundle();
-    let window = &bundle.manifest.window;
+    let window = &result.window;
 
     // max-age: use half of (next_update_min - this_update_min) as a
     // reasonable default, clamped to at least 60 seconds.
@@ -169,46 +170,36 @@ fn ocsp_success_response(response_bytes: &[u8], state: &AppState) -> Response {
         }
     }
 
-    (StatusCode::OK, headers, response_bytes.to_vec()).into_response()
+    (StatusCode::OK, headers, result.response_bytes.clone()).into_response()
 }
 
 /// Build an HTTP response for an OCSP error (unauthorized, malformed, etc.).
 fn ocsp_error_response(status_der: &[u8]) -> Response {
-    let http_status = if status_der == UNAUTHORIZED {
-        StatusCode::OK // RFC 6960: unauthorized is still HTTP 200
-    } else {
-        StatusCode::OK // All OCSP responses are HTTP 200
-    };
-
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static(CONTENT_TYPE_OCSP_RESPONSE),
     );
-    // Error responses should not be cached.
     headers.insert(
         CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store"),
     );
 
-    (http_status, headers, status_der.to_vec()).into_response()
+    (StatusCode::OK, headers, status_der.to_vec()).into_response()
 }
 
 fn httpdate_format(time: std::time::SystemTime) -> std::result::Result<String, ()> {
     let duration = time.duration_since(std::time::UNIX_EPOCH).map_err(|_| ())?;
     let secs = duration.as_secs();
 
-    // Simple HTTP-date (RFC 7231) formatter for GMT.
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
 
-    // Days since epoch (1970-01-01 Thursday).
     let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][(days % 7) as usize];
 
-    // Compute year, month, day from days since epoch.
     let (year, month, day) = days_to_ymd(days);
     let month_name = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -221,7 +212,6 @@ fn httpdate_format(time: std::time::SystemTime) -> std::result::Result<String, (
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from Howard Hinnant's chrono-compatible date library.
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
