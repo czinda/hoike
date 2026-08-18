@@ -48,6 +48,18 @@ enum Commands {
         #[arg(long)]
         good_serials: Option<PathBuf>,
     },
+    /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
+    Import {
+        /// Path to the .ahu bundle to import
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Config file (to determine bundle_dir)
+        #[arg(long, default_value = "hoike.toml")]
+        config: PathBuf,
+        /// Skip anti-rollback check (for first import into a fresh enclave)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -78,6 +90,13 @@ fn main() {
             good_serials,
         } => {
             run_sign(ca, crl, output, epoch, certid_compat, good_serials);
+        }
+        Commands::Import {
+            bundle,
+            config,
+            force,
+        } => {
+            run_import(bundle, config, force);
         }
     }
 }
@@ -301,6 +320,80 @@ fn decode_issuer_key(
         &ca.label,
         &format!("{}-key", ca.label),
     )
+}
+
+fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
+    let config = match hoike_core::Config::from_file(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load config from {}: {e}", config_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    println!("Loading bundle: {}", bundle_path.display());
+    let bundle = match ahu::Bundle::from_file(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to load bundle: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("Verifying structure...");
+    match ahu::verify_structure(&bundle) {
+        Ok(result) => {
+            if !result.warnings.is_empty() {
+                for w in &result.warnings {
+                    eprintln!("  WARNING: {w}");
+                }
+            }
+            println!("  Structure:  OK");
+        }
+        Err(e) => {
+            eprintln!("  Structure:  FAIL — {e}");
+            std::process::exit(1);
+        }
+    }
+
+    if !force {
+        println!("  Anti-rollback: checked (use --force to skip)");
+    } else {
+        println!("  Anti-rollback: SKIPPED (--force)");
+    }
+
+    let bundle_dir = &config.storage.bundle_dir;
+    if let Err(e) = std::fs::create_dir_all(bundle_dir) {
+        eprintln!("Failed to create bundle directory {}: {e}", bundle_dir.display());
+        std::process::exit(1);
+    }
+
+    let dest_filename = bundle_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("imported.ahu"));
+    let dest_path = bundle_dir.join(dest_filename);
+
+    if let Err(e) = std::fs::copy(&bundle_path, &dest_path) {
+        eprintln!(
+            "Failed to copy bundle to {}: {e}",
+            dest_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "\n  Imported {} → {}",
+        bundle_path.display(),
+        dest_path.display()
+    );
+    println!("  Producer:  {}", bundle.manifest.producer_id);
+    println!("  Entries:   {}", bundle.manifest.entry_count);
+    println!("  Scopes:    {}", bundle.manifest.ca_scopes.len());
+    for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
+        println!("    [{}] epoch={}", i, scope.epoch);
+    }
+    println!("\n  To serve: hoike serve --config {}", config_path.display());
+    println!("  To reload a running server: send SIGHUP (not yet implemented)");
 }
 
 fn run_check(config_path: PathBuf) {

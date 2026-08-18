@@ -29,6 +29,19 @@ pub enum CoreError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("epoch rollback: scope {scope} epoch {epoch} <= high-water {high_water}")]
+    EpochRollback {
+        scope: String,
+        epoch: u64,
+        high_water: u64,
+    },
+
+    #[error("fork detected: prev_manifest_digest mismatch for scope {scope}")]
+    ForkDetected { scope: String },
+
+    #[error("state store error: {0}")]
+    StateStore(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -43,6 +43,17 @@ enum Commands {
         /// Second bundle
         b: PathBuf,
     },
+    /// Apply delta bundles to a base, producing a materialized full bundle
+    Apply {
+        /// Base full bundle
+        base: PathBuf,
+        /// Delta bundles to apply in order
+        #[arg(required = true)]
+        deltas: Vec<PathBuf>,
+        /// Output path for the materialized bundle
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 fn main() {
@@ -57,6 +68,11 @@ fn main() {
             output,
         } => ahu_commands::extract(&file, &certid, output.as_deref()),
         Commands::Diff { a, b } => ahu_commands::diff(&a, &b),
+        Commands::Apply {
+            base,
+            deltas,
+            output,
+        } => ahu_commands::apply(&base, &deltas, &output),
     };
 
     if let Err(e) = result {

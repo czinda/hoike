@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use tracing::{info, warn};
@@ -9,6 +9,7 @@ use ahu::Bundle;
 use crate::config::Config;
 use crate::error::{CoreError, Result};
 use crate::request::ParsedCertId;
+use crate::state::StateStore;
 
 /// Routing key: (issuerNameHash, issuerKeyHash).
 /// Both SHA-1 and SHA-256 hash algorithms produce different CertIDs for the
@@ -42,18 +43,23 @@ pub struct LookupResult {
     pub forward_to: Option<String>,
 }
 
-/// The responder's loaded state: bundles indexed by CA scope.
+/// The responder's loaded state: bundles indexed by CA scope,
+/// with persistent anti-rollback state.
 pub struct ResponderState {
     scope_map: ArcSwap<ScopeMap>,
     pub config: Config,
+    state_store: Mutex<StateStore>,
 }
 
 impl ResponderState {
     pub fn load(config: Config) -> Result<Self> {
-        let scope_map = load_scope_map(&config)?;
+        let state_db_path = config.storage.state_db.join("state.json");
+        let mut state_store = StateStore::open(&state_db_path)?;
+        let scope_map = load_scope_map(&config, &mut state_store)?;
         Ok(ResponderState {
             scope_map: ArcSwap::from_pointee(scope_map),
             config,
+            state_store: Mutex::new(state_store),
         })
     }
 
@@ -153,9 +159,12 @@ impl ResponderState {
         info
     }
 
-    /// Hot-reload all bundles from disk.
+    /// Hot-reload all bundles from disk with anti-rollback checks.
     pub fn reload(&self) -> Result<()> {
-        let scope_map = load_scope_map(&self.config)?;
+        let mut store = self.state_store.lock().map_err(|e| {
+            CoreError::StateStore(format!("state store lock poisoned: {e}"))
+        })?;
+        let scope_map = load_scope_map(&self.config, &mut store)?;
         let total: u64 = scope_map.bundles.iter().map(|b| b.manifest.entry_count).sum();
         self.scope_map.store(Arc::new(scope_map));
         info!(total_entries = total, "all bundles reloaded");
@@ -195,7 +204,7 @@ fn validate_nonce_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn load_scope_map(config: &Config) -> Result<ScopeMap> {
+fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
     validate_nonce_config(config)?;
 
     let mut bundles: Vec<Arc<Bundle>> = Vec::new();
@@ -204,6 +213,9 @@ fn load_scope_map(config: &Config) -> Result<ScopeMap> {
 
     if config.ca.is_empty() {
         let bundle = load_single_bundle(&config.storage.bundle_dir, None)?;
+        state_store.check_rollback(&bundle)?;
+        state_store.check_continuity(&bundle)?;
+        state_store.advance_from_bundle(&bundle)?;
         let bundle_idx = 0;
         register_bundle_scopes(
             &bundle,
@@ -229,6 +241,9 @@ fn load_scope_map(config: &Config) -> Result<ScopeMap> {
                 idx
             } else {
                 let bundle = load_and_verify_bundle(&bundle_path)?;
+                state_store.check_rollback(&bundle)?;
+                state_store.check_continuity(&bundle)?;
+                state_store.advance_from_bundle(&bundle)?;
                 let idx = bundles.len();
                 bundles.push(Arc::new(bundle));
                 loaded_paths.insert(canonical, idx);

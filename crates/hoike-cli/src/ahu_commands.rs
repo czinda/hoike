@@ -1,5 +1,6 @@
-use ahu::{Bundle, BundleType, Completeness, ResponderIdType};
-use std::collections::HashSet;
+use ahu::{Bundle, BundleBuilder, BundleType, Completeness, IndexFlags, ResponderIdType};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -263,6 +264,150 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
             println!("  - {}", hex::encode(key));
         }
     }
+
+    Ok(())
+}
+
+pub fn apply(base_path: &Path, delta_paths: &[std::path::PathBuf], output_path: &Path) -> Result<()> {
+    println!("Loading base bundle: {}", base_path.display());
+    let base = Bundle::from_file(base_path)?;
+    ahu::verify_structure(&base)?;
+
+    if base.manifest.bundle_type != BundleType::Full {
+        return Err("base bundle must be a full bundle, not a delta".into());
+    }
+
+    // Build the working set from the base: entry_key -> response bytes
+    let mut working_set: BTreeMap<[u8; 32], (Vec<u8>, IndexFlags)> = BTreeMap::new();
+    for record in &base.index {
+        if let Some(data) = base.entry_bytes(record) {
+            working_set.insert(record.entry_key, (data.to_vec(), record.flags));
+        }
+    }
+
+    println!("  Base entries: {}", working_set.len());
+
+    let base_manifest_digest = ahu::manifest_digest(&base.manifest_bytes);
+    let mut prev_manifest_digest = base_manifest_digest;
+    let mut max_epoch = base
+        .manifest
+        .ca_scopes
+        .iter()
+        .map(|s| s.epoch)
+        .max()
+        .unwrap_or(0);
+
+    // Apply each delta in order
+    for (i, delta_path) in delta_paths.iter().enumerate() {
+        println!("Applying delta {}: {}", i + 1, delta_path.display());
+        let delta = Bundle::from_file(delta_path)?;
+        ahu::verify_structure(&delta)?;
+
+        if delta.manifest.bundle_type != BundleType::Delta {
+            return Err(format!(
+                "expected delta bundle, got full bundle: {}",
+                delta_path.display()
+            )
+            .into());
+        }
+
+        // Verify continuity chain
+        if i == 0 {
+            if let Some(ref base_digest) = delta.manifest.continuity.base_manifest_digest {
+                if *base_digest != base_manifest_digest {
+                    return Err(format!(
+                        "delta {} base_manifest_digest does not match base bundle",
+                        delta_path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+
+        if let Some(ref prev_digest) = delta.manifest.continuity.prev_manifest_digest {
+            if *prev_digest != prev_manifest_digest {
+                return Err(format!(
+                    "delta {} prev_manifest_digest chain broken (expected {}, got {})",
+                    delta_path.display(),
+                    hex::encode(prev_manifest_digest),
+                    hex::encode(prev_digest),
+                )
+                .into());
+            }
+        }
+
+        let chain_len = delta.manifest.continuity.chain_length;
+        if chain_len > 24 {
+            eprintln!(
+                "  WARNING: chain_length {} exceeds recommended max (24)",
+                chain_len
+            );
+        }
+
+        let mut added = 0usize;
+        let mut replaced = 0usize;
+        let mut removed = 0usize;
+
+        for record in &delta.index {
+            if record.flags.contains(IndexFlags::TOMBSTONE) {
+                if working_set.remove(&record.entry_key).is_some() {
+                    removed += 1;
+                }
+            } else if let Some(data) = delta.entry_bytes(record) {
+                if working_set.insert(record.entry_key, (data.to_vec(), record.flags)).is_some() {
+                    replaced += 1;
+                } else {
+                    added += 1;
+                }
+            }
+        }
+
+        println!(
+            "  Applied: +{added} ~{replaced} -{removed} → {} entries",
+            working_set.len()
+        );
+
+        // Advance epoch tracking
+        for scope in &delta.manifest.ca_scopes {
+            max_epoch = max_epoch.max(scope.epoch);
+        }
+
+        prev_manifest_digest = ahu::manifest_digest(&delta.manifest_bytes);
+    }
+
+    // Build the materialized full bundle
+    let mut manifest = base.manifest.clone();
+    manifest.bundle_type = BundleType::Full;
+    manifest.continuity.chain_length = 0;
+    manifest.continuity.prev_manifest_digest = Some(prev_manifest_digest);
+    manifest.continuity.base_manifest_digest = None;
+
+    // Advance epochs to the max seen
+    for scope in &mut manifest.ca_scopes {
+        scope.epoch = max_epoch + 1;
+    }
+
+    let mut builder = BundleBuilder::new(manifest);
+
+    for (entry_key, (data, flags)) in &working_set {
+        if flags.contains(IndexFlags::ALIAS) {
+            // For alias entries, just add as normal — the dedup in build()
+            // handles identical payloads
+            builder.add_entry(*entry_key, data.clone());
+        } else {
+            builder.add_entry(*entry_key, data.clone());
+        }
+    }
+
+    let output_bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec()))?;
+
+    std::fs::write(output_path, &output_bytes)?;
+    println!(
+        "\nWrote materialized bundle: {} ({} bytes, {} entries)",
+        output_path.display(),
+        output_bytes.len(),
+        working_set.len()
+    );
 
     Ok(())
 }
