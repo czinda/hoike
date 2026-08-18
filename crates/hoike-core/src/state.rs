@@ -88,11 +88,16 @@ impl StateStore {
         manifest_digest: [u8; 32],
     ) -> Result<()> {
         let key = PersistedState::make_key(producer_id, issuer_key_hash_hex);
-        self.state.high_water_marks.insert(key.clone(), epoch);
-        self.state
-            .manifest_digests
-            .insert(key, hex::encode(manifest_digest));
-        self.persist()
+        let current = self.state.high_water_marks.get(&key).copied().unwrap_or(0);
+        if epoch > current {
+            self.state.high_water_marks.insert(key.clone(), epoch);
+            self.state
+                .manifest_digests
+                .insert(key, hex::encode(manifest_digest));
+            self.persist()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn check_rollback(&self, bundle: &Bundle) -> Result<()> {

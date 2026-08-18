@@ -93,6 +93,8 @@ impl GossipNode {
 
         let socket = Arc::new(socket);
         let foca = Arc::new(Mutex::new(foca));
+        let timer_queue: Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
         let node = GossipNode {
             foca: Arc::clone(&foca),
@@ -104,8 +106,9 @@ impl GossipNode {
         {
             let foca = Arc::clone(&foca);
             let socket = Arc::clone(&socket);
+            let tq = Arc::clone(&timer_queue);
             tokio::spawn(async move {
-                receive_loop(foca, socket).await;
+                receive_loop(foca, socket, tq).await;
             });
         }
 
@@ -113,8 +116,9 @@ impl GossipNode {
         {
             let foca = Arc::clone(&foca);
             let socket_clone = Arc::clone(&socket);
+            let tq = Arc::clone(&timer_queue);
             tokio::spawn(async move {
-                timer_loop(foca, socket_clone).await;
+                timer_loop(foca, socket_clone, tq).await;
             });
         }
 
@@ -132,7 +136,7 @@ impl GossipNode {
                     if let Err(e) = foca_guard.announce(seed_id, &mut runtime) {
                         warn!(seed = %addr, error = %e, "failed to announce to seed");
                     }
-                    drain_runtime(&mut runtime, &socket).await;
+                    drain_runtime(&mut runtime, &socket, &timer_queue).await;
                     info!(seed = %addr, "announced to seed");
                 }
                 Err(e) => {
@@ -196,7 +200,11 @@ impl GossipNode {
 }
 
 /// Receive incoming UDP packets and feed them to foca.
-async fn receive_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
+async fn receive_loop(
+    foca: Arc<Mutex<HoikeFoca>>,
+    socket: Arc<UdpSocket>,
+    timer_queue: Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>,
+) {
     let mut buf = vec![0u8; 2048];
     loop {
         match socket.recv_from(&mut buf).await {
@@ -208,7 +216,7 @@ async fn receive_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
                     debug!(from = %from, error = %e, "foca handle_data error (expected for arbitrary UDP)");
                 }
                 drop(foca_guard);
-                drain_runtime(&mut runtime, &socket).await;
+                drain_runtime(&mut runtime, &socket, &timer_queue).await;
             }
             Err(e) => {
                 warn!(error = %e, "UDP recv error");
@@ -219,13 +227,11 @@ async fn receive_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
 }
 
 /// Process foca timer events at fixed intervals.
-///
-/// In a production system each timer event would be scheduled individually
-/// via tokio::time::sleep_until. For this simplified implementation we poll
-/// at a fixed rate that's well within foca's tolerance.
-async fn timer_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
-    // Collect pending timers from the runtime and process them.
-    // For simplicity, we use a coarse tick and drive foca's periodic probes.
+async fn timer_loop(
+    foca: Arc<Mutex<HoikeFoca>>,
+    socket: Arc<UdpSocket>,
+    new_timers_rx: Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>,
+) {
     let mut pending_timers: Vec<(tokio::time::Instant, Timer<NodeId>)> = Vec::new();
 
     let tick = Duration::from_millis(200);
@@ -234,9 +240,16 @@ async fn timer_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
     loop {
         interval.tick().await;
 
+        // Collect timers scheduled by receive_loop and seed announce
+        {
+            let mut incoming = new_timers_rx.lock().await;
+            for (duration, timer) in incoming.drain(..) {
+                pending_timers.push((tokio::time::Instant::now() + duration, timer));
+            }
+        }
+
         let now = tokio::time::Instant::now();
 
-        // Collect timers that are due
         let mut due = Vec::new();
         pending_timers.retain(|(deadline, timer)| {
             if *deadline <= now {
@@ -248,7 +261,6 @@ async fn timer_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
         });
 
         if due.is_empty() {
-            // Even with nothing due, check for newly scheduled timers
             continue;
         }
 
@@ -261,18 +273,22 @@ async fn timer_loop(foca: Arc<Mutex<HoikeFoca>>, socket: Arc<UdpSocket>) {
             }
         }
 
-        // Process notifications
         while let Some(notification) = runtime.to_notify() {
             handle_notification(&notification);
         }
 
-        // Schedule new timers
         while let Some((duration, timer)) = runtime.to_schedule() {
             pending_timers.push((tokio::time::Instant::now() + duration, timer));
         }
 
         drop(foca_guard);
-        drain_runtime(&mut runtime, &socket).await;
+
+        // Send any outgoing packets
+        while let Some((to, data)) = runtime.to_send() {
+            if let Err(e) = socket.send_to(&data, to.addr).await {
+                debug!(to = %to.addr, error = %e, "failed to send gossip packet");
+            }
+        }
     }
 }
 
@@ -306,8 +322,12 @@ fn handle_notification(notification: &foca::OwnedNotification<NodeId>) {
     }
 }
 
-/// Drain accumulated runtime events: send packets, schedule timers, process notifications.
-async fn drain_runtime(runtime: &mut AccumulatingRuntime<NodeId>, socket: &UdpSocket) {
+/// Drain accumulated runtime events: send packets, forward timers, process notifications.
+async fn drain_runtime(
+    runtime: &mut AccumulatingRuntime<NodeId>,
+    socket: &UdpSocket,
+    timer_queue: &Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>,
+) {
     while let Some(notification) = runtime.to_notify() {
         handle_notification(&notification);
     }
@@ -319,15 +339,10 @@ async fn drain_runtime(runtime: &mut AccumulatingRuntime<NodeId>, socket: &UdpSo
         }
     }
 
-    // Timer scheduling is handled by the timer_loop; we just need to make
-    // sure they're drained so the runtime backlog goes to zero.
-    // In a real implementation these would be scheduled individually.
-    while let Some((_duration, _timer)) = runtime.to_schedule() {
-        // Timer events are consumed by the timer_loop in a production setup.
-        // For drain_runtime called outside the timer_loop (e.g. from
-        // receive_loop), these timers need to be collected too.
-        // For this simplified implementation, we let the timer_loop's
-        // periodic polling handle the probe cycle via foca's internal state.
+    // Forward timer events to the timer_loop's shared queue
+    let mut timers = timer_queue.lock().await;
+    while let Some((duration, timer)) = runtime.to_schedule() {
+        timers.push((duration, timer));
     }
 }
 

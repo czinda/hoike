@@ -413,7 +413,19 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     }
 
     if !force {
-        println!("  Anti-rollback: checked (use --force to skip)");
+        let state_store = match hoike_core::StateStore::open(&config.storage.state_db) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  Anti-rollback: FAIL — cannot open state store: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = state_store.check_rollback(&bundle) {
+            eprintln!("  Anti-rollback: REJECTED — {e}");
+            eprintln!("  Use --force to skip this check (e.g., first import into an enclave)");
+            std::process::exit(1);
+        }
+        println!("  Anti-rollback: OK");
     } else {
         println!("  Anti-rollback: SKIPPED (--force)");
     }

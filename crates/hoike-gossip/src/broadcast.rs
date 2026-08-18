@@ -134,8 +134,9 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
             epoch: msg.epoch(),
         };
 
-        // Non-blocking send to the gossip message processor
-        let _ = self.tx.try_send(msg);
+        if let Err(e) = self.tx.try_send(msg) {
+            tracing::warn!(error = %e, "gossip message channel full — announcement may be lost");
+        }
 
         Ok(Some(key))
     }
