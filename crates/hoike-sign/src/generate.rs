@@ -114,6 +114,7 @@ where
     };
 
     let mut builder = BundleBuilder::new(manifest);
+    let this_update = ocsp_time(now)?;
 
     for (serial, status) in &snapshot.entries {
         let cert_status = match status {
@@ -132,8 +133,6 @@ where
 
         let serial_number = x509_cert::serial_number::SerialNumber::new(serial)
             .map_err(|e| SignError::Der(e))?;
-
-        let this_update = ocsp_time(now)?;
 
         let entry_key_jitter = {
             let mut h = Sha256::new();

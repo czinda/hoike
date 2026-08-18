@@ -7,30 +7,25 @@ use crate::error::{Result, SignError};
 use crate::source::{CaIdentity, CertificateStatus, Epoch, RevocationSource, StatusChange, StatusSnapshot};
 
 pub struct CrlSource {
-    crl_data: Vec<u8>,
+    crl: CertificateList,
 }
 
 impl CrlSource {
     pub fn from_der(data: Vec<u8>) -> Result<Self> {
-        CertificateList::from_der(&data)
+        let crl = CertificateList::from_der(&data)
             .map_err(|e| SignError::CrlParse(format!("failed to parse CRL DER: {e}")))?;
-        Ok(CrlSource { crl_data: data })
+        Ok(CrlSource { crl })
     }
 
     pub fn from_pem(pem_text: &str) -> Result<Self> {
         let der_data = pem_to_der(pem_text)?;
         Self::from_der(der_data)
     }
-
-    fn parse_crl(&self) -> Result<CertificateList> {
-        CertificateList::from_der(&self.crl_data)
-            .map_err(|e| SignError::CrlParse(format!("CRL parse: {e}")))
-    }
 }
 
 impl RevocationSource for CrlSource {
     fn snapshot(&self, _ca: &CaIdentity) -> Result<StatusSnapshot> {
-        let crl = self.parse_crl()?;
+        let crl = &self.crl;
         let mut entries = BTreeMap::new();
 
         if let Some(revoked_certs) = &crl.tbs_cert_list.revoked_certificates {
@@ -43,7 +38,7 @@ impl RevocationSource for CrlSource {
                         .and_then(|ext| CrlReason::from_der(ext.extn_value.as_bytes()).ok())
                 });
 
-                let revocation_time = generalized_time_to_epoch(rc.revocation_date);
+                let revocation_time = time_to_epoch(rc.revocation_date);
 
                 entries.insert(
                     serial,
@@ -89,10 +84,6 @@ fn time_to_epoch(time: x509_cert::time::Time) -> u64 {
         x509_cert::time::Time::GeneralTime(t) => t.to_date_time(),
     };
     datetime_to_epoch(dt)
-}
-
-fn generalized_time_to_epoch(time: x509_cert::time::Time) -> u64 {
-    time_to_epoch(time)
 }
 
 fn datetime_to_epoch(dt: der::DateTime) -> u64 {
