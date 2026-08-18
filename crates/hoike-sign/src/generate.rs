@@ -23,6 +23,10 @@ pub struct GenerationConfig {
     pub jitter_secs: u64,
     pub certid_compat: CertIdCompat,
     pub completeness: Completeness,
+    /// Number of SingleResponse elements per signed BasicOCSPResponse.
+    /// 1 = one signature per certificate (default).
+    /// >1 = batch N certificates under one signature, amortizing signature cost.
+    pub bucket_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,7 @@ impl Default for GenerationConfig {
             jitter_secs: 7200,
             certid_compat: CertIdCompat::Dual,
             completeness: Completeness::Partial,
+            bucket_size: 1,
         }
     }
 }
@@ -139,6 +144,14 @@ where
     let mut builder = BundleBuilder::new(manifest);
     let this_update = ocsp_time(now)?;
 
+    // Prepare all entries: (entry_keys, cert_id(s), single_response(s)) per serial
+    struct PreparedEntry {
+        entry_keys: Vec<[u8; 32]>,
+        single_responses: Vec<SingleResponse>,
+    }
+
+    let mut prepared: Vec<PreparedEntry> = Vec::with_capacity(snapshot.entries.len());
+
     for (serial, status) in &snapshot.entries {
         let cert_status = match status {
             CertificateStatus::Good => CertStatus::good(),
@@ -173,40 +186,32 @@ where
                     sha256_oid,
                     &issuer_name_hash_sha256,
                     &issuer_key_hash_sha256,
-                    serial_number.clone(),
-                )?;
-                let response_der = build_and_sign_response(
-                    &responder_id,
-                    cert_id.clone(),
-                    cert_status.clone(),
-                    this_update,
-                    next_update,
-                    produced_at,
-                    signer,
+                    serial_number,
                 )?;
                 let certid_der = cert_id.to_der().map_err(SignError::Der)?;
                 let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
-                builder.add_entry(entry_key, response_der);
+                let single = SingleResponse::new(cert_id, cert_status, this_update)
+                    .with_next_update(next_update);
+                prepared.push(PreparedEntry {
+                    entry_keys: vec![entry_key],
+                    single_responses: vec![single],
+                });
             }
             CertIdCompat::Sha1Only => {
                 let cert_id = build_certid(
                     sha1_oid,
                     &issuer_name_hash_sha1,
                     &issuer_key_hash_sha1,
-                    serial_number.clone(),
-                )?;
-                let response_der = build_and_sign_response(
-                    &responder_id,
-                    cert_id.clone(),
-                    cert_status.clone(),
-                    this_update,
-                    next_update,
-                    produced_at,
-                    signer,
+                    serial_number,
                 )?;
                 let certid_der = cert_id.to_der().map_err(SignError::Der)?;
                 let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
-                builder.add_entry(entry_key, response_der);
+                let single = SingleResponse::new(cert_id, cert_status, this_update)
+                    .with_next_update(next_update);
+                prepared.push(PreparedEntry {
+                    entry_keys: vec![entry_key],
+                    single_responses: vec![single],
+                });
             }
             CertIdCompat::Dual => {
                 let cert_id_sha256 = build_certid(
@@ -221,28 +226,41 @@ where
                     &issuer_key_hash_sha1,
                     serial_number,
                 )?;
+                let ek256: [u8; 32] = Sha256::digest(&cert_id_sha256.to_der().map_err(SignError::Der)?).into();
+                let ek1: [u8; 32] = Sha256::digest(&cert_id_sha1.to_der().map_err(SignError::Der)?).into();
 
-                let single_sha256 = SingleResponse::new(cert_id_sha256.clone(), cert_status.clone(), this_update)
+                let single_sha256 = SingleResponse::new(cert_id_sha256, cert_status.clone(), this_update)
                     .with_next_update(next_update);
-                let single_sha1 = SingleResponse::new(cert_id_sha1.clone(), cert_status, this_update)
+                let single_sha1 = SingleResponse::new(cert_id_sha1, cert_status, this_update)
                     .with_next_update(next_update);
 
-                let response_builder = OcspResponseBuilder::new(responder_id.clone())
-                    .with_single_response(single_sha256)
-                    .with_single_response(single_sha1);
-
-                let ocsp_response = response_builder
-                    .sign(signer, None, produced_at)
-                    .map_err(SignError::from)?;
-                let response_der = ocsp_response.to_der().map_err(SignError::Der)?;
-
-                let certid_sha256_der = cert_id_sha256.to_der().map_err(SignError::Der)?;
-                let certid_sha1_der = cert_id_sha1.to_der().map_err(SignError::Der)?;
-                let ek256: [u8; 32] = Sha256::digest(&certid_sha256_der).into();
-                let ek1: [u8; 32] = Sha256::digest(&certid_sha1_der).into();
-                builder.add_dual_entry(ek256, ek1, response_der);
+                prepared.push(PreparedEntry {
+                    entry_keys: vec![ek256, ek1],
+                    single_responses: vec![single_sha256, single_sha1],
+                });
             }
         }
+    }
+
+    // Group entries into buckets and sign
+    let bucket_size = config.bucket_size.max(1);
+    for bucket in prepared.chunks(bucket_size) {
+        let mut response_builder = OcspResponseBuilder::new(responder_id.clone());
+        let mut all_keys: Vec<[u8; 32]> = Vec::new();
+
+        for entry in bucket {
+            for single in &entry.single_responses {
+                response_builder = response_builder.with_single_response(single.clone());
+            }
+            all_keys.extend_from_slice(&entry.entry_keys);
+        }
+
+        let ocsp_response = response_builder
+            .sign(signer, None, produced_at)
+            .map_err(SignError::from)?;
+        let response_der = ocsp_response.to_der().map_err(SignError::Der)?;
+
+        add_shared_entries(&mut builder, &all_keys, response_der);
     }
 
     builder
@@ -269,29 +287,30 @@ fn build_certid(
     })
 }
 
-fn build_and_sign_response<S, Sig>(
-    responder_id: &ResponderId,
-    cert_id: CertId,
-    cert_status: CertStatus,
-    this_update: OcspGeneralizedTime,
-    next_update: OcspGeneralizedTime,
-    produced_at: OcspGeneralizedTime,
-    signer: &mut S,
-) -> Result<Vec<u8>>
-where
-    S: Signer<Sig> + DynSignatureAlgorithmIdentifier,
-    Sig: SignatureBitStringEncoding,
-{
-    let single = SingleResponse::new(cert_id, cert_status, this_update).with_next_update(next_update);
-
-    let builder =
-        OcspResponseBuilder::new(responder_id.clone()).with_single_response(single);
-
-    let ocsp_response = builder
-        .sign(signer, None, produced_at)
-        .map_err(SignError::from)?;
-
-    ocsp_response.to_der().map_err(SignError::Der)
+/// Add multiple entry keys all pointing to the same response blob.
+/// Pairs consecutive keys via add_dual_entry so ALIAS dedup stores the
+/// data once. An odd key out gets a regular add_entry (one extra data copy
+/// per bucket — negligible vs the signature amortization savings).
+fn add_shared_entries(builder: &mut BundleBuilder, keys: &[[u8; 32]], response_der: Vec<u8>) {
+    match keys.len() {
+        0 => {}
+        1 => {
+            builder.add_entry(keys[0], response_der);
+        }
+        2 => {
+            builder.add_dual_entry(keys[0], keys[1], response_der);
+        }
+        _ => {
+            let mut i = 0;
+            while i + 1 < keys.len() {
+                builder.add_dual_entry(keys[i], keys[i + 1], response_der.clone());
+                i += 2;
+            }
+            if i < keys.len() {
+                builder.add_entry(keys[i], response_der);
+            }
+        }
+    }
 }
 
 fn ocsp_time(epoch_secs: u64) -> Result<OcspGeneralizedTime> {
@@ -456,6 +475,138 @@ mod tests {
         assert_eq!(
             ocsp_resp.response_status,
             x509_ocsp::OcspResponseStatus::Successful
+        );
+    }
+
+    fn large_snapshot(n: usize) -> StatusSnapshot {
+        let mut entries = BTreeMap::new();
+        for i in 0..n {
+            let serial = (i as u32 + 1).to_be_bytes().to_vec();
+            if i % 5 == 0 {
+                entries.insert(
+                    serial,
+                    CertificateStatus::Revoked {
+                        revocation_time: 1700000000,
+                        reason: Some(CrlReason::Unspecified),
+                    },
+                );
+            } else {
+                entries.insert(serial, CertificateStatus::Good);
+            }
+        }
+        StatusSnapshot {
+            entries,
+            this_update: 1700000000,
+            next_update: Some(1700086400),
+        }
+    }
+
+    #[test]
+    fn batching_bucket_5_produces_correct_bundle() {
+        let ca = test_ca();
+        let snapshot = large_snapshot(10);
+        let config = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only,
+            bucket_size: 5,
+            ..Default::default()
+        };
+        let mut key = test_signing_key();
+
+        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &config,
+            &mut key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+        )
+        .unwrap();
+
+        let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
+        let result = ahu::verify_structure(&bundle).unwrap();
+        assert!(result.index_digest_ok);
+        assert!(result.data_digest_ok);
+        assert!(result.sort_order_ok);
+        // 10 entries, each with its own index record
+        assert_eq!(bundle.manifest.entry_count, 10);
+    }
+
+    #[test]
+    fn batching_preserves_lookup() {
+        let ca = test_ca();
+        let snapshot = large_snapshot(20);
+        let config = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only,
+            bucket_size: 5,
+            ..Default::default()
+        };
+        let mut key = test_signing_key();
+
+        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &config,
+            &mut key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+        )
+        .unwrap();
+
+        let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
+
+        let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+        let name_hash = Sha256::digest(&ca.issuer_name_der);
+        let key_hash_val = Sha256::digest(&ca.issuer_key_bytes);
+
+        // Verify every entry can be looked up and returns valid OCSP DER
+        for i in 0..20u32 {
+            let serial_bytes = (i + 1).to_be_bytes().to_vec();
+            let serial = x509_cert::serial_number::SerialNumber::new(&serial_bytes).unwrap();
+            let cert_id = build_certid(sha256_oid, &name_hash, &key_hash_val, serial).unwrap();
+            let certid_der = cert_id.to_der().unwrap();
+            let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
+
+            let response = bundle.lookup(&entry_key)
+                .unwrap_or_else(|| panic!("entry for serial {} not found", i + 1));
+            assert!(!response.is_empty(), "empty response for serial {}", i + 1);
+
+            let ocsp_resp = <x509_ocsp::OcspResponse as Decode>::from_der(response)
+                .unwrap_or_else(|e| panic!("invalid DER for serial {}: {e}", i + 1));
+            assert_eq!(ocsp_resp.response_status, x509_ocsp::OcspResponseStatus::Successful);
+        }
+    }
+
+    #[test]
+    fn batching_reduces_data_size() {
+        let ca = test_ca();
+        let snapshot = large_snapshot(50);
+        let mut key = test_signing_key();
+
+        // Unbatched
+        let config_1 = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only,
+            bucket_size: 1,
+            ..Default::default()
+        };
+        let unbatched = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca, &snapshot, &config_1, &mut key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+        ).unwrap();
+
+        // Batched with bucket_size=10
+        let config_10 = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only,
+            bucket_size: 10,
+            ..Default::default()
+        };
+        let batched = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca, &snapshot, &config_10, &mut key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+        ).unwrap();
+
+        // Batched should be smaller (fewer signatures)
+        assert!(
+            batched.len() < unbatched.len(),
+            "batched ({}) should be smaller than unbatched ({})",
+            batched.len(), unbatched.len()
         );
     }
 }
