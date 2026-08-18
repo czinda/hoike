@@ -47,6 +47,9 @@ enum Commands {
         /// Include known-good serials from a file (one hex serial per line)
         #[arg(long)]
         good_serials: Option<PathBuf>,
+        /// Signing algorithm: ecdsa-p256 (default), ml-dsa-44, ml-dsa-65, ml-dsa-87
+        #[arg(long, default_value = "ecdsa-p256")]
+        sig_alg: String,
     },
     /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
     Import {
@@ -88,8 +91,9 @@ fn main() {
             epoch,
             certid_compat,
             good_serials,
+            sig_alg,
         } => {
-            run_sign(ca, crl, output, epoch, certid_compat, good_serials);
+            run_sign(ca, crl, output, epoch, certid_compat, good_serials, sig_alg);
         }
         Commands::Import {
             bundle,
@@ -509,9 +513,9 @@ fn run_sign(
     epoch: u64,
     certid_compat: String,
     good_serials: Option<PathBuf>,
+    sig_alg: String,
 ) {
     use hoike_sign::{CaIdentity, CertIdCompat, CertificateStatus, CrlSource, GenerationConfig, RevocationSource};
-    use p256::ecdsa::SigningKey;
     use sha2_v010::{Digest, Sha256};
 
     let compat = match certid_compat.as_str() {
@@ -581,6 +585,7 @@ fn run_sign(
         ca = ca_label,
         revoked = snapshot.entries.values().filter(|s| matches!(s, CertificateStatus::Revoked { .. })).count(),
         good = snapshot.entries.values().filter(|s| matches!(s, CertificateStatus::Good)).count(),
+        sig_alg = %sig_alg,
         "snapshot loaded"
     );
 
@@ -591,17 +596,40 @@ fn run_sign(
         ..Default::default()
     };
 
-    // For CLI use, generate an ephemeral ECDSA key
-    let secret = [42u8; 32];
-    let mut signing_key = SigningKey::from_bytes((&secret).into()).expect("invalid signing key");
+    let seed = [42u8; 32];
+    let seal_fn = |m: &[u8]| -> hoike_sign::Result<Vec<u8>> { Ok(Sha256::digest(m).to_vec()) };
 
-    let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-        &ca,
-        &snapshot,
-        &config,
-        &mut signing_key,
-        |m| Ok(Sha256::digest(m).to_vec()),
-    )
+    let bundle_bytes = match sig_alg.as_str() {
+        "ecdsa-p256" => {
+            let mut signer = p256::ecdsa::SigningKey::from_bytes((&seed).into())
+                .expect("invalid ECDSA key");
+            hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                &ca, &snapshot, &config, &mut signer, seal_fn,
+            )
+        }
+        "ml-dsa-44" => {
+            let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
+            hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
+                &ca, &snapshot, &config, &mut signer, seal_fn,
+            )
+        }
+        "ml-dsa-65" => {
+            let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
+            hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
+                &ca, &snapshot, &config, &mut signer, seal_fn,
+            )
+        }
+        "ml-dsa-87" => {
+            let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
+            hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
+                &ca, &snapshot, &config, &mut signer, seal_fn,
+            )
+        }
+        other => {
+            eprintln!("Unknown sig_alg: {other} (expected: ecdsa-p256, ml-dsa-44, ml-dsa-65, ml-dsa-87)");
+            std::process::exit(1);
+        }
+    }
     .unwrap_or_else(|e| {
         eprintln!("Failed to produce bundle: {e}");
         std::process::exit(1);
@@ -612,9 +640,21 @@ fn run_sign(
         std::process::exit(1);
     });
 
-    println!(
-        "Wrote {} bytes to {}",
-        bundle_bytes.len(),
-        output.display()
-    );
+    let entry_count = ahu::Bundle::from_bytes(&bundle_bytes)
+        .map(|b| b.manifest.entry_count)
+        .unwrap_or(0);
+    let avg_size = if entry_count > 0 {
+        bundle_bytes.len() / entry_count as usize
+    } else {
+        0
+    };
+    let sig_overhead = hoike_sign::ml_dsa_signature_size(&sig_alg);
+
+    println!("Bundle size: {} bytes", bundle_bytes.len());
+    println!("  Entries:           {entry_count}");
+    println!("  Avg response size: {avg_size} bytes");
+    if sig_overhead > 0 {
+        println!("  Signature overhead: ~{sig_overhead} bytes ({sig_alg})");
+    }
+    println!("  Output:            {}", output.display());
 }

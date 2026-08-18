@@ -25,6 +25,9 @@ sha2 = { version = "0.10", features = ["oid"] }
 sha1 = { version = "0.10", features = ["oid"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+# Post-quantum
+ml-dsa = { workspace = true }
+
 # CMS seal
 cms = "0.3.0-pre.2"
 
