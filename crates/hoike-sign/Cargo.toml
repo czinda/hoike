@@ -1,10 +1,40 @@
 [package]
 name = "hoike-sign"
 version = "0.1.0"
-description = "PKCS#11 signing and generation production for hoike"
+description = "Signing, generation production, and revocation source adapters for hoike"
 license = "GPL-3.0-or-later"
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 ahu = { path = "../ahu" }
+
+# Use der 0.7 ecosystem to match x509-ocsp 0.2.1
+der = { version = "0.7", features = ["alloc", "derive", "std", "oid"] }
+x509-ocsp = { version = "0.2", features = ["builder", "std"] }
+x509-cert = { version = "0.2", features = ["std"] }
+const-oid = { version = "0.9", features = ["db"] }
+spki = { version = "0.7", features = ["alloc", "std"] }
+
+# Signing (0.10/2.x generation matching x509-ocsp builder)
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+signature = "2"
+digest = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+sha1 = { version = "0.10", features = ["oid"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# CMS seal
+cms = "0.3.0-pre.2"
+
+# General
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
