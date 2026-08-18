@@ -148,7 +148,7 @@ async fn forward_request(url: &str, der_bytes: &[u8]) -> Response {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_default();
+        .expect("failed to build HTTP client for forwarding");
 
     match client
         .post(url)
@@ -158,6 +158,36 @@ async fn forward_request(url: &str, der_bytes: &[u8]) -> Response {
         .await
     {
         Ok(upstream_resp) => {
+            let status = upstream_resp.status();
+            if !status.is_success() {
+                warn!(
+                    url = url,
+                    status = %status,
+                    "upstream OCSP responder returned non-success status"
+                );
+                return ocsp_error_response(TRY_LATER);
+            }
+
+            // Validate Content-Type — upstream should return application/ocsp-response.
+            let ct_ok = upstream_resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| {
+                    ct.split(';')
+                        .next()
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case(CONTENT_TYPE_OCSP_RESPONSE))
+                })
+                .unwrap_or(false);
+
+            if !ct_ok {
+                warn!(
+                    url = url,
+                    "upstream response has unexpected Content-Type, not application/ocsp-response"
+                );
+                return ocsp_error_response(TRY_LATER);
+            }
+
             match upstream_resp.bytes().await {
                 Ok(body) => {
                     let mut headers = HeaderMap::new();

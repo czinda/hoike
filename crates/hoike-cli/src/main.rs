@@ -162,8 +162,8 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
 
         let ca = CaIdentity {
             label: ca_config.label.clone(),
-            issuer_name_der: decode_issuer_name(&ca_config),
-            issuer_key_bytes: decode_issuer_key(&ca_config),
+            issuer_name_der: decode_issuer_name(&ca_config)?,
+            issuer_key_bytes: decode_issuer_key(&ca_config)?,
         };
 
         let snapshot = source
@@ -177,7 +177,7 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
             .as_secs();
 
         let gen_config = GenerationConfig {
-            producer_id: format!("hoike-combined"),
+            producer_id: "hoike-combined".into(),
             epoch,
             validity_secs: ca_config.validity_secs,
             certid_compat: hoike_sign::CertIdCompat::Dual,
@@ -259,26 +259,48 @@ async fn run_signer_loop(
     }
 }
 
-fn decode_issuer_name(ca: &hoike_core::config::CaConfig) -> Vec<u8> {
-    if let Some(b64) = &ca.issuer_name_der_b64 {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .unwrap_or_else(|_| format!("CN={}", ca.label).into_bytes())
-    } else {
-        format!("CN={}", ca.label).into_bytes()
+fn decode_b64_field(
+    b64: &Option<String>,
+    field_name: &str,
+    ca_label: &str,
+    fallback: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    match b64 {
+        Some(val) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(val)
+                .map_err(|e| {
+                    format!(
+                        "CA '{}': invalid base64 in {}: {e}",
+                        ca_label, field_name
+                    )
+                })
+        }
+        None => Ok(fallback.as_bytes().to_vec()),
     }
 }
 
-fn decode_issuer_key(ca: &hoike_core::config::CaConfig) -> Vec<u8> {
-    if let Some(b64) = &ca.issuer_key_bytes_b64 {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .unwrap_or_else(|_| format!("{}-key", ca.label).into_bytes())
-    } else {
-        format!("{}-key", ca.label).into_bytes()
-    }
+fn decode_issuer_name(
+    ca: &hoike_core::config::CaConfig,
+) -> std::result::Result<Vec<u8>, String> {
+    decode_b64_field(
+        &ca.issuer_name_der_b64,
+        "issuer_name_der_b64",
+        &ca.label,
+        &format!("CN={}", ca.label),
+    )
+}
+
+fn decode_issuer_key(
+    ca: &hoike_core::config::CaConfig,
+) -> std::result::Result<Vec<u8>, String> {
+    decode_b64_field(
+        &ca.issuer_key_bytes_b64,
+        "issuer_key_bytes_b64",
+        &ca.label,
+        &format!("{}-key", ca.label),
+    )
 }
 
 fn run_check(config_path: PathBuf) {
@@ -296,6 +318,11 @@ fn run_check(config_path: PathBuf) {
     println!("  Mode:      {}", config.server.mode);
     println!("  Listen:    {}", config.server.listen);
     println!("  Bundle:    {}", config.storage.bundle_dir.display());
+
+    if let Err(e) = config.validate_for_mode() {
+        eprintln!("  Mode:      FAIL — {e}");
+        std::process::exit(1);
+    }
 
     match hoike_core::ResponderState::load(config) {
         Ok(state) => {

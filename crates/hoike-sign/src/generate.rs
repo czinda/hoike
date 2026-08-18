@@ -73,16 +73,27 @@ where
     let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
     let sha1_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
 
-    let manifest = Manifest {
-        format_version: 1,
-        bundle_id: uuid::Uuid::nil(),
-        producer_id: config.producer_id.clone(),
-        created_at: now,
-        bundle_type: BundleType::Full,
-        ca_scopes: vec![ahu::CaScope {
-            hash_algorithm: sha256_oid.as_bytes().to_vec(),
-            issuer_name_hash: issuer_name_hash_sha256.to_vec(),
-            issuer_key_hash: issuer_key_hash_sha256.to_vec(),
+    let mut ca_scopes = vec![ahu::CaScope {
+        hash_algorithm: sha256_oid.as_bytes().to_vec(),
+        issuer_name_hash: issuer_name_hash_sha256.to_vec(),
+        issuer_key_hash: issuer_key_hash_sha256.to_vec(),
+        epoch: config.epoch,
+        responder_id: AhuResponderId {
+            id_type: ResponderIdType::ByKey,
+            value: responder_key_hash.to_vec(),
+        },
+        responder_chain: None,
+        signature_algorithm: vec![],
+        completeness: config.completeness,
+    }];
+
+    // Dual and Sha1Only modes produce SHA-1 CertID entries; register a SHA-1
+    // ca_scope so the router can route requests with SHA-1 issuer hashes.
+    if matches!(config.certid_compat, CertIdCompat::Dual | CertIdCompat::Sha1Only) {
+        ca_scopes.push(ahu::CaScope {
+            hash_algorithm: sha1_oid.as_bytes().to_vec(),
+            issuer_name_hash: issuer_name_hash_sha1.to_vec(),
+            issuer_key_hash: issuer_key_hash_sha1.to_vec(),
             epoch: config.epoch,
             responder_id: AhuResponderId {
                 id_type: ResponderIdType::ByKey,
@@ -91,7 +102,19 @@ where
             responder_chain: None,
             signature_algorithm: vec![],
             completeness: config.completeness,
-        }],
+        });
+    }
+
+    // For Sha256Only, remove the SHA-256 scope if only SHA-1 is wanted —
+    // but Sha256Only should keep just the SHA-256 scope (already the default).
+
+    let manifest = Manifest {
+        format_version: 1,
+        bundle_id: uuid::Uuid::nil(),
+        producer_id: config.producer_id.clone(),
+        created_at: now,
+        bundle_type: BundleType::Full,
+        ca_scopes,
         window: Window {
             produced_at: now,
             this_update_min: now,

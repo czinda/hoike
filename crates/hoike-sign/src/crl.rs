@@ -117,6 +117,7 @@ fn is_leap(y: u64) -> bool {
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     let mut collecting = false;
+    let mut found_end = false;
     let mut b64 = String::new();
     for line in pem.lines() {
         if line.starts_with("-----BEGIN") {
@@ -124,11 +125,20 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
             continue;
         }
         if line.starts_with("-----END") {
+            found_end = true;
             break;
         }
         if collecting {
             b64.push_str(line.trim());
         }
+    }
+    if !collecting {
+        return Err(SignError::CrlParse("PEM has no BEGIN marker".into()));
+    }
+    if !found_end {
+        return Err(SignError::CrlParse(
+            "PEM is truncated: found BEGIN but no END marker".into(),
+        ));
     }
     base64::engine::general_purpose::STANDARD
         .decode(&b64)
