@@ -1,0 +1,33 @@
+[package]
+name = "hoike-server"
+version = "0.1.0"
+description = "HTTP request path for hoike OCSP responder"
+license = "GPL-3.0-or-later"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ahu = { path = "../ahu" }
+hoike-core = { path = "../hoike-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sha2 = { workspace = true }
+digest = { workspace = true }
+hex = { workspace = true }
+arc-swap = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", features = ["blocking"] }
+# Use der 0.7 to match x509-ocsp in tests
+der = { version = "0.7", features = ["alloc"] }
+x509-ocsp = { workspace = true }
+x509-cert = "0.2"
+const-oid = "0.9"
+spki = "0.7"
+uuid = { workspace = true }

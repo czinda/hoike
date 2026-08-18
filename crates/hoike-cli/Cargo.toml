@@ -1,0 +1,28 @@
+[package]
+name = "hoike-cli"
+version = "0.1.0"
+description = "CLI for hoike OCSP responder and ahu bundle tools"
+license = "GPL-3.0-or-later"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hoike"
+path = "src/main.rs"
+
+[[bin]]
+name = "ahu"
+path = "src/ahu_main.rs"
+
+[dependencies]
+ahu = { path = "../ahu" }
+hoike-core = { path = "../hoike-core" }
+hoike-server = { path = "../hoike-server" }
+axum = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

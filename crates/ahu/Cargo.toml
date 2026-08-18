@@ -1,0 +1,33 @@
+[package]
+name = "ahu"
+version = "0.1.0"
+description = "The ahu pre-signed OCSP response bundle format: read, write, verify"
+license = "Apache-2.0 OR MIT"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+der = { workspace = true }
+x509-cert = { workspace = true }
+x509-ocsp = { workspace = true }
+sha2 = { workspace = true }
+digest = { workspace = true }
+cms = { workspace = true }
+const-oid = { workspace = true }
+spki = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+memmap2 = { workspace = true }
+zstd = { workspace = true, optional = true }
+hex = { workspace = true }
+byteorder = { workspace = true }
+bitflags = { workspace = true }
+
+[features]
+default = ["compression"]
+compression = ["dep:zstd"]
+
+[dev-dependencies]
+tempfile = "3"

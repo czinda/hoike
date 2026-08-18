@@ -1,0 +1,10 @@
+[package]
+name = "hoike-gossip"
+version = "0.1.0"
+description = "SWIM membership and generation announcements for hoike"
+license = "GPL-3.0-or-later"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ahu = { path = "../ahu" }

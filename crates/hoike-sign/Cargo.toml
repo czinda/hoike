@@ -1,0 +1,10 @@
+[package]
+name = "hoike-sign"
+version = "0.1.0"
+description = "PKCS#11 signing and generation production for hoike"
+license = "GPL-3.0-or-later"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ahu = { path = "../ahu" }

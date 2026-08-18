@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ahu",
+    "crates/hoike-core",
+    "crates/hoike-sign",
+    "crates/hoike-server",
+    "crates/hoike-gossip",
+    "crates/hoike-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# RustCrypto
+der = "0.8"
+x509-cert = "0.3"
+x509-ocsp = "0.2"
+sha2 = "0.11"
+digest = "0.11"
+cms = "0.3.0-pre.2"
+const-oid = "0.10"
+spki = "0.8"
+
+# Serialization
+ciborium = "0.2"
+ciborium-io = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+hyper = "1"
+
+# Config
+toml = "0.8"
+
+# General
+thiserror = "2"
+uuid = { version = "1", features = ["v7", "serde"] }
+memmap2 = "0.9"
+zstd = "0.13"
+hex = "0.4"
+byteorder = "1"
+bitflags = "2"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap = "1"
+percent-encoding = "2"

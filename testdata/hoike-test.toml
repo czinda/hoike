@@ -1,0 +1,15 @@
+[server]
+mode = "edge"
+listen = "127.0.0.1:2560"
+max_request = 8192
+
+[storage]
+bundle_dir = "/tmp/hoike-test"
+state_db = "/tmp/hoike-test/state"
+max_chain = 24
+
+[[ca]]
+label = "test-ca"
+bundle_file = "/tmp/hoike-test/test.ahu"
+nonce_policy = "ignore"
+completeness = "authoritative-complete"
