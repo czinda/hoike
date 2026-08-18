@@ -141,6 +141,62 @@ async fn run_server(config_path: PathBuf) {
         });
     }
 
+    // Start gossip if enabled
+    if let Some(gossip_cfg) = &config.gossip {
+        if gossip_cfg.enabled {
+            let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<hoike_gossip::GossipMessage>(256);
+
+            let gc = hoike_gossip::GossipConfig {
+                enabled: true,
+                bind: gossip_cfg.bind.clone(),
+                seeds: gossip_cfg.seeds.clone(),
+                node_name: gossip_cfg.node_name.clone(),
+            };
+
+            match hoike_gossip::GossipNode::start(gc, msg_tx).await {
+                Ok(_gossip_node) => {
+                    info!("gossip node started");
+                    let _responder = app_state.responder.clone();
+                    tokio::spawn(async move {
+                        while let Some(msg) = msg_rx.recv().await {
+                            match &msg {
+                                hoike_gossip::GossipMessage::GenerationAnnouncement {
+                                    producer_id,
+                                    epoch,
+                                    bundle_url,
+                                    ..
+                                } => {
+                                    info!(
+                                        producer = %producer_id,
+                                        epoch,
+                                        url = bundle_url.as_deref().unwrap_or("none"),
+                                        "received generation announcement — would pull bundle from peer"
+                                    );
+                                    // In a full implementation: fetch bundle from bundle_url,
+                                    // verify anti-rollback, swap into router via responder.reload()
+                                }
+                                hoike_gossip::GossipMessage::UrgentRevocation {
+                                    producer_id,
+                                    epoch,
+                                    ..
+                                } => {
+                                    info!(
+                                        producer = %producer_id,
+                                        epoch,
+                                        "received urgent revocation notice — would pull delta"
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "gossip startup failed, continuing without gossip");
+                }
+            }
+        }
+    }
+
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind(&listen)

@@ -7,6 +7,26 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub ca: Vec<CaConfig>,
+    pub gossip: Option<GossipConfigSection>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GossipConfigSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_gossip_bind")]
+    pub bind: String,
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    #[serde(default = "default_gossip_node_name")]
+    pub node_name: String,
+}
+
+fn default_gossip_bind() -> String {
+    "0.0.0.0:7946".into()
+}
+fn default_gossip_node_name() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "hoike-node".into())
 }
 
 #[derive(Debug, Deserialize, Clone)]

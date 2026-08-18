@@ -94,3 +94,71 @@ path = "{crl}"
     assert!(config.needs_signing());
     assert_eq!(config.ca[0].batch_interval, 60);
 }
+
+#[test]
+fn gossip_config_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_dir = dir.path().join("bundles");
+    std::fs::create_dir_all(&bundle_dir).unwrap();
+    let config_path = dir.path().join("hoike.toml");
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "{}"
+
+[gossip]
+enabled = true
+bind = "0.0.0.0:7947"
+seeds = ["edge-a.pki.example:7946", "edge-b.pki.example:7946"]
+node_name = "test-edge-01"
+
+[[ca]]
+label = "test-ca"
+"#,
+            bundle_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+    let gossip = config.gossip.as_ref().expect("gossip section should be present");
+    assert!(gossip.enabled);
+    assert_eq!(gossip.bind, "0.0.0.0:7947");
+    assert_eq!(gossip.seeds.len(), 2);
+    assert_eq!(gossip.node_name, "test-edge-01");
+}
+
+#[test]
+fn gossip_absent_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_dir = dir.path().join("bundles");
+    std::fs::create_dir_all(&bundle_dir).unwrap();
+    let config_path = dir.path().join("hoike.toml");
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "{}"
+
+[[ca]]
+label = "test-ca"
+"#,
+            bundle_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+    assert!(config.gossip.is_none());
+}
