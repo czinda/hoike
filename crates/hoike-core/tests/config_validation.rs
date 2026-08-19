@@ -173,7 +173,10 @@ key_label = "hoike-responder"
 
     let config = Config::from_file(&config_path).unwrap();
     let result = config.validate_for_mode();
-    assert!(result.is_ok(), "PKCS#11 without pin/pin_env should pass validation (interactive prompt at runtime)");
+    assert!(
+        result.is_ok(),
+        "PKCS#11 without pin/pin_env should pass validation (interactive prompt at runtime)"
+    );
 }
 
 #[test]

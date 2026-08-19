@@ -71,7 +71,10 @@ impl Pkcs11Signer {
             .map_err(|e| SignError::Pkcs11(format!("open session: {e}")))?;
 
         session
-            .login(UserType::User, Some(&AuthPin::new(config.pin.clone().into())))
+            .login(
+                UserType::User,
+                Some(&AuthPin::new(config.pin.clone().into())),
+            )
             .map_err(|e| SignError::Pkcs11(format!("login: {e}")))?;
 
         let key_handle = find_key(&session, config)?;
@@ -135,10 +138,7 @@ fn find_slot(ctx: &Pkcs11, config: &Pkcs11Config) -> Result<cryptoki::slot::Slot
     }
 }
 
-fn find_key(
-    session: &cryptoki::session::Session,
-    config: &Pkcs11Config,
-) -> Result<ObjectHandle> {
+fn find_key(session: &cryptoki::session::Session, config: &Pkcs11Config) -> Result<ObjectHandle> {
     if config.key_label.is_none() && config.key_id.is_none() {
         return Err(SignError::Pkcs11(
             "PKCS#11 config must specify key_label or key_id to identify the signing key".into(),
@@ -247,16 +247,12 @@ impl signature::Signer<Pkcs11EcdsaSignature> for Pkcs11SignerBridge {
         // Convert to DER-encoded ECDSA-Sig-Value.
         let der_sig = raw_ecdsa_to_der(&raw_sig).map_err(|_| signature::Error::new())?;
 
-        Ok(Pkcs11EcdsaSignature {
-            der_bytes: der_sig,
-        })
+        Ok(Pkcs11EcdsaSignature { der_bytes: der_sig })
     }
 }
 
 impl spki::DynSignatureAlgorithmIdentifier for Pkcs11SignerBridge {
-    fn signature_algorithm_identifier(
-        &self,
-    ) -> spki::Result<spki::AlgorithmIdentifierOwned> {
+    fn signature_algorithm_identifier(&self) -> spki::Result<spki::AlgorithmIdentifierOwned> {
         Ok(spki::AlgorithmIdentifierOwned {
             oid: const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
             parameters: None,

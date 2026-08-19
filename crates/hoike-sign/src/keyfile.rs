@@ -40,9 +40,7 @@ mod tests {
         let key_path = dir.path().join("test.der");
 
         let original = demo_ecdsa_p256_key();
-        let der_bytes = original
-            .to_pkcs8_der()
-            .expect("PKCS#8 DER encode failed");
+        let der_bytes = original.to_pkcs8_der().expect("PKCS#8 DER encode failed");
         std::fs::write(&key_path, der_bytes.as_bytes()).unwrap();
 
         let loaded = load_ecdsa_p256_key(&key_path).unwrap();

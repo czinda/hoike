@@ -861,12 +861,8 @@ fn resolve_pkcs11_pin(
     };
 
     eprint!("{}", prompt);
-    rpassword::read_password().map_err(|e| {
-        format!(
-            "CA '{}': failed to read PIN from terminal: {e}",
-            ca_label
-        )
-    })
+    rpassword::read_password()
+        .map_err(|e| format!("CA '{}': failed to read PIN from terminal: {e}", ca_label))
 }
 
 /// Resolve PKCS#11 config from CaConfig.
@@ -884,12 +880,8 @@ fn resolve_pkcs11_config(
             key_label,
             key_id,
         }) => {
-            let resolved_pin = resolve_pkcs11_pin(
-                &ca_config.label,
-                token_label.as_deref(),
-                pin,
-                pin_env,
-            )?;
+            let resolved_pin =
+                resolve_pkcs11_pin(&ca_config.label, token_label.as_deref(), pin, pin_env)?;
 
             Ok(hoike_sign::Pkcs11Config {
                 module_path: module.clone(),
@@ -901,7 +893,10 @@ fn resolve_pkcs11_config(
                     .as_ref()
                     .map(|h| {
                         hex::decode(h).map_err(|e| {
-                            format!("CA '{}': invalid hex in key_id '{}': {e}", ca_config.label, h)
+                            format!(
+                                "CA '{}': invalid hex in key_id '{}': {e}",
+                                ca_config.label, h
+                            )
                         })
                     })
                     .transpose()?,
