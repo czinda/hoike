@@ -815,7 +815,61 @@ fn run_sign(
     println!("  Output:            {}", output.display());
 }
 
-/// Resolve PKCS#11 config from CaConfig, reading PIN from env if needed.
+#[cfg(feature = "pkcs11")]
+/// Resolve a PKCS#11 PIN through the precedence chain:
+///   1. `pin` in config (least secure — plaintext on disk)
+///   2. `pin_env` — read from the named environment variable
+///   3. Interactive terminal prompt (most secure — never stored)
+///
+/// For production deployments, omit both `pin` and `pin_env` from the
+/// config file. hoike will prompt at startup:
+///
+/// ```text
+/// Enter PKCS#11 PIN for CA 'enterprise-issuing-01' (Luna: hoike-partition):
+/// ```
+///
+/// For automated/headless environments (containers, systemd), use `pin_env`
+/// and inject the PIN via a secrets manager (Vault, Kubernetes secrets, etc.).
+fn resolve_pkcs11_pin(
+    ca_label: &str,
+    token_label: Option<&str>,
+    pin: &Option<String>,
+    pin_env: &Option<String>,
+) -> std::result::Result<String, String> {
+    if let Some(p) = pin {
+        warn!(
+            ca = ca_label,
+            "PKCS#11 PIN is in config file — use pin_env or interactive prompt for production"
+        );
+        return Ok(p.clone());
+    }
+
+    if let Some(env_var) = pin_env {
+        return std::env::var(env_var).map_err(|_| {
+            format!(
+                "CA '{}': PKCS#11 pin_env '{}' is not set in environment",
+                ca_label, env_var
+            )
+        });
+    }
+
+    // Interactive prompt — the production path
+    let prompt = if let Some(tl) = token_label {
+        format!("Enter PKCS#11 PIN for CA '{}' (token: {}): ", ca_label, tl)
+    } else {
+        format!("Enter PKCS#11 PIN for CA '{}': ", ca_label)
+    };
+
+    eprint!("{}", prompt);
+    rpassword::read_password().map_err(|e| {
+        format!(
+            "CA '{}': failed to read PIN from terminal: {e}",
+            ca_label
+        )
+    })
+}
+
+/// Resolve PKCS#11 config from CaConfig.
 #[cfg(feature = "pkcs11")]
 fn resolve_pkcs11_config(
     ca_config: &hoike_core::config::CaConfig,
@@ -830,21 +884,12 @@ fn resolve_pkcs11_config(
             key_label,
             key_id,
         }) => {
-            let resolved_pin = if let Some(p) = pin {
-                p.clone()
-            } else if let Some(env_var) = pin_env {
-                std::env::var(env_var).map_err(|_| {
-                    format!(
-                        "CA '{}': PKCS#11 pin_env '{}' is not set",
-                        ca_config.label, env_var
-                    )
-                })?
-            } else {
-                return Err(format!(
-                    "CA '{}': PKCS#11 has neither pin nor pin_env",
-                    ca_config.label
-                ));
-            };
+            let resolved_pin = resolve_pkcs11_pin(
+                &ca_config.label,
+                token_label.as_deref(),
+                pin,
+                pin_env,
+            )?;
 
             Ok(hoike_sign::Pkcs11Config {
                 module_path: module.clone(),

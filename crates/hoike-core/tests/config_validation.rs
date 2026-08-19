@@ -136,7 +136,7 @@ path = "{crl}"
 }
 
 #[test]
-fn pkcs11_config_without_pin_is_error() {
+fn pkcs11_config_without_pin_allows_interactive_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("hoike.toml");
     let crl_path = dir.path().join("test.crl");
@@ -173,9 +173,7 @@ key_label = "hoike-responder"
 
     let config = Config::from_file(&config_path).unwrap();
     let result = config.validate_for_mode();
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("pin"), "got: {msg}");
+    assert!(result.is_ok(), "PKCS#11 without pin/pin_env should pass validation (interactive prompt at runtime)");
 }
 
 #[test]

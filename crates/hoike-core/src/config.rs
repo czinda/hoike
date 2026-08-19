@@ -187,17 +187,9 @@ impl Config {
                         ca.label, self.server.mode
                     )));
                 }
-                if let Some(SigningKeyConfig::Pkcs11 {
-                    pin, pin_env, ..
-                }) = &ca.signing_key
-                {
-                    if pin.is_none() && pin_env.is_none() {
-                        return Err(crate::error::CoreError::Config(format!(
-                            "CA '{}' PKCS#11 signing_key has neither pin nor pin_env",
-                            ca.label
-                        )));
-                    }
-                }
+                // PKCS#11 PIN resolution: pin (config) → pin_env (env var) → interactive prompt.
+                // All three are valid — no validation error if both pin and pin_env are absent,
+                // because the CLI will prompt interactively at startup.
             }
             if self.ca.is_empty() {
                 return Err(crate::error::CoreError::Config(format!(
