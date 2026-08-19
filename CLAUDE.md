@@ -44,5 +44,7 @@ uses `der` 0.8 and must not directly encode/decode x509-ocsp types.
 
 - M0 (ahu crate): Done
 - M1 (edge server): Done
-- M2 (signer tier): In progress
-- M3-M5: Planned
+- M2 (signer tier — CRL adapter, ECDSA signing): Done
+- M3 (multi-CA routing, nonce policies, combined mode): Done
+- M4 (gossip via foca SWIM, enclave import, anti-rollback): Done
+- M5 (ML-DSA-44/65/87, batching benchmark, RFC 9919/9654 conformance): Done

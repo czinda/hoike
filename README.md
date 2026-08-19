@@ -138,10 +138,10 @@ hoike/
 |--|-------|--------|
 | **M0** | `ahu` crate: read, write, verify, CLI | Done |
 | **M1** | Single-CA edge server: GET/POST, RFC 9919 headers | Done |
-| **M2** | Signer tier: Dogtag adapter, PKCS#11, batch production | In progress |
-| **M3** | Multi-CA routing, nonce policies, combined mode | Planned |
-| **M4** | Gossip, enclave import, anti-rollback persistence | Planned |
-| **M5** | ML-DSA post-quantum, batching benchmarks, Infrared conformance | Planned |
+| **M2** | Signer tier: CRL adapter, ECDSA signing, batch production | Done |
+| **M3** | Multi-CA routing, nonce policies, combined mode | Done |
+| **M4** | Gossip (SWIM/foca), enclave import, anti-rollback persistence | Done |
+| **M5** | ML-DSA-44/65/87 post-quantum, batching benchmarks, RFC 9919/9654 conformance suite | Done |
 
 ## License
 
