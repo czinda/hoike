@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use hoike_core::{
-    CONTENT_TYPE_OCSP_REQUEST, CONTENT_TYPE_OCSP_RESPONSE, INTERNAL_ERROR, MALFORMED_REQUEST,
-    TRY_LATER, UNAUTHORIZED, LookupResult, NonceAction, decode_get_path, parse_ocsp_request,
+    CONTENT_TYPE_OCSP_REQUEST, CONTENT_TYPE_OCSP_RESPONSE, INTERNAL_ERROR, LookupResult,
+    MALFORMED_REQUEST, NonceAction, TRY_LATER, UNAUTHORIZED, decode_get_path, parse_ocsp_request,
     validate_nonce,
 };
 
@@ -18,10 +18,7 @@ pub async fn handle_get_root() -> Response {
     ocsp_error_response(MALFORMED_REQUEST)
 }
 
-pub async fn handle_get(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-) -> Response {
+pub async fn handle_get(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     let der_bytes = match decode_get_path(&path) {
         Ok(b) => b,
         Err(e) => {
@@ -221,7 +218,9 @@ fn ocsp_success_response(result: &LookupResult) -> Response {
     );
 
     let window = &result.window;
-    let validity_secs = window.next_update_min.saturating_sub(window.this_update_min);
+    let validity_secs = window
+        .next_update_min
+        .saturating_sub(window.this_update_min);
     let max_age = (validity_secs / 2).max(60);
 
     let cache_control = format!("max-age={max_age}, public, no-transform, must-revalidate");

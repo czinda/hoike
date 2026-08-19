@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use ahu::Bundle;
 use crate::error::{CoreError, Result};
+use ahu::Bundle;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PersistedState {
@@ -59,11 +59,7 @@ impl StateStore {
         })
     }
 
-    pub fn get_high_water(
-        &self,
-        producer_id: &str,
-        issuer_key_hash_hex: &str,
-    ) -> Option<u64> {
+    pub fn get_high_water(&self, producer_id: &str, issuer_key_hash_hex: &str) -> Option<u64> {
         let key = PersistedState::make_key(producer_id, issuer_key_hash_hex);
         self.state.high_water_marks.get(&key).copied()
     }
@@ -146,9 +142,8 @@ impl StateStore {
     }
 
     fn persist(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.state).map_err(|e| {
-            CoreError::StateStore(format!("failed to serialize state: {e}"))
-        })?;
+        let json = serde_json::to_string_pretty(&self.state)
+            .map_err(|e| CoreError::StateStore(format!("failed to serialize state: {e}")))?;
 
         let tmp_path = self.path.with_extension("tmp");
         std::fs::write(&tmp_path, &json).map_err(|e| {

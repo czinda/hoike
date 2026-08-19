@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::error::{AhuError, Result};
 use crate::header::{FileHeader, HEADER_SIZE};
-use crate::index::{IndexRecord, INDEX_RECORD_SIZE};
+use crate::index::{INDEX_RECORD_SIZE, IndexRecord};
 use crate::manifest::Manifest;
 
 /// A parsed ahu bundle, loaded into memory.
@@ -33,7 +33,8 @@ impl Bundle {
         let header = FileHeader::read_from(&mut cursor)?;
         header.validate_bounds(file_size)?;
 
-        let manifest_bytes = Self::read_section(bytes, header.manifest_offset, header.manifest_length as u64)?;
+        let manifest_bytes =
+            Self::read_section(bytes, header.manifest_offset, header.manifest_length as u64)?;
         let manifest = Manifest::from_cbor(&manifest_bytes)?;
 
         let seal_bytes = Self::read_section(bytes, header.seal_offset, header.seal_length as u64)?;
@@ -195,7 +196,8 @@ impl BundleBuilder {
         F: FnOnce(&[u8]) -> Result<Vec<u8>>,
     {
         // Sort entries by key, resolving alias data sharing.
-        self.entries.sort_by(|a, b| a.0.entry_key.cmp(&b.0.entry_key));
+        self.entries
+            .sort_by(|a, b| a.0.entry_key.cmp(&b.0.entry_key));
 
         // Build data section and fix up offsets.
         // For ALIAS entries, deduplicate identical payloads so the data
@@ -371,9 +373,7 @@ mod tests {
 
         builder.add_entry(entry_key, response.clone());
 
-        let bytes = builder
-            .build(|m| Ok(Sha256::digest(m).to_vec()))
-            .unwrap();
+        let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
         let bundle = Bundle::from_bytes(&bytes).unwrap();
         assert_eq!(bundle.index.len(), 1);
@@ -398,9 +398,7 @@ mod tests {
         builder.add_entry(key_b, b"response-b".to_vec());
         builder.add_entry(key_a, b"response-a".to_vec());
 
-        let bytes = builder
-            .build(|m| Ok(Sha256::digest(m).to_vec()))
-            .unwrap();
+        let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
         let bundle = Bundle::from_bytes(&bytes).unwrap();
         assert_eq!(bundle.index[0].entry_key, key_a);

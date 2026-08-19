@@ -50,9 +50,7 @@ fn make_bundle(producer: &str, epoch: u64, prev_digest: Option<[u8; 32]>) -> (Bu
     let mut builder = BundleBuilder::new(manifest);
     builder.add_entry([epoch as u8; 32], format!("response-{epoch}").into_bytes());
 
-    let bytes = builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap();
+    let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
     let bundle = Bundle::from_bytes(&bytes).unwrap();
     (bundle, bytes)
 }
@@ -155,7 +153,10 @@ fn advance_is_atomic() {
 
     assert!(path.exists());
     let tmp_path = path.with_extension("tmp");
-    assert!(!tmp_path.exists(), ".tmp file should be cleaned up after rename");
+    assert!(
+        !tmp_path.exists(),
+        ".tmp file should be cleaned up after rename"
+    );
 
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(contents.contains("\"p:k\""));

@@ -1,6 +1,6 @@
 use ahu::{
-    BundleBuilder, BundleType, CaScope, Completeness, Continuity, Integrity, Manifest,
-    ResponderId, ResponderIdType, Window,
+    BundleBuilder, BundleType, CaScope, Completeness, Continuity, Integrity, Manifest, ResponderId,
+    ResponderIdType, Window,
 };
 use der::Encode;
 use sha2::{Digest, Sha256};
@@ -56,11 +56,7 @@ fn build_ocsp_request(cert_id: &CertId) -> Vec<u8> {
     ocsp_req.to_der().expect("OCSPRequest encode failed")
 }
 
-fn build_bundle_for_ca(
-    issuer_name: &[u8],
-    issuer_key: &[u8],
-    entries: &[(u64, &[u8])],
-) -> Vec<u8> {
+fn build_bundle_for_ca(issuer_name: &[u8], issuer_key: &[u8], entries: &[(u64, &[u8])]) -> Vec<u8> {
     let manifest = Manifest {
         format_version: 1,
         bundle_id: Uuid::nil(),
@@ -68,9 +64,7 @@ fn build_bundle_for_ca(
         created_at: 1700000000,
         bundle_type: BundleType::Full,
         ca_scopes: vec![CaScope {
-            hash_algorithm: vec![
-                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-            ],
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
             issuer_name_hash: Sha256::digest(issuer_name).to_vec(),
             issuer_key_hash: Sha256::digest(issuer_key).to_vec(),
             epoch: 1,
@@ -125,9 +119,7 @@ fn build_test_bundle_with_real_certids(entries: &[(u64, &[u8])]) -> Vec<u8> {
         created_at: 1700000000,
         bundle_type: BundleType::Full,
         ca_scopes: vec![CaScope {
-            hash_algorithm: vec![
-                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-            ],
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
             issuer_name_hash: Sha256::digest(b"CN=Test CA,O=Hoike Test").to_vec(),
             issuer_key_hash: Sha256::digest(b"test-ca-public-key").to_vec(),
             epoch: 1,
@@ -506,7 +498,9 @@ fn build_ocsp_request_with_nonce(cert_id: &CertId, nonce: &[u8]) -> Vec<u8> {
         optional_signature: None,
     };
 
-    ocsp_req.to_der().expect("OCSPRequest with nonce encode failed")
+    ocsp_req
+        .to_der()
+        .expect("OCSPRequest with nonce encode failed")
 }
 
 #[tokio::test]

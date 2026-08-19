@@ -46,9 +46,7 @@ fn main() {
 
     let bucket_sizes = [1, 2, 5, 10, 25, 50, 100];
 
-    println!(
-        "Batching Benchmark ({cert_count} certificates, ECDSA P-256)"
-    );
+    println!("Batching Benchmark ({cert_count} certificates, ECDSA P-256)");
     println!("═══════════════════════════════════════════════════════════════════════════");
     println!(
         "{:<8} {:>14} {:>12} {:>14} {:>10} {:>10}",
@@ -63,7 +61,10 @@ fn main() {
 
     // Also collect CSV
     let mut csv_lines = Vec::new();
-    csv_lines.push("bucket_size,bundle_bytes,per_entry_bytes,data_section_bytes,savings_pct,time_ms".to_string());
+    csv_lines.push(
+        "bucket_size,bundle_bytes,per_entry_bytes,data_section_bytes,savings_pct,time_ms"
+            .to_string(),
+    );
 
     for &bucket_size in &bucket_sizes {
         if bucket_size > cert_count {

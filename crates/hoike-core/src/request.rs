@@ -76,24 +76,19 @@ pub fn parse_ocsp_request(der_bytes: &[u8]) -> Result<ParsedRequest> {
     // We parse through that inner OCTET STRING to get the actual nonce bytes
     // so RFC 9654 length validation applies to the nonce itself, not
     // its DER wrapper.
-    let nonce_ext = tbs
-        .request_extensions
-        .as_ref()
-        .and_then(|exts| {
-            exts.iter().find(|ext| {
-                ext.extn_id == der::oid::db::rfc6960::ID_PKIX_OCSP_NONCE
-            })
-        });
+    let nonce_ext = tbs.request_extensions.as_ref().and_then(|exts| {
+        exts.iter()
+            .find(|ext| ext.extn_id == der::oid::db::rfc6960::ID_PKIX_OCSP_NONCE)
+    });
 
     let nonce = match nonce_ext {
         Some(ext) => {
             let raw = ext.extn_value.as_bytes();
-            let inner = der::asn1::OctetStringRef::from_der(raw).map_err(|e| {
-                CoreError::DerParse {
+            let inner =
+                der::asn1::OctetStringRef::from_der(raw).map_err(|e| CoreError::DerParse {
                     context: "nonce extension value",
                     detail: e.to_string(),
-                }
-            })?;
+                })?;
             Some(inner.as_bytes().to_vec())
         }
         None => None,

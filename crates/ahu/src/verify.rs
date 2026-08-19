@@ -187,9 +187,7 @@ mod tests {
         let mut builder = BundleBuilder::new(test_manifest());
         builder.add_entry([0xAA; 32], b"response".to_vec());
 
-        let bytes = builder
-            .build(|m| Ok(Sha256::digest(m).to_vec()))
-            .unwrap();
+        let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
         let bundle = Bundle::from_bytes(&bytes).unwrap();
         let result = verify_structure(&bundle).unwrap();
@@ -205,9 +203,7 @@ mod tests {
         let mut builder = BundleBuilder::new(test_manifest());
         builder.add_entry([0xAA; 32], b"response".to_vec());
 
-        let bytes = builder
-            .build(|m| Ok(Sha256::digest(m).to_vec()))
-            .unwrap();
+        let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
         let bundle = Bundle::from_bytes(&bytes).unwrap();
 

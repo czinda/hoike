@@ -51,9 +51,7 @@ fn build_full_bundle(entries: &[([u8; 32], &[u8])], epoch: u64) -> (Vec<u8>, [u8
     for (key, data) in entries {
         builder.add_entry(*key, data.to_vec());
     }
-    let bytes = builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap();
+    let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
     let bundle = Bundle::from_bytes(&bytes).unwrap();
     let digest = manifest_digest(&bundle.manifest_bytes);
     (bytes, digest)
@@ -77,9 +75,7 @@ fn build_delta_bundle(
             None => builder.add_tombstone(*key),
         }
     }
-    let bytes = builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap();
+    let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
     let bundle = Bundle::from_bytes(&bytes).unwrap();
     let digest = manifest_digest(&bundle.manifest_bytes);
     (bytes, digest)
@@ -152,9 +148,7 @@ fn apply_base_plus_delta() {
     for (key, data) in &working_set {
         builder.add_entry(*key, data.clone());
     }
-    let materialized = builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap();
+    let materialized = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
     let result = Bundle::from_bytes(&materialized).unwrap();
     verify_structure(&result).unwrap();
@@ -173,26 +167,15 @@ fn apply_chain_of_deltas() {
     let key_b = [0x0B; 32];
     let key_c = [0x0C; 32];
 
-    let (base_bytes, base_digest) = build_full_bundle(
-        &[(key_a, b"A-v1")],
-        1,
-    );
+    let (base_bytes, base_digest) = build_full_bundle(&[(key_a, b"A-v1")], 1);
 
     // Delta 1: add B
-    let (delta1_bytes, delta1_digest) = build_delta_bundle(
-        &[(key_b, Some(b"B-v1"))],
-        2,
-        base_digest,
-        base_digest,
-        1,
-    );
+    let (delta1_bytes, delta1_digest) =
+        build_delta_bundle(&[(key_b, Some(b"B-v1"))], 2, base_digest, base_digest, 1);
 
     // Delta 2: add C, update A
     let (delta2_bytes, _delta2_digest) = build_delta_bundle(
-        &[
-            (key_c, Some(b"C-v1")),
-            (key_a, Some(b"A-v2")),
-        ],
+        &[(key_c, Some(b"C-v1")), (key_a, Some(b"A-v2"))],
         3,
         base_digest,
         delta1_digest,

@@ -82,7 +82,11 @@ impl FileHeader {
             Ok(())
         };
 
-        check("manifest", self.manifest_offset, self.manifest_length as u64)?;
+        check(
+            "manifest",
+            self.manifest_offset,
+            self.manifest_length as u64,
+        )?;
         check("seal", self.seal_offset, self.seal_length as u64)?;
         check("index", self.index_offset, self.index_length)?;
         check("data", self.data_offset, self.data_length)?;

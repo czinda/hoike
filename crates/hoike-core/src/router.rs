@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
-use ahu::Bundle;
 use crate::config::Config;
 use crate::error::{CoreError, Result};
 use crate::request::ParsedCertId;
 use crate::state::StateStore;
+use ahu::Bundle;
 
 /// Routing key: (issuerNameHash, issuerKeyHash).
 /// Both SHA-1 and SHA-256 hash algorithms produce different CertIDs for the
@@ -83,19 +83,22 @@ impl ResponderState {
         for entry in scope_entries {
             let bundle = &map.bundles[entry.bundle_idx];
             if let Some(response_bytes) = bundle.lookup(&cert_id.entry_key) {
-                hits.push((entry, response_bytes.to_vec(), bundle.manifest.window.clone()));
+                hits.push((
+                    entry,
+                    response_bytes.to_vec(),
+                    bundle.manifest.window.clone(),
+                ));
             }
         }
 
-        let make_result = |entry: &ScopeEntry, response_bytes: Vec<u8>, window: ahu::Window| {
-            LookupResult {
+        let make_result =
+            |entry: &ScopeEntry, response_bytes: Vec<u8>, window: ahu::Window| LookupResult {
                 response_bytes,
                 window,
                 ca_label: entry.ca_label.clone(),
                 nonce_policy: entry.nonce_policy.clone(),
                 forward_to: entry.forward_to.clone(),
-            }
-        };
+            };
 
         match hits.len() {
             0 => None,
@@ -151,7 +154,12 @@ impl ResponderState {
                 let bundle = &map.bundles[entry.bundle_idx];
                 info.push((
                     entry.ca_label.clone(),
-                    bundle.manifest.ca_scopes.first().map(|s| s.epoch).unwrap_or(0),
+                    bundle
+                        .manifest
+                        .ca_scopes
+                        .first()
+                        .map(|s| s.epoch)
+                        .unwrap_or(0),
                     entry.completeness.clone(),
                 ));
             }
@@ -161,11 +169,16 @@ impl ResponderState {
 
     /// Hot-reload all bundles from disk with anti-rollback checks.
     pub fn reload(&self) -> Result<()> {
-        let mut store = self.state_store.lock().map_err(|e| {
-            CoreError::StateStore(format!("state store lock poisoned: {e}"))
-        })?;
+        let mut store = self
+            .state_store
+            .lock()
+            .map_err(|e| CoreError::StateStore(format!("state store lock poisoned: {e}")))?;
         let scope_map = load_scope_map(&self.config, &mut store)?;
-        let total: u64 = scope_map.bundles.iter().map(|b| b.manifest.entry_count).sum();
+        let total: u64 = scope_map
+            .bundles
+            .iter()
+            .map(|b| b.manifest.entry_count)
+            .sum();
         self.scope_map.store(Arc::new(scope_map));
         info!(total_entries = total, "all bundles reloaded");
         Ok(())
@@ -264,7 +277,11 @@ fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<Scope
 
     let scope_count = entries.len();
     let bundle_count = bundles.len();
-    info!(bundles = bundle_count, scopes = scope_count, "scope map loaded");
+    info!(
+        bundles = bundle_count,
+        scopes = scope_count,
+        "scope map loaded"
+    );
 
     Ok(ScopeMap { entries, bundles })
 }
@@ -297,7 +314,8 @@ fn register_bundle_scopes(
         info!(
             ca = ca_label,
             epoch = scope.epoch,
-            issuer_key_hash = hex::encode(&scope.issuer_key_hash[..8.min(scope.issuer_key_hash.len())]),
+            issuer_key_hash =
+                hex::encode(&scope.issuer_key_hash[..8.min(scope.issuer_key_hash.len())]),
             "registered CA scope"
         );
     }
@@ -336,11 +354,7 @@ fn load_and_verify_bundle(path: &Path) -> Result<Bundle> {
 fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {
     let mut file_entries: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "ahu")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "ahu"))
         .collect();
 
     file_entries.sort_by_key(|e| {

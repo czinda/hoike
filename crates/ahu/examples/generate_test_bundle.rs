@@ -6,17 +6,16 @@ fn main() {
     let manifest = Manifest {
         format_version: 1,
         bundle_id: Uuid::from_bytes([
-            0x01, 0x92, 0xf3, 0xc8, 0x00, 0x00, 0x70, 0x00,
-            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x92, 0xf3, 0xc8, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
         ]),
         producer_id: "signer-a.pki.example".into(),
         created_at: 1700000000,
         bundle_type: BundleType::Full,
         ca_scopes: vec![CaScope {
-            hash_algorithm: vec![
-                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-            ],
-            issuer_name_hash: Sha256::digest(b"CN=Enterprise Issuing CA 01,O=Example Corp").to_vec(),
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
+            issuer_name_hash: Sha256::digest(b"CN=Enterprise Issuing CA 01,O=Example Corp")
+                .to_vec(),
             issuer_key_hash: Sha256::digest(b"fake-issuer-public-key").to_vec(),
             epoch: 4417,
             responder_id: ResponderId {
@@ -24,9 +23,7 @@ fn main() {
                 value: Sha256::digest(b"fake-responder-public-key")[..20].to_vec(),
             },
             responder_chain: None,
-            signature_algorithm: vec![
-                0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02,
-            ],
+            signature_algorithm: vec![0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02],
             completeness: Completeness::AuthoritativeComplete,
         }],
         window: Window {

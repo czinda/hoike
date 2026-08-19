@@ -10,9 +10,7 @@ fn build_test_bundle(entry_count: usize) -> Vec<u8> {
         created_at: 1700000000,
         bundle_type: BundleType::Full,
         ca_scopes: vec![CaScope {
-            hash_algorithm: vec![
-                0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-            ],
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
             issuer_name_hash: vec![0xAA; 32],
             issuer_key_hash: vec![0xBB; 32],
             epoch: 1,
@@ -157,9 +155,7 @@ fn delta_bundle_with_tombstone() {
     let removed_key = compute_entry_key(b"revoked-cert");
     builder.add_tombstone(removed_key);
 
-    let bytes = builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap();
+    let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
     let bundle = Bundle::from_bytes(&bytes).unwrap();
     assert_eq!(bundle.manifest.bundle_type, BundleType::Delta);
@@ -257,9 +253,7 @@ fn dual_certid_alias_survives_sort() {
     builder.add_dual_entry(key_sha1, key_sha256, shared_response.clone());
     builder.add_entry(key_between, b"other-response".to_vec());
 
-    let bytes = builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap();
+    let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 
     let bundle = Bundle::from_bytes(&bytes).unwrap();
     let result = verify_structure(&bundle).unwrap();

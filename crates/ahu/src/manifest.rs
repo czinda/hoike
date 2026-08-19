@@ -122,7 +122,10 @@ impl Manifest {
 
         let responder_id_to_val = |rid: &ResponderId| -> Value {
             Value::Map(vec![
-                (Value::Integer(1.into()), Value::Integer((rid.id_type as u8 ).into())),
+                (
+                    Value::Integer(1.into()),
+                    Value::Integer((rid.id_type as u8).into()),
+                ),
                 (Value::Integer(2.into()), Value::Bytes(rid.value.clone())),
             ])
         };
@@ -132,11 +135,23 @@ impl Manifest {
             .iter()
             .map(|s| {
                 let mut entries = vec![
-                    (Value::Integer(1.into()), Value::Bytes(s.hash_algorithm.clone())),
-                    (Value::Integer(2.into()), Value::Bytes(s.issuer_name_hash.clone())),
-                    (Value::Integer(3.into()), Value::Bytes(s.issuer_key_hash.clone())),
-                    (Value::Integer(4.into()), Value::Integer((s.epoch ).into())),
-                    (Value::Integer(5.into()), responder_id_to_val(&s.responder_id)),
+                    (
+                        Value::Integer(1.into()),
+                        Value::Bytes(s.hash_algorithm.clone()),
+                    ),
+                    (
+                        Value::Integer(2.into()),
+                        Value::Bytes(s.issuer_name_hash.clone()),
+                    ),
+                    (
+                        Value::Integer(3.into()),
+                        Value::Bytes(s.issuer_key_hash.clone()),
+                    ),
+                    (Value::Integer(4.into()), Value::Integer((s.epoch).into())),
+                    (
+                        Value::Integer(5.into()),
+                        responder_id_to_val(&s.responder_id),
+                    ),
                 ];
                 if let Some(chain) = &s.responder_chain {
                     entries.push((
@@ -144,25 +159,46 @@ impl Manifest {
                         Value::Array(chain.iter().map(|c| Value::Bytes(c.clone())).collect()),
                     ));
                 }
-                entries.push((Value::Integer(7.into()), Value::Bytes(s.signature_algorithm.clone())));
+                entries.push((
+                    Value::Integer(7.into()),
+                    Value::Bytes(s.signature_algorithm.clone()),
+                ));
                 entries.push((
                     Value::Integer(8.into()),
-                    Value::Integer((s.completeness as u8 ).into()),
+                    Value::Integer((s.completeness as u8).into()),
                 ));
                 Value::Map(entries)
             })
             .collect();
 
         let window = Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer((self.window.produced_at ).into())),
-            (Value::Integer(2.into()), Value::Integer((self.window.this_update_min ).into())),
-            (Value::Integer(3.into()), Value::Integer((self.window.next_update_min ).into())),
-            (Value::Integer(4.into()), Value::Integer((self.window.next_update_max ).into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer((self.window.produced_at).into()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Integer((self.window.this_update_min).into()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Integer((self.window.next_update_min).into()),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Integer((self.window.next_update_max).into()),
+            ),
         ]);
 
         let integrity = Value::Map(vec![
-            (Value::Integer(1.into()), Value::Bytes(self.integrity.index_digest.to_vec())),
-            (Value::Integer(2.into()), Value::Bytes(self.integrity.data_digest.to_vec())),
+            (
+                Value::Integer(1.into()),
+                Value::Bytes(self.integrity.index_digest.to_vec()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes(self.integrity.data_digest.to_vec()),
+            ),
         ]);
 
         let mut continuity_entries = Vec::new();
@@ -174,23 +210,38 @@ impl Manifest {
         }
         continuity_entries.push((
             Value::Integer(3.into()),
-            Value::Integer((self.continuity.chain_length ).into()),
+            Value::Integer((self.continuity.chain_length).into()),
         ));
         let continuity = Value::Map(continuity_entries);
 
         let mut root = vec![
-            (Value::Integer(1.into()), Value::Integer((self.format_version ).into())),
-            (Value::Integer(2.into()), Value::Bytes(self.bundle_id.as_bytes().to_vec())),
-            (Value::Integer(3.into()), Value::Text(self.producer_id.clone())),
-            (Value::Integer(4.into()), Value::Integer((self.created_at ).into())),
+            (
+                Value::Integer(1.into()),
+                Value::Integer((self.format_version).into()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes(self.bundle_id.as_bytes().to_vec()),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Text(self.producer_id.clone()),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Integer((self.created_at).into()),
+            ),
             (
                 Value::Integer(5.into()),
-                Value::Integer((self.bundle_type as u8 ).into()),
+                Value::Integer((self.bundle_type as u8).into()),
             ),
             (Value::Integer(6.into()), Value::Array(ca_scopes)),
             (Value::Integer(7.into()), window),
             (Value::Integer(8.into()), integrity),
-            (Value::Integer(9.into()), Value::Integer((self.entry_count ).into())),
+            (
+                Value::Integer(9.into()),
+                Value::Integer((self.entry_count).into()),
+            ),
             (Value::Integer(10.into()), continuity),
         ];
 
@@ -198,9 +249,18 @@ impl Manifest {
             root.push((
                 Value::Integer(11.into()),
                 Value::Map(vec![
-                    (Value::Integer(1.into()), Value::Integer((shard.shard_index ).into())),
-                    (Value::Integer(2.into()), Value::Integer((shard.shard_count ).into())),
-                    (Value::Integer(3.into()), Value::Integer((shard.shard_fn ).into())),
+                    (
+                        Value::Integer(1.into()),
+                        Value::Integer((shard.shard_index).into()),
+                    ),
+                    (
+                        Value::Integer(2.into()),
+                        Value::Integer((shard.shard_count).into()),
+                    ),
+                    (
+                        Value::Integer(3.into()),
+                        Value::Integer((shard.shard_fn).into()),
+                    ),
                 ]),
             ));
         }
@@ -208,7 +268,7 @@ impl Manifest {
         if let Some(comp) = &self.compression {
             let mut comp_entries = vec![(
                 Value::Integer(1.into()),
-                Value::Integer((comp.algorithm as u8 ).into()),
+                Value::Integer((comp.algorithm as u8).into()),
             )];
             if let Some(dict) = &comp.dictionary_digest {
                 comp_entries.push((Value::Integer(2.into()), Value::Bytes(dict.to_vec())));
@@ -231,21 +291,26 @@ impl Manifest {
     }
 
     pub fn from_cbor(data: &[u8]) -> crate::error::Result<Self> {
-        let val: ciborium::Value =
-            ciborium::from_reader(data).map_err(|e| crate::error::AhuError::ManifestDecode(e.to_string()))?;
+        let val: ciborium::Value = ciborium::from_reader(data)
+            .map_err(|e| crate::error::AhuError::ManifestDecode(e.to_string()))?;
 
         let map = val
             .as_map()
             .ok_or_else(|| crate::error::AhuError::ManifestDecode("root is not a map".into()))?;
 
-        fn get_uint(map: &[(ciborium::Value, ciborium::Value)], key: i128) -> crate::error::Result<u64> {
+        fn get_uint(
+            map: &[(ciborium::Value, ciborium::Value)],
+            key: i128,
+        ) -> crate::error::Result<u64> {
             for (k, v) in map {
                 if let Some(ki) = k.as_integer() {
                     if i128::from(ki) == key {
                         if let Some(vi) = v.as_integer() {
                             let n: i128 = vi.into();
                             return u64::try_from(n).map_err(|_| {
-                                crate::error::AhuError::ManifestField(format!("key {key}: integer out of u64 range"))
+                                crate::error::AhuError::ManifestField(format!(
+                                    "key {key}: integer out of u64 range"
+                                ))
                             });
                         }
                         return Err(crate::error::AhuError::ManifestField(format!(
@@ -254,10 +319,15 @@ impl Manifest {
                     }
                 }
             }
-            Err(crate::error::AhuError::ManifestField(format!("key {key}: missing")))
+            Err(crate::error::AhuError::ManifestField(format!(
+                "key {key}: missing"
+            )))
         }
 
-        fn get_bytes(map: &[(ciborium::Value, ciborium::Value)], key: i128) -> crate::error::Result<Vec<u8>> {
+        fn get_bytes(
+            map: &[(ciborium::Value, ciborium::Value)],
+            key: i128,
+        ) -> crate::error::Result<Vec<u8>> {
             for (k, v) in map {
                 if let Some(ki) = k.as_integer() {
                     if i128::from(ki) == key {
@@ -270,10 +340,15 @@ impl Manifest {
                     }
                 }
             }
-            Err(crate::error::AhuError::ManifestField(format!("key {key}: missing")))
+            Err(crate::error::AhuError::ManifestField(format!(
+                "key {key}: missing"
+            )))
         }
 
-        fn get_text(map: &[(ciborium::Value, ciborium::Value)], key: i128) -> crate::error::Result<String> {
+        fn get_text(
+            map: &[(ciborium::Value, ciborium::Value)],
+            key: i128,
+        ) -> crate::error::Result<String> {
             for (k, v) in map {
                 if let Some(ki) = k.as_integer() {
                     if i128::from(ki) == key {
@@ -286,7 +361,9 @@ impl Manifest {
                     }
                 }
             }
-            Err(crate::error::AhuError::ManifestField(format!("key {key}: missing")))
+            Err(crate::error::AhuError::ManifestField(format!(
+                "key {key}: missing"
+            )))
         }
 
         fn get_map<'a>(
@@ -305,7 +382,9 @@ impl Manifest {
                     }
                 }
             }
-            Err(crate::error::AhuError::ManifestField(format!("key {key}: missing")))
+            Err(crate::error::AhuError::ManifestField(format!(
+                "key {key}: missing"
+            )))
         }
 
         fn get_array<'a>(
@@ -324,7 +403,9 @@ impl Manifest {
                     }
                 }
             }
-            Err(crate::error::AhuError::ManifestField(format!("key {key}: missing")))
+            Err(crate::error::AhuError::ManifestField(format!(
+                "key {key}: missing"
+            )))
         }
 
         fn get_optional_bytes(
@@ -361,8 +442,9 @@ impl Manifest {
         }
 
         fn to_fixed_32(v: &[u8]) -> crate::error::Result<[u8; 32]> {
-            v.try_into()
-                .map_err(|_| crate::error::AhuError::ManifestField("expected 32-byte digest".into()))
+            v.try_into().map_err(|_| {
+                crate::error::AhuError::ManifestField("expected 32-byte digest".into())
+            })
         }
 
         let format_version = get_uint(map, 1)?;
@@ -378,16 +460,16 @@ impl Manifest {
             _ => {
                 return Err(crate::error::AhuError::ManifestField(format!(
                     "unknown bundle_type: {bundle_type_raw}"
-                )))
+                )));
             }
         };
 
         let ca_scope_arr = get_array(map, 6)?;
         let mut ca_scopes = Vec::with_capacity(ca_scope_arr.len());
         for scope_val in ca_scope_arr {
-            let scope_map = scope_val
-                .as_map()
-                .ok_or_else(|| crate::error::AhuError::ManifestField("ca_scope entry is not a map".into()))?;
+            let scope_map = scope_val.as_map().ok_or_else(|| {
+                crate::error::AhuError::ManifestField("ca_scope entry is not a map".into())
+            })?;
 
             let rid_map = get_map(scope_map, 5)?;
             let responder_id = ResponderId {
@@ -397,7 +479,7 @@ impl Manifest {
                     n => {
                         return Err(crate::error::AhuError::ManifestField(format!(
                             "unknown responder_id type: {n}"
-                        )))
+                        )));
                     }
                 },
                 value: get_bytes(rid_map, 2)?,
@@ -412,13 +494,11 @@ impl Manifest {
                                 let certs: crate::error::Result<Vec<Vec<u8>>> = arr
                                     .iter()
                                     .map(|c| {
-                                        c.as_bytes()
-                                            .map(|b| b.to_vec())
-                                            .ok_or_else(|| {
-                                                crate::error::AhuError::ManifestField(
-                                                    "responder chain entry is not bytes".into(),
-                                                )
-                                            })
+                                        c.as_bytes().map(|b| b.to_vec()).ok_or_else(|| {
+                                            crate::error::AhuError::ManifestField(
+                                                "responder chain entry is not bytes".into(),
+                                            )
+                                        })
                                     })
                                     .collect();
                                 chain = Some(certs?);
@@ -443,7 +523,7 @@ impl Manifest {
                     n => {
                         return Err(crate::error::AhuError::ManifestField(format!(
                             "unknown completeness: {n}"
-                        )))
+                        )));
                     }
                 },
             });
@@ -467,8 +547,12 @@ impl Manifest {
 
         let continuity_map = get_map(map, 10)?;
         let continuity = Continuity {
-            prev_manifest_digest: get_optional_bytes(continuity_map, 1)?.map(|b| to_fixed_32(&b)).transpose()?,
-            base_manifest_digest: get_optional_bytes(continuity_map, 2)?.map(|b| to_fixed_32(&b)).transpose()?,
+            prev_manifest_digest: get_optional_bytes(continuity_map, 1)?
+                .map(|b| to_fixed_32(&b))
+                .transpose()?,
+            base_manifest_digest: get_optional_bytes(continuity_map, 2)?
+                .map(|b| to_fixed_32(&b))
+                .transpose()?,
             chain_length: get_uint(continuity_map, 3)?,
         };
 
@@ -490,10 +574,12 @@ impl Manifest {
                     n => {
                         return Err(crate::error::AhuError::ManifestField(format!(
                             "unknown compression algorithm: {n}"
-                        )))
+                        )));
                     }
                 };
-                let dict = get_optional_bytes(cm, 2)?.map(|b| to_fixed_32(&b)).transpose()?;
+                let dict = get_optional_bytes(cm, 2)?
+                    .map(|b| to_fixed_32(&b))
+                    .transpose()?;
                 Ok(Compression {
                     algorithm: algo,
                     dictionary_digest: dict,
@@ -504,9 +590,7 @@ impl Manifest {
         let extensions = get_optional_map(map, 13).map(|ext_map| {
             ext_map
                 .iter()
-                .filter_map(|(k, v)| {
-                    k.as_text().map(|key| (key.to_string(), v.clone()))
-                })
+                .filter_map(|(k, v)| k.as_text().map(|key| (key.to_string(), v.clone())))
                 .collect::<Vec<_>>()
         });
 

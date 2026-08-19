@@ -4,7 +4,10 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
-#[command(name = "hoike", about = "hoike — OCSP responder for pre-signed ahu bundles")]
+#[command(
+    name = "hoike",
+    about = "hoike — OCSP responder for pre-signed ahu bundles"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -148,7 +151,8 @@ async fn run_server(config_path: PathBuf) {
     // Start gossip if enabled
     if let Some(gossip_cfg) = &config.gossip {
         if gossip_cfg.enabled {
-            let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<hoike_gossip::GossipMessage>(256);
+            let (msg_tx, mut msg_rx) =
+                tokio::sync::mpsc::channel::<hoike_gossip::GossipMessage>(256);
 
             let gc = hoike_gossip::GossipConfig {
                 enabled: true,
@@ -268,17 +272,19 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
         let mut signing_key =
             SigningKey::from_bytes((&secret).into()).expect("invalid signing key");
 
-        warn!(ca = ca_config.label, "using ephemeral signing key — not for production");
+        warn!(
+            ca = ca_config.label,
+            "using ephemeral signing key — not for production"
+        );
 
-        let bundle_bytes =
-            hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                &ca,
-                &snapshot,
-                &gen_config,
-                &mut signing_key,
-                |m| Ok(Sha256::digest(m).to_vec()),
-            )
-            .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
+        let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &gen_config,
+            &mut signing_key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+        )
+        .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
 
         let bundle_path = config
             .storage
@@ -288,8 +294,7 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
         std::fs::create_dir_all(&config.storage.bundle_dir)
             .map_err(|e| format!("create bundle_dir: {e}"))?;
 
-        std::fs::write(&bundle_path, &bundle_bytes)
-            .map_err(|e| format!("write bundle: {e}"))?;
+        std::fs::write(&bundle_path, &bundle_bytes).map_err(|e| format!("write bundle: {e}"))?;
 
         info!(
             ca = ca_config.label,
@@ -303,10 +308,7 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
     Ok(())
 }
 
-async fn run_signer_loop(
-    state: Arc<hoike_core::ResponderState>,
-    config: hoike_core::Config,
-) {
+async fn run_signer_loop(state: Arc<hoike_core::ResponderState>, config: hoike_core::Config) {
     let min_interval = config
         .ca
         .iter()
@@ -349,20 +351,13 @@ fn decode_b64_field(
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
                 .decode(val)
-                .map_err(|e| {
-                    format!(
-                        "CA '{}': invalid base64 in {}: {e}",
-                        ca_label, field_name
-                    )
-                })
+                .map_err(|e| format!("CA '{}': invalid base64 in {}: {e}", ca_label, field_name))
         }
         None => Ok(fallback.as_bytes().to_vec()),
     }
 }
 
-fn decode_issuer_name(
-    ca: &hoike_core::config::CaConfig,
-) -> std::result::Result<Vec<u8>, String> {
+fn decode_issuer_name(ca: &hoike_core::config::CaConfig) -> std::result::Result<Vec<u8>, String> {
     decode_b64_field(
         &ca.issuer_name_der_b64,
         "issuer_name_der_b64",
@@ -371,9 +366,7 @@ fn decode_issuer_name(
     )
 }
 
-fn decode_issuer_key(
-    ca: &hoike_core::config::CaConfig,
-) -> std::result::Result<Vec<u8>, String> {
+fn decode_issuer_key(ca: &hoike_core::config::CaConfig) -> std::result::Result<Vec<u8>, String> {
     decode_b64_field(
         &ca.issuer_key_bytes_b64,
         "issuer_key_bytes_b64",
@@ -436,7 +429,10 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
 
     let bundle_dir = &config.storage.bundle_dir;
     if let Err(e) = std::fs::create_dir_all(bundle_dir) {
-        eprintln!("Failed to create bundle directory {}: {e}", bundle_dir.display());
+        eprintln!(
+            "Failed to create bundle directory {}: {e}",
+            bundle_dir.display()
+        );
         std::process::exit(1);
     }
 
@@ -446,10 +442,7 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     let dest_path = bundle_dir.join(dest_filename);
 
     if let Err(e) = std::fs::copy(&bundle_path, &dest_path) {
-        eprintln!(
-            "Failed to copy bundle to {}: {e}",
-            dest_path.display()
-        );
+        eprintln!("Failed to copy bundle to {}: {e}", dest_path.display());
         std::process::exit(1);
     }
 
@@ -464,7 +457,10 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
         println!("    [{}] epoch={}", i, scope.epoch);
     }
-    println!("\n  To serve: hoike serve --config {}", config_path.display());
+    println!(
+        "\n  To serve: hoike serve --config {}",
+        config_path.display()
+    );
     println!("  To reload a running server: send SIGHUP (not yet implemented)");
 }
 
@@ -515,7 +511,9 @@ fn run_sign(
     good_serials: Option<PathBuf>,
     sig_alg: String,
 ) {
-    use hoike_sign::{CaIdentity, CertIdCompat, CertificateStatus, CrlSource, GenerationConfig, RevocationSource};
+    use hoike_sign::{
+        CaIdentity, CertIdCompat, CertificateStatus, CrlSource, GenerationConfig, RevocationSource,
+    };
     use sha2_v010::{Digest, Sha256};
 
     let compat = match certid_compat.as_str() {
@@ -562,7 +560,10 @@ fn run_sign(
 
     if let Some(good_path) = good_serials {
         let content = std::fs::read_to_string(&good_path).unwrap_or_else(|e| {
-            eprintln!("Failed to read good serials from {}: {e}", good_path.display());
+            eprintln!(
+                "Failed to read good serials from {}: {e}",
+                good_path.display()
+            );
             std::process::exit(1);
         });
         for line in content.lines() {
@@ -572,7 +573,10 @@ fn run_sign(
             }
             match hex::decode(line) {
                 Ok(serial) => {
-                    snapshot.entries.entry(serial).or_insert(CertificateStatus::Good);
+                    snapshot
+                        .entries
+                        .entry(serial)
+                        .or_insert(CertificateStatus::Good);
                 }
                 Err(e) => {
                     eprintln!("Warning: invalid hex serial '{line}': {e}");
@@ -601,32 +605,50 @@ fn run_sign(
 
     let bundle_bytes = match sig_alg.as_str() {
         "ecdsa-p256" => {
-            let mut signer = p256::ecdsa::SigningKey::from_bytes((&seed).into())
-                .expect("invalid ECDSA key");
+            let mut signer =
+                p256::ecdsa::SigningKey::from_bytes((&seed).into()).expect("invalid ECDSA key");
             hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                &ca, &snapshot, &config, &mut signer, seal_fn,
+                &ca,
+                &snapshot,
+                &config,
+                &mut signer,
+                seal_fn,
             )
         }
         "ml-dsa-44" => {
             let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
             hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                &ca, &snapshot, &config, &mut signer, seal_fn,
+                &ca,
+                &snapshot,
+                &config,
+                &mut signer,
+                seal_fn,
             )
         }
         "ml-dsa-65" => {
             let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
             hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                &ca, &snapshot, &config, &mut signer, seal_fn,
+                &ca,
+                &snapshot,
+                &config,
+                &mut signer,
+                seal_fn,
             )
         }
         "ml-dsa-87" => {
             let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
             hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                &ca, &snapshot, &config, &mut signer, seal_fn,
+                &ca,
+                &snapshot,
+                &config,
+                &mut signer,
+                seal_fn,
             )
         }
         other => {
-            eprintln!("Unknown sig_alg: {other} (expected: ecdsa-p256, ml-dsa-44, ml-dsa-65, ml-dsa-87)");
+            eprintln!(
+                "Unknown sig_alg: {other} (expected: ecdsa-p256, ml-dsa-44, ml-dsa-65, ml-dsa-87)"
+            );
             std::process::exit(1);
         }
     }

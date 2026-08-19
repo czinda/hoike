@@ -127,7 +127,10 @@ label = "test-ca"
     .unwrap();
 
     let config = Config::from_file(&config_path).unwrap();
-    let gossip = config.gossip.as_ref().expect("gossip section should be present");
+    let gossip = config
+        .gossip
+        .as_ref()
+        .expect("gossip section should be present");
     assert!(gossip.enabled);
     assert_eq!(gossip.bind, "0.0.0.0:7947");
     assert_eq!(gossip.seeds.len(), 2);

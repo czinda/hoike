@@ -125,8 +125,8 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
         data: &[u8],
         _sender: Option<&T>,
     ) -> Result<Option<Self::Key>, Self::Error> {
-        let msg: GossipMessage = serde_json::from_slice(data)
-            .map_err(|e| BroadcastError(format!("decode: {e}")))?;
+        let msg: GossipMessage =
+            serde_json::from_slice(data).map_err(|e| BroadcastError(format!("decode: {e}")))?;
 
         let key = BroadcastKey {
             producer_id: msg.scope_key().0.to_string(),

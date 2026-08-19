@@ -4,7 +4,9 @@ use x509_cert::crl::CertificateList;
 use x509_cert::ext::pkix::CrlReason;
 
 use crate::error::{Result, SignError};
-use crate::source::{CaIdentity, CertificateStatus, Epoch, RevocationSource, StatusChange, StatusSnapshot};
+use crate::source::{
+    CaIdentity, CertificateStatus, Epoch, RevocationSource, StatusChange, StatusSnapshot,
+};
 
 pub struct CrlSource {
     crl: CertificateList,
@@ -153,12 +155,12 @@ mod tests {
 
     fn build_test_crl_der() -> Vec<u8> {
         use der::Encode;
-        use x509_cert::crl::{CertificateList, TbsCertList, RevokedCert};
-        use x509_cert::name::RdnSequence;
-        use x509_cert::time::Time;
+        use der::asn1::BitString;
         use der::asn1::UtcTime;
         use spki::AlgorithmIdentifierOwned;
-        use der::asn1::BitString;
+        use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};
+        use x509_cert::name::RdnSequence;
+        use x509_cert::time::Time;
 
         let now_dt = der::DateTime::new(2025, 1, 15, 12, 0, 0).unwrap();
         let next_dt = der::DateTime::new(2025, 1, 16, 12, 0, 0).unwrap();

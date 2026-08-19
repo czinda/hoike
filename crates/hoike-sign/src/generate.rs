@@ -1,5 +1,5 @@
-use der::asn1::{Null, OctetString};
 use der::Encode;
+use der::asn1::{Null, OctetString};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use signature::Signer;
@@ -71,9 +71,8 @@ where
     let issuer_key_hash_sha1 = Sha1::digest(&ca.issuer_key_bytes);
 
     let responder_key_hash = Sha1::digest(&ca.issuer_key_bytes);
-    let responder_id = ResponderId::ByKey(
-        OctetString::new(responder_key_hash.to_vec()).map_err(SignError::Der)?,
-    );
+    let responder_id =
+        ResponderId::ByKey(OctetString::new(responder_key_hash.to_vec()).map_err(SignError::Der)?);
 
     let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
     let sha1_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
@@ -94,7 +93,10 @@ where
 
     // Dual and Sha1Only modes produce SHA-1 CertID entries; register a SHA-1
     // ca_scope so the router can route requests with SHA-1 issuer hashes.
-    if matches!(config.certid_compat, CertIdCompat::Dual | CertIdCompat::Sha1Only) {
+    if matches!(
+        config.certid_compat,
+        CertIdCompat::Dual | CertIdCompat::Sha1Only
+    ) {
         ca_scopes.push(ahu::CaScope {
             hash_algorithm: sha1_oid.as_bytes().to_vec(),
             issuer_name_hash: issuer_name_hash_sha1.to_vec(),
@@ -167,8 +169,8 @@ where
             }
         };
 
-        let serial_number = x509_cert::serial_number::SerialNumber::new(serial)
-            .map_err(|e| SignError::Der(e))?;
+        let serial_number =
+            x509_cert::serial_number::SerialNumber::new(serial).map_err(|e| SignError::Der(e))?;
 
         let entry_key_jitter = {
             let mut h = Sha256::new();
@@ -226,11 +228,14 @@ where
                     &issuer_key_hash_sha1,
                     serial_number,
                 )?;
-                let ek256: [u8; 32] = Sha256::digest(&cert_id_sha256.to_der().map_err(SignError::Der)?).into();
-                let ek1: [u8; 32] = Sha256::digest(&cert_id_sha1.to_der().map_err(SignError::Der)?).into();
+                let ek256: [u8; 32] =
+                    Sha256::digest(&cert_id_sha256.to_der().map_err(SignError::Der)?).into();
+                let ek1: [u8; 32] =
+                    Sha256::digest(&cert_id_sha1.to_der().map_err(SignError::Der)?).into();
 
-                let single_sha256 = SingleResponse::new(cert_id_sha256, cert_status.clone(), this_update)
-                    .with_next_update(next_update);
+                let single_sha256 =
+                    SingleResponse::new(cert_id_sha256, cert_status.clone(), this_update)
+                        .with_next_update(next_update);
                 let single_sha1 = SingleResponse::new(cert_id_sha1, cert_status, this_update)
                     .with_next_update(next_update);
 
@@ -468,10 +473,13 @@ mod tests {
         let certid_der = cert_id.to_der().unwrap();
         let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
 
-        let response = bundle.lookup(&entry_key).expect("entry for serial 42 not found");
+        let response = bundle
+            .lookup(&entry_key)
+            .expect("entry for serial 42 not found");
         assert!(!response.is_empty());
 
-        let ocsp_resp = <x509_ocsp::OcspResponse as Decode>::from_der(response).expect("invalid OCSP response DER");
+        let ocsp_resp = <x509_ocsp::OcspResponse as Decode>::from_der(response)
+            .expect("invalid OCSP response DER");
         assert_eq!(
             ocsp_resp.response_status,
             x509_ocsp::OcspResponseStatus::Successful
@@ -564,13 +572,17 @@ mod tests {
             let certid_der = cert_id.to_der().unwrap();
             let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
 
-            let response = bundle.lookup(&entry_key)
+            let response = bundle
+                .lookup(&entry_key)
                 .unwrap_or_else(|| panic!("entry for serial {} not found", i + 1));
             assert!(!response.is_empty(), "empty response for serial {}", i + 1);
 
             let ocsp_resp = <x509_ocsp::OcspResponse as Decode>::from_der(response)
                 .unwrap_or_else(|e| panic!("invalid DER for serial {}: {e}", i + 1));
-            assert_eq!(ocsp_resp.response_status, x509_ocsp::OcspResponseStatus::Successful);
+            assert_eq!(
+                ocsp_resp.response_status,
+                x509_ocsp::OcspResponseStatus::Successful
+            );
         }
     }
 
@@ -587,9 +599,13 @@ mod tests {
             ..Default::default()
         };
         let unbatched = produce_bundle::<_, p256::ecdsa::DerSignature>(
-            &ca, &snapshot, &config_1, &mut key,
+            &ca,
+            &snapshot,
+            &config_1,
+            &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Batched with bucket_size=10
         let config_10 = GenerationConfig {
@@ -598,15 +614,20 @@ mod tests {
             ..Default::default()
         };
         let batched = produce_bundle::<_, p256::ecdsa::DerSignature>(
-            &ca, &snapshot, &config_10, &mut key,
+            &ca,
+            &snapshot,
+            &config_10,
+            &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Batched should be smaller (fewer signatures)
         assert!(
             batched.len() < unbatched.len(),
             "batched ({}) should be smaller than unbatched ({})",
-            batched.len(), unbatched.len()
+            batched.len(),
+            unbatched.len()
         );
     }
 }

@@ -11,7 +11,10 @@ pub fn inspect(path: &Path) -> Result<()> {
 
     println!("═══ ahu bundle ═══");
     println!("  File:           {}", path.display());
-    println!("  Format:         {}.{}", bundle.header.format_major, bundle.header.format_minor);
+    println!(
+        "  Format:         {}.{}",
+        bundle.header.format_major, bundle.header.format_minor
+    );
     println!("  Bundle ID:      {}", m.bundle_id);
     println!("  Producer:       {}", m.producer_id);
     println!("  Created:        {} (epoch)", m.created_at);
@@ -47,9 +50,18 @@ pub fn inspect(path: &Path) -> Result<()> {
     println!("\n── CA Scopes ({}) ──", m.ca_scopes.len());
     for (i, scope) in m.ca_scopes.iter().enumerate() {
         println!("  [{}]", i);
-        println!("    hash_algorithm:     {}", hex::encode(&scope.hash_algorithm));
-        println!("    issuer_name_hash:   {}", hex::encode(&scope.issuer_name_hash));
-        println!("    issuer_key_hash:    {}", hex::encode(&scope.issuer_key_hash));
+        println!(
+            "    hash_algorithm:     {}",
+            hex::encode(&scope.hash_algorithm)
+        );
+        println!(
+            "    issuer_name_hash:   {}",
+            hex::encode(&scope.issuer_name_hash)
+        );
+        println!(
+            "    issuer_key_hash:    {}",
+            hex::encode(&scope.issuer_key_hash)
+        );
         println!("    epoch:              {}", scope.epoch);
         println!(
             "    responder_id:       {} ({})",
@@ -96,10 +108,7 @@ pub fn inspect(path: &Path) -> Result<()> {
     }
 
     println!("\n── Layout ──");
-    println!(
-        "  header:   0..{}",
-        ahu::header::HEADER_SIZE
-    );
+    println!("  header:   0..{}", ahu::header::HEADER_SIZE);
     println!(
         "  manifest: {}..{} ({} bytes)",
         bundle.header.manifest_offset,
@@ -240,10 +249,24 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
     }
 
     println!("═══ ahu diff ═══");
-    println!("  A: {} (epoch {:?})", a_path.display(),
-        a.manifest.ca_scopes.iter().map(|s| s.epoch).collect::<Vec<_>>());
-    println!("  B: {} (epoch {:?})", b_path.display(),
-        b.manifest.ca_scopes.iter().map(|s| s.epoch).collect::<Vec<_>>());
+    println!(
+        "  A: {} (epoch {:?})",
+        a_path.display(),
+        a.manifest
+            .ca_scopes
+            .iter()
+            .map(|s| s.epoch)
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "  B: {} (epoch {:?})",
+        b_path.display(),
+        b.manifest
+            .ca_scopes
+            .iter()
+            .map(|s| s.epoch)
+            .collect::<Vec<_>>()
+    );
     println!();
     println!("  Entries in A:    {}", a.index.len());
     println!("  Entries in B:    {}", b.index.len());
@@ -268,7 +291,11 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn apply(base_path: &Path, delta_paths: &[std::path::PathBuf], output_path: &Path) -> Result<()> {
+pub fn apply(
+    base_path: &Path,
+    delta_paths: &[std::path::PathBuf],
+    output_path: &Path,
+) -> Result<()> {
     println!("Loading base bundle: {}", base_path.display());
     let base = Bundle::from_file(base_path)?;
     ahu::verify_structure(&base)?;
@@ -354,7 +381,10 @@ pub fn apply(base_path: &Path, delta_paths: &[std::path::PathBuf], output_path: 
                     removed += 1;
                 }
             } else if let Some(data) = delta.entry_bytes(record) {
-                if working_set.insert(record.entry_key, (data.to_vec(), record.flags)).is_some() {
+                if working_set
+                    .insert(record.entry_key, (data.to_vec(), record.flags))
+                    .is_some()
+                {
                     replaced += 1;
                 } else {
                     added += 1;

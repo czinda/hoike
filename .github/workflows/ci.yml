@@ -1,0 +1,256 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 7 * * 1'  # Weekly Monday 07:00 UTC — security audit
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. Fast gate: check, clippy, fmt
+  # ──────────────────────────────────────────────
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --workspace
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  # ──────────────────────────────────────────────
+  # 2. Test matrix: stable + nightly
+  # ──────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.toolchain }}
+      - name: Run tests
+        run: |
+          cargo test --workspace 2>&1 | tee test-output.txt
+          exit ${PIPESTATUS[0]}
+      - name: Test summary
+        if: always()
+        run: |
+          echo "## Test Results (${{ matrix.toolchain }})" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep "^test result" test-output.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          TOTAL=$(grep "^test result" test-output.txt | awk '{sum += $4} END {print sum}')
+          echo "**Total: ${TOTAL} tests passed**" >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────
+  # 3. Build release binaries (cross-platform)
+  # ──────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          ARCHIVE="hoike-${VERSION}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/hoike" dist/ || true
+          cp "target/${{ matrix.target }}/release/ahu" dist/ || true
+          cd dist && tar czf "../${ARCHIVE}" hoike ahu && cd ..
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hoike-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # 4. Release (on v* tags only)
+  # ──────────────────────────────────────────────
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [check, test, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name '*.tar.gz' -exec mv {} release-assets/ \;
+          find artifacts -name '*.sha256' -exec mv {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            CHANGES=$(git log --oneline)
+          else
+            CHANGES=$(git log --oneline "${PREV_TAG}..HEAD")
+          fi
+          {
+            echo 'body<<BODY_EOF'
+            echo "## Changes"
+            echo ""
+            echo "$CHANGES"
+            echo ""
+            echo "## Downloads"
+            echo ""
+            echo "| Platform | Archive |"
+            echo "|----------|---------|"
+            echo "| Linux x86_64 (glibc) | \`hoike-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz\` |"
+            echo "| Linux x86_64 (musl, static) | \`hoike-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz\` |"
+            echo "| Linux ARM64 | \`hoike-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz\` |"
+            echo "| macOS ARM64 | \`hoike-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz\` |"
+            echo ""
+            echo "Each archive contains \`hoike\` (OCSP responder) and \`ahu\` (bundle tool)."
+            echo 'BODY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          files: release-assets/*
+          generate_release_notes: true
+
+  # ──────────────────────────────────────────────
+  # 5. Container image (main + tags)
+  # ──────────────────────────────────────────────
+  container:
+    name: Container Image
+    runs-on: ubuntu-latest
+    needs: [check, test]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # ──────────────────────────────────────────────
+  # 6. Security audit (main + weekly schedule)
+  # ──────────────────────────────────────────────
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Run audit
+        run: cargo audit

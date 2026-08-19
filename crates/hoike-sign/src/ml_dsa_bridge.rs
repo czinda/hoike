@@ -44,7 +44,10 @@ where
 {
     fn try_sign(&self, msg: &[u8]) -> Result<MlDsaSignatureBytes, signature::Error> {
         use mldsa::Signer as Signer3;
-        let sig: mldsa::Signature<P> = self.inner.try_sign(msg).map_err(|_| signature::Error::new())?;
+        let sig: mldsa::Signature<P> = self
+            .inner
+            .try_sign(msg)
+            .map_err(|_| signature::Error::new())?;
         use mldsa::SignatureEncoding;
         let repr = sig.to_bytes();
         let slice: &[u8] = repr.as_ref();
@@ -90,9 +93,7 @@ where
     P: mldsa::MlDsaParams,
     mldsa::SigningKey<P>: mldsa::Signer<mldsa::Signature<P>>,
 {
-    fn signature_algorithm_identifier(
-        &self,
-    ) -> spki::Result<spki::AlgorithmIdentifierOwned> {
+    fn signature_algorithm_identifier(&self) -> spki::Result<spki::AlgorithmIdentifierOwned> {
         Ok(spki::AlgorithmIdentifierOwned {
             oid: self.sig_alg_oid,
             parameters: None,

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use hoike_core::ResponderState;
+use std::sync::Arc;
 
 /// Shared application state, cheaply cloneable via Arc.
 #[derive(Clone)]

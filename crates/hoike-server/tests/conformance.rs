@@ -19,7 +19,9 @@ fn signing_key() -> p256::ecdsa::SigningKey {
 }
 
 fn build_conformance_bundle() -> Vec<u8> {
-    use hoike_sign::{CaIdentity, CertIdCompat, CertificateStatus, GenerationConfig, StatusSnapshot};
+    use hoike_sign::{
+        CaIdentity, CertIdCompat, CertificateStatus, GenerationConfig, StatusSnapshot,
+    };
     use sha2_v010::Digest as Digest010;
     use x509_cert::ext::pkix::CrlReason;
 
@@ -143,7 +145,9 @@ fn build_request_with_nonce(cert_id: &CertId, nonce_len: usize) -> Vec<u8> {
         tbs_request: tbs,
         optional_signature: None,
     };
-    ocsp_req.to_der().expect("OCSPRequest with nonce encode failed")
+    ocsp_req
+        .to_der()
+        .expect("OCSPRequest with nonce encode failed")
 }
 
 async fn start_conformance_server() -> (u16, tempfile::TempDir) {
@@ -494,8 +498,14 @@ async fn conformance_http_cache_control() {
         .to_str()
         .unwrap();
 
-    assert!(cc.contains("max-age="), "Cache-Control must have max-age, got: {cc}");
-    assert!(cc.contains("public"), "Cache-Control must have public, got: {cc}");
+    assert!(
+        cc.contains("max-age="),
+        "Cache-Control must have max-age, got: {cc}"
+    );
+    assert!(
+        cc.contains("public"),
+        "Cache-Control must have public, got: {cc}"
+    );
     assert!(
         cc.contains("no-transform"),
         "Cache-Control must have no-transform, got: {cc}"
@@ -568,11 +578,8 @@ async fn conformance_get_method() {
     // Now do a GET with the base64-encoded request in the path
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&request_der);
-    let encoded = percent_encoding::utf8_percent_encode(
-        &b64,
-        percent_encoding::NON_ALPHANUMERIC,
-    )
-    .to_string();
+    let encoded =
+        percent_encoding::utf8_percent_encode(&b64, percent_encoding::NON_ALPHANUMERIC).to_string();
 
     let client = reqwest::Client::new();
     let get_resp = client

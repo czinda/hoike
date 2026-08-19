@@ -8,7 +8,9 @@ pub enum AhuError {
     #[error("unsupported format version {major}.{minor}")]
     UnsupportedVersion { major: u16, minor: u16 },
 
-    #[error("header field out of bounds: {field} offset {offset} + length {length} exceeds file size {file_size}")]
+    #[error(
+        "header field out of bounds: {field} offset {offset} + length {length} exceeds file size {file_size}"
+    )]
     HeaderOutOfBounds {
         field: &'static str,
         offset: u64,

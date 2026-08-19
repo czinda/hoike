@@ -57,13 +57,14 @@ impl GossipNode {
         config: GossipConfig,
         msg_tx: tokio::sync::mpsc::Sender<GossipMessage>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let bind_addr: SocketAddr = config.bind.parse().map_err(|e| {
-            format!("invalid gossip bind address '{}': {}", config.bind, e)
-        })?;
+        let bind_addr: SocketAddr = config
+            .bind
+            .parse()
+            .map_err(|e| format!("invalid gossip bind address '{}': {}", config.bind, e))?;
 
-        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-            format!("failed to bind gossip socket on {}: {}", bind_addr, e)
-        })?;
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| format!("failed to bind gossip socket on {}: {}", bind_addr, e))?;
 
         let local_addr = socket.local_addr()?;
         info!(addr = %local_addr, name = %config.node_name, "gossip node starting");
