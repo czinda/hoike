@@ -1,15 +1,15 @@
-/// Static DER-encoded OCSP error responses.
-///
-/// These are constant byte arrays because error responses contain only
-/// a responseStatus ENUMERATED and no responseBytes — they never change
-/// and never need signing.
-///
-/// ```asn1
-/// OCSPResponse ::= SEQUENCE {
-///     responseStatus  OCSPResponseStatus,   -- ENUMERATED
-///     responseBytes   [0] EXPLICIT ResponseBytes OPTIONAL
-/// }
-/// ```
+//! Static DER-encoded OCSP error responses.
+//!
+//! These are constant byte arrays because error responses contain only
+//! a responseStatus ENUMERATED and no responseBytes — they never change
+//! and never need signing.
+//!
+//! ```asn1
+//! OCSPResponse ::= SEQUENCE {
+//!     responseStatus  OCSPResponseStatus,   -- ENUMERATED
+//!     responseBytes   [0] EXPLICIT ResponseBytes OPTIONAL
+//! }
+//! ```
 
 /// responseStatus = unauthorized (6)
 /// Used when the responder has no entry for the requested CertID.

@@ -306,6 +306,7 @@ async fn get_root_returns_malformed() {
 
 // ── Multi-CA tests ──────────────────────────────────────────────────
 
+#[allow(clippy::type_complexity)]
 async fn start_multi_ca_server(
     bundles: Vec<(&str, &[u8], &[u8], Vec<u8>)>, // (label, issuer_name, issuer_key, bundle_bytes)
 ) -> (u16, tempfile::TempDir) {
@@ -754,7 +755,12 @@ async fn success_response_has_last_modified() {
         resp.headers().get("last-modified").is_some(),
         "successful response should have Last-Modified header"
     );
-    let lm = resp.headers().get("last-modified").unwrap().to_str().unwrap();
+    let lm = resp
+        .headers()
+        .get("last-modified")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(
         lm.ends_with("GMT"),
         "Last-Modified should be HTTP-date in GMT: {lm}"

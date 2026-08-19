@@ -196,8 +196,7 @@ impl BundleBuilder {
         F: FnOnce(&[u8]) -> Result<Vec<u8>>,
     {
         // Sort entries by key, resolving alias data sharing.
-        self.entries
-            .sort_by(|a, b| a.0.entry_key.cmp(&b.0.entry_key));
+        self.entries.sort_by_key(|a| a.0.entry_key);
 
         // Build data section and fix up offsets.
         // For ALIAS entries, deduplicate identical payloads so the data

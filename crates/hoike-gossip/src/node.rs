@@ -43,6 +43,7 @@ impl foca::Identity for NodeId {
 }
 
 type HoikeFoca = Foca<NodeId, PostcardCodec, SmallRng, HoikeBroadcastHandler>;
+type TimerQueue = Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>;
 
 pub struct GossipNode {
     foca: Arc<Mutex<HoikeFoca>>,
@@ -94,8 +95,7 @@ impl GossipNode {
 
         let socket = Arc::new(socket);
         let foca = Arc::new(Mutex::new(foca));
-        let timer_queue: Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let timer_queue: TimerQueue = Arc::new(Mutex::new(Vec::new()));
 
         let node = GossipNode {
             foca: Arc::clone(&foca),
@@ -204,7 +204,7 @@ impl GossipNode {
 async fn receive_loop(
     foca: Arc<Mutex<HoikeFoca>>,
     socket: Arc<UdpSocket>,
-    timer_queue: Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>,
+    timer_queue: TimerQueue,
 ) {
     let mut buf = vec![0u8; 2048];
     loop {
@@ -231,7 +231,7 @@ async fn receive_loop(
 async fn timer_loop(
     foca: Arc<Mutex<HoikeFoca>>,
     socket: Arc<UdpSocket>,
-    new_timers_rx: Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>,
+    new_timers_rx: TimerQueue,
 ) {
     let mut pending_timers: Vec<(tokio::time::Instant, Timer<NodeId>)> = Vec::new();
 
@@ -327,7 +327,7 @@ fn handle_notification(notification: &foca::OwnedNotification<NodeId>) {
 async fn drain_runtime(
     runtime: &mut AccumulatingRuntime<NodeId>,
     socket: &UdpSocket,
-    timer_queue: &Arc<Mutex<Vec<(Duration, Timer<NodeId>)>>>,
+    timer_queue: &TimerQueue,
 ) {
     while let Some(notification) = runtime.to_notify() {
         handle_notification(&notification);

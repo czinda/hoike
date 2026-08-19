@@ -263,8 +263,8 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
 
         let ca = CaIdentity {
             label: ca_config.label.clone(),
-            issuer_name_der: decode_issuer_name(&ca_config)?,
-            issuer_key_bytes: decode_issuer_key(&ca_config)?,
+            issuer_name_der: decode_issuer_name(ca_config)?,
+            issuer_key_bytes: decode_issuer_key(ca_config)?,
         };
 
         let snapshot = source
@@ -436,13 +436,14 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     }
 
     if !force {
-        let state_store = match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  Anti-rollback: FAIL — cannot open state store: {e}");
-                std::process::exit(1);
-            }
-        };
+        let state_store =
+            match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  Anti-rollback: FAIL — cannot open state store: {e}");
+                    std::process::exit(1);
+                }
+            };
         if let Err(e) = state_store.check_rollback(&bundle) {
             eprintln!("  Anti-rollback: REJECTED — {e}");
             eprintln!("  Use --force to skip this check (e.g., first import into an enclave)");
@@ -528,6 +529,7 @@ fn run_check(config_path: PathBuf) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sign(
     ca_label: String,
     crl_path: PathBuf,

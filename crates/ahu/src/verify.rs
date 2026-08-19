@@ -79,7 +79,7 @@ pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
         if record.is_tombstone() {
             continue;
         }
-        let end = record.data_offset as u64 + record.data_length as u64;
+        let end = record.data_offset + record.data_length as u64;
         if end > bundle.data.len() as u64 {
             result.entry_bounds_ok = false;
             return Err(AhuError::EntryOutOfBounds {
@@ -90,10 +90,10 @@ pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
     }
 
     // Check for delta-specific requirements.
-    if bundle.manifest.bundle_type == crate::manifest::BundleType::Delta {
-        if bundle.manifest.continuity.base_manifest_digest.is_none() {
-            return Err(AhuError::DeltaMissingBase);
-        }
+    if bundle.manifest.bundle_type == crate::manifest::BundleType::Delta
+        && bundle.manifest.continuity.base_manifest_digest.is_none()
+    {
+        return Err(AhuError::DeltaMissingBase);
     }
 
     // Warn about missing seal.

@@ -366,10 +366,10 @@ impl Manifest {
             )))
         }
 
-        fn get_map<'a>(
-            map: &'a [(ciborium::Value, ciborium::Value)],
+        fn get_map(
+            map: &[(ciborium::Value, ciborium::Value)],
             key: i128,
-        ) -> crate::error::Result<&'a [(ciborium::Value, ciborium::Value)]> {
+        ) -> crate::error::Result<&[(ciborium::Value, ciborium::Value)]> {
             for (k, v) in map {
                 if let Some(ki) = k.as_integer() {
                     if i128::from(ki) == key {
@@ -387,10 +387,10 @@ impl Manifest {
             )))
         }
 
-        fn get_array<'a>(
-            map: &'a [(ciborium::Value, ciborium::Value)],
+        fn get_array(
+            map: &[(ciborium::Value, ciborium::Value)],
             key: i128,
-        ) -> crate::error::Result<&'a [ciborium::Value]> {
+        ) -> crate::error::Result<&[ciborium::Value]> {
             for (k, v) in map {
                 if let Some(ki) = k.as_integer() {
                     if i128::from(ki) == key {
@@ -427,10 +427,10 @@ impl Manifest {
             Ok(None)
         }
 
-        fn get_optional_map<'a>(
-            map: &'a [(ciborium::Value, ciborium::Value)],
+        fn get_optional_map(
+            map: &[(ciborium::Value, ciborium::Value)],
             key: i128,
-        ) -> Option<&'a [(ciborium::Value, ciborium::Value)]> {
+        ) -> Option<&[(ciborium::Value, ciborium::Value)]> {
             for (k, v) in map {
                 if let Some(ki) = k.as_integer() {
                     if i128::from(ki) == key {

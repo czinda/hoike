@@ -174,15 +174,14 @@ impl StateStore {
             ))
         })?;
         let mut writer = std::io::BufWriter::new(file);
-        writer.write_all(json.as_bytes()).map_err(|e| {
-            CoreError::StateStore(format!("failed to write state: {e}"))
-        })?;
-        let file = writer.into_inner().map_err(|e| {
-            CoreError::StateStore(format!("failed to flush state: {e}"))
-        })?;
-        file.sync_all().map_err(|e| {
-            CoreError::StateStore(format!("failed to fsync state file: {e}"))
-        })?;
+        writer
+            .write_all(json.as_bytes())
+            .map_err(|e| CoreError::StateStore(format!("failed to write state: {e}")))?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| CoreError::StateStore(format!("failed to flush state: {e}")))?;
+        file.sync_all()
+            .map_err(|e| CoreError::StateStore(format!("failed to fsync state file: {e}")))?;
 
         std::fs::rename(&tmp_path, &self.path).map_err(|e| {
             CoreError::StateStore(format!(

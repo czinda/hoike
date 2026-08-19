@@ -92,11 +92,7 @@ fn main() {
         let bundle = ahu::Bundle::from_bytes(&bundle_bytes).expect("bundle parse failed");
         let data_size = bundle.header.data_length as usize;
         let entry_count = bundle.index.len();
-        let per_entry = if entry_count > 0 {
-            data_size / entry_count
-        } else {
-            0
-        };
+        let per_entry = data_size.checked_div(entry_count).unwrap_or(0);
 
         let total_size = bundle_bytes.len();
         if baseline_size.is_none() {

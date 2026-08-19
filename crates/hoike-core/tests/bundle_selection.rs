@@ -50,9 +50,7 @@ fn build_bundle_at_epoch(epoch: u64, entries: &[([u8; 32], &[u8])]) -> Vec<u8> {
     for (key, data) in entries {
         builder.add_entry(*key, data.to_vec());
     }
-    builder
-        .build(|m| Ok(Sha256::digest(m).to_vec()))
-        .unwrap()
+    builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap()
 }
 
 #[test]
@@ -117,7 +115,10 @@ state_db = "{dir}/state"
     };
 
     // epoch=10 bundle should be loaded, which has key 0x22 but not 0x11
-    assert!(found_22, "expected epoch-10 bundle (key 0x22) to be selected");
+    assert!(
+        found_22,
+        "expected epoch-10 bundle (key 0x22) to be selected"
+    );
     assert!(
         state.lookup(&cert_id_11).is_none(),
         "epoch-5 bundle (key 0x11) should NOT be loaded"

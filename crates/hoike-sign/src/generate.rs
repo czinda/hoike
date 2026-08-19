@@ -170,7 +170,7 @@ where
         };
 
         let serial_number =
-            x509_cert::serial_number::SerialNumber::new(serial).map_err(|e| SignError::Der(e))?;
+            x509_cert::serial_number::SerialNumber::new(serial).map_err(SignError::Der)?;
 
         let entry_key_jitter = {
             let mut h = Sha256::new();
@@ -233,9 +233,8 @@ where
                 let ek1: [u8; 32] =
                     Sha256::digest(&cert_id_sha1.to_der().map_err(SignError::Der)?).into();
 
-                let single_sha256 =
-                    SingleResponse::new(cert_id_sha256, cert_status.clone(), this_update)
-                        .with_next_update(next_update);
+                let single_sha256 = SingleResponse::new(cert_id_sha256, cert_status, this_update)
+                    .with_next_update(next_update);
                 let single_sha1 = SingleResponse::new(cert_id_sha1, cert_status, this_update)
                     .with_next_update(next_update);
 
@@ -332,7 +331,7 @@ fn epoch_to_datetime(secs: u64) -> Result<der::DateTime> {
 
     let (year, month, day) = days_to_ymd(days);
     der::DateTime::new(year as u16, month as u8, day as u8, hours, minutes, seconds)
-        .map_err(|e| SignError::Der(e))
+        .map_err(SignError::Der)
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {

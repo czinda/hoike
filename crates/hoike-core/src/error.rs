@@ -36,7 +36,9 @@ pub enum CoreError {
         high_water: u64,
     },
 
-    #[error("epoch jump too large: scope {scope} epoch {epoch} jumps {jump} from high-water {high_water} (max allowed: {max_jump})")]
+    #[error(
+        "epoch jump too large: scope {scope} epoch {epoch} jumps {jump} from high-water {high_water} (max allowed: {max_jump})"
+    )]
     EpochJumpTooLarge {
         scope: String,
         epoch: u64,

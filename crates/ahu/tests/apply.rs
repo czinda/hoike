@@ -135,7 +135,7 @@ fn apply_base_plus_delta() {
     // Verify result
     assert_eq!(working_set.len(), 3); // A, C(new), D
     assert_eq!(working_set.get(&key_a).unwrap().as_slice(), b"response-A");
-    assert!(working_set.get(&key_b).is_none());
+    assert!(!working_set.contains_key(&key_b));
     assert_eq!(
         working_set.get(&key_c).unwrap().as_slice(),
         b"response-C-new"

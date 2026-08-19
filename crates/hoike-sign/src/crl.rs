@@ -235,6 +235,6 @@ mod tests {
             snapshot.entries.get(&vec![100u8]),
             Some(CertificateStatus::Revoked { .. })
         ));
-        assert!(snapshot.entries.get(&vec![1u8]).is_none());
+        assert!(!snapshot.entries.contains_key(&vec![1u8]));
     }
 }

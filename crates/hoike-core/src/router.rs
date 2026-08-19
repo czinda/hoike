@@ -389,10 +389,6 @@ fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {
         }
     }
 
-    best.map(|(p, _)| p).ok_or_else(|| {
-        CoreError::Config(format!(
-            "no valid .ahu files in {}",
-            dir.display()
-        ))
-    })
+    best.map(|(p, _)| p)
+        .ok_or_else(|| CoreError::Config(format!("no valid .ahu files in {}", dir.display())))
 }
