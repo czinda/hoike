@@ -732,9 +732,12 @@ fn run_sign(
                     eprintln!("Failed to load signing key: {e}");
                     std::process::exit(1);
                 })
-            } else {
-                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+            } else if demo_key {
+                warn!("using ephemeral ECDSA demo key — NOT FOR PRODUCTION");
                 hoike_sign::demo_ecdsa_p256_key()
+            } else {
+                eprintln!("No signing key provided. Use --signing-key <path> for a PKCS#8 key file, or --demo-key for testing.");
+                std::process::exit(1);
             };
             hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                 &ca,
@@ -744,47 +747,37 @@ fn run_sign(
                 seal_fn,
             )
         }
-        "ml-dsa-44" => {
-            if demo_key {
-                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+        "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87" => {
+            if !demo_key {
+                eprintln!("ML-DSA key loading from file is not yet supported.");
+                eprintln!("Use --demo-key for testing, or use --sig-alg ecdsa-p256 with --signing-key for production.");
+                std::process::exit(1);
             }
-            let seed = [42u8; 32];
-            let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
-            hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                &ca,
-                &snapshot,
-                &config,
-                &mut signer,
-                seal_fn,
-            )
-        }
-        "ml-dsa-65" => {
-            if demo_key {
-                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+            warn!("using ephemeral ML-DSA demo key — NOT FOR PRODUCTION");
+            let mut seed = [0u8; 32];
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut seed);
+            match sig_alg.as_str() {
+                "ml-dsa-44" => {
+                    let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
+                    hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
+                        &ca, &snapshot, &config, &mut signer, seal_fn,
+                    )
+                }
+                "ml-dsa-65" => {
+                    let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
+                    hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
+                        &ca, &snapshot, &config, &mut signer, seal_fn,
+                    )
+                }
+                "ml-dsa-87" => {
+                    let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
+                    hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
+                        &ca, &snapshot, &config, &mut signer, seal_fn,
+                    )
+                }
+                _ => unreachable!(),
             }
-            let seed = [42u8; 32];
-            let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
-            hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                &ca,
-                &snapshot,
-                &config,
-                &mut signer,
-                seal_fn,
-            )
-        }
-        "ml-dsa-87" => {
-            if demo_key {
-                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
-            }
-            let seed = [42u8; 32];
-            let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
-            hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                &ca,
-                &snapshot,
-                &config,
-                &mut signer,
-                seal_fn,
-            )
         }
         other => {
             eprintln!(
