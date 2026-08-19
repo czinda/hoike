@@ -190,13 +190,11 @@ fn validate_nonce_config(config: &Config) -> Result<()> {
         match ca.nonce_policy.as_str() {
             "ignore" => {}
             "live" => {
-                if config.server.mode == "edge" {
-                    return Err(CoreError::Config(format!(
-                        "CA '{}': nonce_policy \"live\" requires signer or combined mode, \
-                         but server.mode is \"edge\" — an edge node holds no signing key",
-                        ca.label
-                    )));
-                }
+                return Err(CoreError::Config(format!(
+                    "CA '{}': nonce_policy \"live\" is not yet implemented — \
+                     use \"ignore\" or \"forward\"",
+                    ca.label
+                )));
             }
             "forward" => {
                 if ca.forward_to.is_none() {
@@ -352,20 +350,49 @@ fn load_and_verify_bundle(path: &Path) -> Result<Bundle> {
 }
 
 fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {
-    let mut file_entries: Vec<_> = std::fs::read_dir(dir)?
+    let ahu_files: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "ahu"))
+        .map(|e| e.path())
         .collect();
 
-    file_entries.sort_by_key(|e| {
-        e.metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
+    if ahu_files.is_empty() {
+        return Err(CoreError::Config(format!(
+            "no .ahu files in {}",
+            dir.display()
+        )));
+    }
 
-    file_entries
-        .last()
-        .map(|e| e.path())
-        .ok_or_else(|| CoreError::Config(format!("no .ahu files in {}", dir.display())))
+    // Select the bundle with the highest max epoch across its CA scopes.
+    // Falls back to mtime if a bundle can't be parsed.
+    let mut best: Option<(std::path::PathBuf, u64)> = None;
+    for path in &ahu_files {
+        let max_epoch = match ahu::Bundle::from_file(path) {
+            Ok(bundle) => bundle
+                .manifest
+                .ca_scopes
+                .iter()
+                .map(|s| s.epoch)
+                .max()
+                .unwrap_or(0),
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to parse bundle for epoch selection, skipping"
+                );
+                continue;
+            }
+        };
+        if best.as_ref().is_none_or(|(_, e)| max_epoch > *e) {
+            best = Some((path.clone(), max_epoch));
+        }
+    }
+
+    best.map(|(p, _)| p).ok_or_else(|| {
+        CoreError::Config(format!(
+            "no valid .ahu files in {}",
+            dir.display()
+        ))
+    })
 }

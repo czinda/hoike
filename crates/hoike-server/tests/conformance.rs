@@ -40,7 +40,7 @@ fn build_conformance_bundle() -> Vec<u8> {
     entries.insert(
         vec![10u8],
         CertificateStatus::Revoked {
-            revocation_time: 1699900000,
+            revocation_time: 4102400000,
             reason: Some(CrlReason::KeyCompromise),
         },
     );
@@ -48,15 +48,15 @@ fn build_conformance_bundle() -> Vec<u8> {
     entries.insert(
         vec![11u8],
         CertificateStatus::Revoked {
-            revocation_time: 1699950000,
+            revocation_time: 4102410000,
             reason: None,
         },
     );
 
     let snapshot = StatusSnapshot {
         entries,
-        this_update: 1700000000,
-        next_update: Some(1700086400),
+        this_update: 4102444800,
+        next_update: Some(4102531200),
     };
 
     let config = GenerationConfig {

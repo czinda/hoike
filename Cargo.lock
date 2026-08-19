@@ -18,20 +18,12 @@ dependencies = [
  "bitflags",
  "byteorder",
  "ciborium",
- "cms",
- "const-oid 0.10.2",
- "der 0.8.1",
- "digest 0.11.3",
  "hex",
- "memmap2",
  "serde",
  "sha2 0.11.0",
- "spki 0.8.0",
  "tempfile",
  "thiserror",
  "uuid",
- "x509-cert 0.3.0",
- "x509-ocsp",
  "zstd",
 ]
 
@@ -466,7 +458,7 @@ dependencies = [
  "const-oid 0.9.6",
  "der_derive 0.7.3",
  "flagset",
- "pem-rfc7468 0.7.0",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -479,7 +471,6 @@ dependencies = [
  "const-oid 0.10.2",
  "der_derive 0.8.0",
  "flagset",
- "pem-rfc7468 1.0.0",
  "zeroize",
 ]
 
@@ -565,7 +556,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
- "pem-rfc7468 0.7.0",
+ "pem-rfc7468",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "sec1",
@@ -1308,15 +1299,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memmap2"
-version = "0.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1490,15 +1472,6 @@ name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
-dependencies = [
- "base64ct",
-]
-
-[[package]]
-name = "pem-rfc7468"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6305423e0e7738146434843d1694d621cce767262b2a86910beab705e4493d9"
 dependencies = [
  "base64ct",
 ]
@@ -2821,7 +2794,6 @@ dependencies = [
  "const-oid 0.10.2",
  "der 0.8.1",
  "spki 0.8.0",
- "tls_codec",
 ]
 
 [[package]]

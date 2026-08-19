@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, EXPIRES};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, EXPIRES, LAST_MODIFIED};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
@@ -85,6 +85,23 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
         Some(cid) => cid,
         None => return ocsp_error_response(MALFORMED_REQUEST),
     };
+
+    // Reject requests if the loaded bundle has expired.
+    // Spec §3: a mirror MUST NOT serve an entry after its nextUpdate.
+    if let Some(window) = state.responder.default_window() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now > window.next_update_min {
+            warn!(
+                now,
+                next_update_min = window.next_update_min,
+                "bundle expired — returning tryLater"
+            );
+            return ocsp_error_response(TRY_LATER);
+        }
+    }
 
     let has_nonce = parsed.nonce.is_some();
 
@@ -185,8 +202,17 @@ async fn forward_request(url: &str, der_bytes: &[u8]) -> Response {
                 return ocsp_error_response(TRY_LATER);
             }
 
+            const MAX_FORWARD_RESPONSE: usize = 65536;
             match upstream_resp.bytes().await {
                 Ok(body) => {
+                    if body.len() > MAX_FORWARD_RESPONSE {
+                        warn!(
+                            size = body.len(),
+                            max = MAX_FORWARD_RESPONSE,
+                            "upstream response too large"
+                        );
+                        return ocsp_error_response(INTERNAL_ERROR);
+                    }
                     let mut headers = HeaderMap::new();
                     headers.insert(
                         CONTENT_TYPE,
@@ -212,12 +238,24 @@ async fn forward_request(url: &str, der_bytes: &[u8]) -> Response {
 }
 
 fn ocsp_success_response(result: &LookupResult) -> Response {
+    let window = &result.window;
+
+    // Per-result expiry check (the bundle-level check in process_request
+    // catches most cases, but a multi-CA deployment may have bundles with
+    // different windows).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now > window.next_update_min {
+        return ocsp_error_response(TRY_LATER);
+    }
+
     let etag = format!(
         "\"{}\"",
         hex::encode(Sha256::digest(&result.response_bytes))
     );
 
-    let window = &result.window;
     let validity_secs = window
         .next_update_min
         .saturating_sub(window.this_update_min);
@@ -236,6 +274,17 @@ fn ocsp_success_response(result: &LookupResult) -> Response {
         HeaderValue::from_str(&cache_control).unwrap(),
     );
 
+    // Last-Modified: thisUpdate (RFC 9919 §7.2)
+    if let Ok(last_modified_time) = std::time::SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(window.this_update_min))
+        .ok_or(())
+    {
+        if let Ok(formatted) = httpdate_format(last_modified_time) {
+            headers.insert(LAST_MODIFIED, HeaderValue::from_str(&formatted).unwrap());
+        }
+    }
+
+    // Expires: nextUpdate
     if let Ok(expires_time) = std::time::SystemTime::UNIX_EPOCH
         .checked_add(std::time::Duration::from_secs(window.next_update_min))
         .ok_or(())

@@ -142,16 +142,32 @@ impl StateStore {
     }
 
     fn persist(&self) -> Result<()> {
+        use std::io::Write;
+
         let json = serde_json::to_string_pretty(&self.state)
             .map_err(|e| CoreError::StateStore(format!("failed to serialize state: {e}")))?;
 
         let tmp_path = self.path.with_extension("tmp");
-        std::fs::write(&tmp_path, &json).map_err(|e| {
+
+        // Write to temp file and fsync before rename — high-water marks
+        // must survive a power cut (spec §6.3).
+        let file = std::fs::File::create(&tmp_path).map_err(|e| {
             CoreError::StateStore(format!(
-                "failed to write temp state file {}: {e}",
+                "failed to create temp state file {}: {e}",
                 tmp_path.display()
             ))
         })?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(json.as_bytes()).map_err(|e| {
+            CoreError::StateStore(format!("failed to write state: {e}"))
+        })?;
+        let file = writer.into_inner().map_err(|e| {
+            CoreError::StateStore(format!("failed to flush state: {e}"))
+        })?;
+        file.sync_all().map_err(|e| {
+            CoreError::StateStore(format!("failed to fsync state file: {e}"))
+        })?;
+
         std::fs::rename(&tmp_path, &self.path).map_err(|e| {
             CoreError::StateStore(format!(
                 "failed to rename {} → {}: {e}",
@@ -159,6 +175,14 @@ impl StateStore {
                 self.path.display()
             ))
         })?;
+
+        // fsync parent directory to ensure the rename is durable.
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
         Ok(())
     }
 }

@@ -61,7 +61,7 @@ fn build_bundle_for_ca(issuer_name: &[u8], issuer_key: &[u8], entries: &[(u64, &
         format_version: 1,
         bundle_id: Uuid::nil(),
         producer_id: "e2e-test".into(),
-        created_at: 1700000000,
+        created_at: 4102444800,
         bundle_type: BundleType::Full,
         ca_scopes: vec![CaScope {
             hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
@@ -77,10 +77,10 @@ fn build_bundle_for_ca(issuer_name: &[u8], issuer_key: &[u8], entries: &[(u64, &
             completeness: Completeness::AuthoritativeComplete,
         }],
         window: Window {
-            produced_at: 1700000000,
-            this_update_min: 1700000000,
-            next_update_min: 1700086400,
-            next_update_max: 1700093600,
+            produced_at: 4102444800,
+            this_update_min: 4102444800,
+            next_update_min: 4102531200,
+            next_update_max: 4102538400,
         },
         integrity: Integrity {
             index_digest: [0; 32],
@@ -116,7 +116,7 @@ fn build_test_bundle_with_real_certids(entries: &[(u64, &[u8])]) -> Vec<u8> {
         format_version: 1,
         bundle_id: Uuid::nil(),
         producer_id: "e2e-test".into(),
-        created_at: 1700000000,
+        created_at: 4102444800,
         bundle_type: BundleType::Full,
         ca_scopes: vec![CaScope {
             hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
@@ -132,10 +132,10 @@ fn build_test_bundle_with_real_certids(entries: &[(u64, &[u8])]) -> Vec<u8> {
             completeness: Completeness::AuthoritativeComplete,
         }],
         window: Window {
-            produced_at: 1700000000,
-            this_update_min: 1700000000,
-            next_update_min: 1700086400,
-            next_update_max: 1700093600,
+            produced_at: 4102444800,
+            this_update_min: 4102444800,
+            next_update_min: 4102531200,
+            next_update_max: 4102538400,
         },
         integrity: Integrity {
             index_digest: [0; 32],
@@ -569,7 +569,7 @@ nonce_policy = "forward"
 }
 
 #[tokio::test]
-async fn live_on_edge_rejected_at_startup() {
+async fn live_nonce_rejected_at_startup() {
     let bundle_bytes = build_test_bundle_with_real_certids(&[(1, b"R")]);
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("test.ahu");
@@ -600,11 +600,11 @@ nonce_policy = "live"
     let config = hoike_core::Config::from_file(&config_path).unwrap();
     let msg = match hoike_core::ResponderState::load(config) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("expected config validation error"),
+        Ok(_) => panic!("expected config validation error for nonce_policy=live"),
     };
     assert!(
-        msg.contains("edge") && msg.contains("live"),
-        "expected edge/live error, got: {msg}"
+        msg.contains("live") && msg.contains("not yet implemented"),
+        "expected live/not-implemented error, got: {msg}"
     );
 }
 

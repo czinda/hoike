@@ -3,17 +3,18 @@
 ## What this project is
 
 hoike is a Rust OCSP responder serving pre-signed responses from `ahu` bundles.
-The design separates signing (signer tier, HSM access) from serving (edge tier,
-keyless, horizontally scalable). See `hoike-design.md` for the full architecture
+The design separates signing (signer tier) from serving (edge tier, keyless,
+horizontally scalable). See `hoike-design.md` for the full architecture roadmap
 and `ahu-format-spec.md` for the bundle format specification.
 
 ## Build and test
 
 ```bash
 cargo build              # build all crates
-cargo test --workspace   # run all tests (23 tests: 12 unit, 7 integration, 4 e2e)
-cargo run --bin ahu -- inspect test.ahu    # inspect a bundle
-cargo run --bin hoike -- serve --config testdata/hoike-test.toml  # run server
+cargo test --workspace   # 81 tests: unit, integration, e2e, conformance
+cargo run --bin ahu -- inspect test.ahu
+cargo run --bin hoike -- serve --config testdata/hoike-test.toml
+cargo run --bin hoike -- sign --ca test --crl test.crl -o test.ahu
 ```
 
 ## Workspace structure
@@ -21,30 +22,46 @@ cargo run --bin hoike -- serve --config testdata/hoike-test.toml  # run server
 | Crate | Purpose | License |
 |-------|---------|---------|
 | `ahu` | Bundle format (no runtime deps) | Apache-2.0 OR MIT |
-| `hoike-core` | Request parsing, CertID routing, config | GPL-3.0+ |
+| `hoike-core` | Request parsing, CertID routing, config, state store | GPL-3.0+ |
 | `hoike-server` | HTTP handlers (axum) | GPL-3.0+ |
-| `hoike-sign` | PKCS#11 signing, batch production | GPL-3.0+ |
-| `hoike-gossip` | SWIM membership, generation gossip | GPL-3.0+ |
+| `hoike-sign` | CRL adapter, OCSP response generation, ECDSA + ML-DSA signing | GPL-3.0+ |
+| `hoike-gossip` | SWIM membership via foca, generation gossip | GPL-3.0+ |
 | `hoike-cli` | `hoike` and `ahu` binaries | GPL-3.0+ |
 
-## Key dependency note
+## Key dependency notes
 
-`x509-ocsp` 0.2.1 depends on `der` 0.7, while `ahu` uses `der` 0.8. Any crate
-that parses OCSP types must use `der` 0.7 (matching x509-ocsp). The `ahu` crate
-uses `der` 0.8 and must not directly encode/decode x509-ocsp types.
+- `x509-ocsp` 0.2.1 depends on `der` 0.7, while `ahu` uses `der` 0.8. Any crate
+  that parses or constructs OCSP types must use `der` 0.7 (matching x509-ocsp).
+  The `ahu` crate uses `der` 0.8 and must not directly encode/decode x509-ocsp types.
+- `ml-dsa` 0.1.1 uses `signature` v3, while `x509-ocsp` builder uses `signature` v2.
+  `hoike-sign/src/ml_dsa_bridge.rs` bridges them with a wrapper type.
 
 ## Conventions
 
 - Entry key = SHA-256(DER of CertID) — used throughout for index lookups
 - CBOR manifest uses integer keys in ascending order (deterministic encoding)
 - Error OCSP responses are static 5-byte DER constants (no signing needed)
-- Tests use `Sha256::digest(manifest)` as a dummy seal (real CMS in M2+)
 
-## Current milestones
+## What is placeholder / not yet implemented
 
-- M0 (ahu crate): Done
-- M1 (edge server): Done
-- M2 (signer tier — CRL adapter, ECDSA signing): Done
-- M3 (multi-CA routing, nonce policies, combined mode): Done
-- M4 (gossip via foca SWIM, enclave import, anti-rollback): Done
-- M5 (ML-DSA-44/65/87, batching benchmark, RFC 9919/9654 conformance): Done
+- **Seal**: Uses `Sha256::digest(manifest)` as a dummy seal, not CMS `SignedData`.
+  The `cms` crate is declared as a dependency but never imported. Responses within
+  bundles are properly signed; the container itself is not cryptographically sealed.
+- **Signing key**: Ephemeral / hardcoded `[42u8; 32]` seed. No key loading path.
+  No `cryptoki` / PKCS#11 dependency exists.
+- **`--issuer` flag**: Accepted but ignored. CertID issuer hashes use synthetic
+  bytes from the CA label string.
+- **`nonce_policy = "live"`**: Rejected at config validation (not implemented).
+- **Revocation sources**: Only CRL ingest. Dogtag REST, 389 DS, akamu, SQL are
+  described in `hoike-design.md` but not coded.
+- **Delegated signing**: Only CA-direct. `responder_cert` / `responder_key` config
+  fields are not wired.
+- **nextUpdate enforcement**: `handlers.rs` computes HTTP Expires/max-age from
+  `next_update_min` but doesn't refuse to serve expired bundles.
+- **Gossip authentication**: Messages are unauthenticated; design doc requires signing.
+
+## Current state
+
+All five milestones (M0–M5) are implemented at the prototype level. The design
+doc (`hoike-design.md`) is the roadmap — it describes the target architecture
+including features not yet built. The README describes what runs today.

@@ -7,19 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-der = { workspace = true }
-x509-cert = { workspace = true }
-x509-ocsp = { workspace = true }
 sha2 = { workspace = true }
-digest = { workspace = true }
-cms = { workspace = true }
-const-oid = { workspace = true }
-spki = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-memmap2 = { workspace = true }
 zstd = { workspace = true, optional = true }
 hex = { workspace = true }
 byteorder = { workspace = true }
