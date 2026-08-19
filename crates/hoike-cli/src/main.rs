@@ -282,7 +282,7 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
             store
                 .get_high_water("hoike-combined", &issuer_key_hash_hex)
                 .unwrap_or(0)
-                + 1
+                .saturating_add(1)
         };
 
         let gen_config = GenerationConfig {
@@ -436,7 +436,7 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     }
 
     if !force {
-        let state_store = match hoike_core::StateStore::open(&config.storage.state_db) {
+        let state_store = match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("  Anti-rollback: FAIL — cannot open state store: {e}");

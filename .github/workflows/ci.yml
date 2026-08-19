@@ -124,7 +124,11 @@ jobs:
           cp "target/${{ matrix.target }}/release/hoike" dist/
           cp "target/${{ matrix.target }}/release/ahu" dist/
           cd dist && tar czf "../${ARCHIVE}" hoike ahu && cd ..
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Upload artifact

@@ -49,8 +49,10 @@ cargo run --bin hoike -- sign --ca test --crl test.crl -o test.ahu
   bundles are properly signed; the container itself is not cryptographically sealed.
 - **Signing key**: Ephemeral / hardcoded `[42u8; 32]` seed. No key loading path.
   No `cryptoki` / PKCS#11 dependency exists.
-- **`--issuer` flag**: Accepted but ignored. CertID issuer hashes use synthetic
-  bytes from the CA label string.
+- **Issuer identity**: `--issuer-name-b64` and `--issuer-key-b64` CLI flags are
+  wired for `hoike sign`. Without them, CertID hashes use synthetic bytes from
+  the CA label (with a warning). Combined mode uses `issuer_name_der_b64` and
+  `issuer_key_bytes_b64` config fields.
 - **`nonce_policy = "live"`**: Rejected at config validation (not implemented).
 - **Revocation sources**: Only CRL ingest. Dogtag REST, 389 DS, akamu, SQL are
   described in `hoike-design.md` but not coded.

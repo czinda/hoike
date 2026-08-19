@@ -111,7 +111,8 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
             if has_nonce {
                 match result.nonce_policy.as_str() {
                     "live" => {
-                        unreachable!("live nonce policy rejected at config validation")
+                        debug!(ca = result.ca_label, "live nonce policy not implemented");
+                        return ocsp_error_response(hoike_core::INTERNAL_ERROR);
                     }
                     "forward" => {
                         if let Some(url) = &result.forward_to {
