@@ -15,7 +15,7 @@
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::Mechanism;
-use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
+use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
 use cryptoki::session::UserType;
 use cryptoki::types::AuthPin;
 use tracing::info;
@@ -23,20 +23,27 @@ use tracing::info;
 use crate::error::{Result, SignError};
 
 /// Configuration for a PKCS#11 signing key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pkcs11Config {
-    /// Path to the vendor's PKCS#11 shared library.
     pub module_path: String,
-    /// Explicit slot ID (mutually exclusive with token_label).
     pub slot_id: Option<u64>,
-    /// Find slot by token label (e.g., Luna partition name).
     pub token_label: Option<String>,
-    /// Login PIN. Read from pin_env environment variable if not set directly.
     pub pin: String,
-    /// Find key by CKA_LABEL.
     pub key_label: Option<String>,
-    /// Find key by CKA_ID (raw bytes).
     pub key_id: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Pkcs11Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkcs11Config")
+            .field("module_path", &self.module_path)
+            .field("slot_id", &self.slot_id)
+            .field("token_label", &self.token_label)
+            .field("pin", &"[REDACTED]")
+            .field("key_label", &self.key_label)
+            .field("key_id", &self.key_id)
+            .finish()
+    }
 }
 
 /// ECDSA P-256 signer backed by a PKCS#11 HSM.
@@ -60,7 +67,7 @@ impl Pkcs11Signer {
         let slot = find_slot(&ctx, config)?;
 
         let session = ctx
-            .open_rw_session(slot)
+            .open_ro_session(slot)
             .map_err(|e| SignError::Pkcs11(format!("open session: {e}")))?;
 
         session
@@ -132,31 +139,46 @@ fn find_key(
     session: &cryptoki::session::Session,
     config: &Pkcs11Config,
 ) -> Result<ObjectHandle> {
+    if config.key_label.is_none() && config.key_id.is_none() {
+        return Err(SignError::Pkcs11(
+            "PKCS#11 config must specify key_label or key_id to identify the signing key".into(),
+        ));
+    }
+
     let mut template = vec![
         Attribute::Class(ObjectClass::PRIVATE_KEY),
         Attribute::Sign(true),
     ];
+    let mut filters = Vec::new();
     if let Some(label) = &config.key_label {
         template.push(Attribute::Label(label.as_bytes().to_vec()));
+        filters.push(format!("CKA_LABEL={label}"));
     }
     if let Some(id) = &config.key_id {
         template.push(Attribute::Id(id.clone()));
+        filters.push(format!("CKA_ID={}", hex::encode(id)));
     }
 
     let handles = session
         .find_objects(&template)
         .map_err(|e| SignError::Pkcs11(format!("find key: {e}")))?;
 
-    handles.first().copied().ok_or_else(|| {
-        let label_info = config
-            .key_label
-            .as_deref()
-            .unwrap_or("(no label filter)");
-        SignError::Pkcs11(format!(
-            "signing key not found (label={label_info}, {} candidates)",
-            handles.len()
-        ))
-    })
+    if handles.is_empty() {
+        return Err(SignError::Pkcs11(format!(
+            "no signing key found matching [{}]",
+            filters.join(", ")
+        )));
+    }
+
+    if handles.len() > 1 {
+        tracing::warn!(
+            count = handles.len(),
+            filters = filters.join(", "),
+            "multiple HSM keys match — using first; narrow with key_label + key_id"
+        );
+    }
+
+    Ok(handles[0])
 }
 
 // ── signature v2 bridge ─────────────────────────────────────────────

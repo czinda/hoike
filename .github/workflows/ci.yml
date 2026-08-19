@@ -31,6 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
         run: cargo check --workspace --locked
+      - name: cargo check (pkcs11 feature)
+        run: cargo check -p hoike-sign -p hoike-cli --features pkcs11 --locked
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo fmt

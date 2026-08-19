@@ -60,7 +60,7 @@ enum Commands {
         #[arg(long)]
         issuer_key_b64: Option<String>,
         /// Path to PKCS#8 PEM or DER signing key file
-        #[arg(long)]
+        #[arg(long, conflicts_with = "demo_key")]
         signing_key: Option<PathBuf>,
         /// Use an ephemeral demo key (NOT FOR PRODUCTION)
         #[arg(long)]
@@ -897,7 +897,14 @@ fn resolve_pkcs11_config(
                 token_label: token_label.clone(),
                 pin: resolved_pin,
                 key_label: key_label.clone(),
-                key_id: key_id.as_ref().and_then(|h| hex::decode(h).ok()),
+                key_id: key_id
+                    .as_ref()
+                    .map(|h| {
+                        hex::decode(h).map_err(|e| {
+                            format!("CA '{}': invalid hex in key_id '{}': {e}", ca_config.label, h)
+                        })
+                    })
+                    .transpose()?,
             })
         }
         _ => Err(format!(

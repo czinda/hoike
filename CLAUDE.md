@@ -47,8 +47,10 @@ cargo run --bin hoike -- sign --ca test --crl test.crl -o test.ahu
 - **Seal**: Uses `Sha256::digest(manifest)` as a dummy seal, not CMS `SignedData`.
   The `cms` crate is declared as a dependency but never imported. Responses within
   bundles are properly signed; the container itself is not cryptographically sealed.
-- **Signing key**: Ephemeral / hardcoded `[42u8; 32]` seed. No key loading path.
-  No `cryptoki` / PKCS#11 dependency exists.
+- **Signing key**: Three options — PKCS#8 file (`--signing-key`), PKCS#11/HSM
+  (`signing_key.type = "pkcs11"`, behind `--features pkcs11`), or ephemeral demo
+  (`--demo-key`). CLI refuses to sign without explicit key source. PKCS#11 PIN
+  resolved via: interactive prompt (production) → env var → config file.
 - **Issuer identity**: `--issuer-name-b64` and `--issuer-key-b64` CLI flags are
   wired for `hoike sign`. Without them, CertID hashes use synthetic bytes from
   the CA label (with a warning). Combined mode uses `issuer_name_der_b64` and
