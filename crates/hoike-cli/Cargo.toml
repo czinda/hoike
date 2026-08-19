@@ -33,3 +33,8 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["der"] }
 sha2 = { workspace = true }
 sha2_v010 = { package = "sha2", version = "0.10", features = ["oid"] }
+signature = "2"
+
+[features]
+default = []
+pkcs11 = ["hoike-sign/pkcs11"]

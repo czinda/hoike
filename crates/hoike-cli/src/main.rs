@@ -59,6 +59,12 @@ enum Commands {
         /// Base64-encoded issuer public key bytes (for correct CertID hashes)
         #[arg(long)]
         issuer_key_b64: Option<String>,
+        /// Path to PKCS#8 PEM or DER signing key file
+        #[arg(long)]
+        signing_key: Option<PathBuf>,
+        /// Use an ephemeral demo key (NOT FOR PRODUCTION)
+        #[arg(long)]
+        demo_key: bool,
     },
     /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
     Import {
@@ -103,6 +109,8 @@ fn main() {
             sig_alg,
             issuer_name_b64,
             issuer_key_b64,
+            signing_key,
+            demo_key,
         } => {
             run_sign(
                 ca,
@@ -114,6 +122,8 @@ fn main() {
                 sig_alg,
                 issuer_name_b64,
                 issuer_key_b64,
+                signing_key,
+                demo_key,
             );
         }
         Commands::Import {
@@ -238,7 +248,6 @@ async fn run_server(config_path: PathBuf) {
 
 fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), String> {
     use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
-    use p256::ecdsa::SigningKey;
     use sha2_v010::{Digest, Sha256};
 
     for ca_config in &config.ca {
@@ -293,23 +302,65 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
             ..Default::default()
         };
 
-        // Ephemeral signing key — production would load from config
-        let secret = [42u8; 32];
-        let mut signing_key =
-            SigningKey::from_bytes((&secret).into()).expect("invalid signing key");
-
-        warn!(
-            ca = ca_config.label,
-            "using ephemeral signing key — not for production"
-        );
-
-        let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-            &ca,
-            &snapshot,
-            &gen_config,
-            &mut signing_key,
-            |m| Ok(Sha256::digest(m).to_vec()),
-        )
+        let bundle_bytes = match &ca_config.signing_key {
+            Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+                let mut signer = hoike_sign::load_ecdsa_p256_key(path)
+                    .map_err(|e| format!("load signing key: {e}"))?;
+                info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
+                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                    &ca,
+                    &snapshot,
+                    &gen_config,
+                    &mut signer,
+                    |m| Ok(Sha256::digest(m).to_vec()),
+                )
+            }
+            Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                // PKCS#11 signing requires the `pkcs11` feature at compile time
+                #[cfg(feature = "pkcs11")]
+                {
+                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
+                    let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
+                        .map_err(|e| format!("PKCS#11 init: {e}"))?;
+                    let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
+                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
+                        &ca,
+                        &snapshot,
+                        &gen_config,
+                        &mut bridge,
+                        |m| Ok(Sha256::digest(m).to_vec()),
+                    )
+                }
+                #[cfg(not(feature = "pkcs11"))]
+                {
+                    return Err(format!(
+                        "CA '{}' requires PKCS#11 signing but hoike was built without the 'pkcs11' feature. \
+                         Rebuild with: cargo build --features pkcs11",
+                        ca_config.label
+                    ));
+                }
+            }
+            Some(hoike_core::config::SigningKeyConfig::Demo) => {
+                warn!(
+                    ca = ca_config.label,
+                    "using ephemeral demo signing key — NOT FOR PRODUCTION"
+                );
+                let mut signer = hoike_sign::demo_ecdsa_p256_key();
+                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                    &ca,
+                    &snapshot,
+                    &gen_config,
+                    &mut signer,
+                    |m| Ok(Sha256::digest(m).to_vec()),
+                )
+            }
+            None => {
+                return Err(format!(
+                    "CA '{}' has no signing_key configured. Add [ca.signing_key] to config.",
+                    ca_config.label
+                ));
+            }
+        }
         .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
 
         let bundle_path = config
@@ -540,11 +591,24 @@ fn run_sign(
     sig_alg: String,
     issuer_name_b64: Option<String>,
     issuer_key_b64: Option<String>,
+    signing_key_path: Option<PathBuf>,
+    demo_key: bool,
 ) {
     use hoike_sign::{
         CaIdentity, CertIdCompat, CertificateStatus, CrlSource, GenerationConfig, RevocationSource,
     };
     use sha2_v010::{Digest, Sha256};
+
+    // Resolve signing key — require explicit --signing-key or --demo-key
+    if signing_key_path.is_none() && !demo_key {
+        eprintln!(
+            "Error: no signing key specified.\n\n\
+             Provide one of:\n  \
+             --signing-key PATH   PKCS#8 PEM or DER key file\n  \
+             --demo-key           Ephemeral key for testing only (NOT FOR PRODUCTION)\n"
+        );
+        std::process::exit(1);
+    }
 
     let compat = match certid_compat.as_str() {
         "dual" => CertIdCompat::Dual,
@@ -659,13 +723,19 @@ fn run_sign(
         ..Default::default()
     };
 
-    let seed = [42u8; 32];
     let seal_fn = |m: &[u8]| -> hoike_sign::Result<Vec<u8>> { Ok(Sha256::digest(m).to_vec()) };
 
     let bundle_bytes = match sig_alg.as_str() {
         "ecdsa-p256" => {
-            let mut signer =
-                p256::ecdsa::SigningKey::from_bytes((&seed).into()).expect("invalid ECDSA key");
+            let mut signer = if let Some(key_path) = &signing_key_path {
+                hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+                    eprintln!("Failed to load signing key: {e}");
+                    std::process::exit(1);
+                })
+            } else {
+                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+                hoike_sign::demo_ecdsa_p256_key()
+            };
             hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                 &ca,
                 &snapshot,
@@ -675,6 +745,10 @@ fn run_sign(
             )
         }
         "ml-dsa-44" => {
+            if demo_key {
+                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+            }
+            let seed = [42u8; 32];
             let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
             hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
                 &ca,
@@ -685,6 +759,10 @@ fn run_sign(
             )
         }
         "ml-dsa-65" => {
+            if demo_key {
+                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+            }
+            let seed = [42u8; 32];
             let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
             hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
                 &ca,
@@ -695,6 +773,10 @@ fn run_sign(
             )
         }
         "ml-dsa-87" => {
+            if demo_key {
+                warn!("using ephemeral demo key — NOT FOR PRODUCTION");
+            }
+            let seed = [42u8; 32];
             let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
             hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
                 &ca,
@@ -738,4 +820,51 @@ fn run_sign(
         println!("  Signature overhead: ~{sig_overhead} bytes ({sig_alg})");
     }
     println!("  Output:            {}", output.display());
+}
+
+/// Resolve PKCS#11 config from CaConfig, reading PIN from env if needed.
+#[cfg(feature = "pkcs11")]
+fn resolve_pkcs11_config(
+    ca_config: &hoike_core::config::CaConfig,
+) -> std::result::Result<hoike_sign::Pkcs11Config, String> {
+    match &ca_config.signing_key {
+        Some(hoike_core::config::SigningKeyConfig::Pkcs11 {
+            module,
+            token_label,
+            slot_id,
+            pin,
+            pin_env,
+            key_label,
+            key_id,
+        }) => {
+            let resolved_pin = if let Some(p) = pin {
+                p.clone()
+            } else if let Some(env_var) = pin_env {
+                std::env::var(env_var).map_err(|_| {
+                    format!(
+                        "CA '{}': PKCS#11 pin_env '{}' is not set",
+                        ca_config.label, env_var
+                    )
+                })?
+            } else {
+                return Err(format!(
+                    "CA '{}': PKCS#11 has neither pin nor pin_env",
+                    ca_config.label
+                ));
+            };
+
+            Ok(hoike_sign::Pkcs11Config {
+                module_path: module.clone(),
+                slot_id: *slot_id,
+                token_label: token_label.clone(),
+                pin: resolved_pin,
+                key_label: key_label.clone(),
+                key_id: key_id.as_ref().and_then(|h| hex::decode(h).ok()),
+            })
+        }
+        _ => Err(format!(
+            "CA '{}': not a PKCS#11 signing key config",
+            ca_config.label
+        )),
+    }
 }

@@ -28,6 +28,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # Post-quantum
 ml-dsa = { workspace = true }
 
+# PKCS#11 (optional — requires vendor C library at link time)
+cryptoki = { version = "0.12", optional = true }
+
 # CMS seal
 cms = "0.3.0-pre.2"
 
@@ -38,6 +41,10 @@ uuid = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 base64 = { workspace = true }
+
+[features]
+default = []
+pkcs11 = ["dep:cryptoki"]
 
 [dev-dependencies]
 tempfile = "3"

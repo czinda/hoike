@@ -17,6 +17,12 @@ pub enum SignError {
     #[error("bundle build error: {0}")]
     Bundle(#[from] ahu::AhuError),
 
+    #[error("PKCS#11 error: {0}")]
+    Pkcs11(String),
+
+    #[error("key loading error: {0}")]
+    KeyLoad(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 

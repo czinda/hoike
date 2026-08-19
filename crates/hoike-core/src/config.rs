@@ -78,6 +78,43 @@ pub struct CaConfig {
     /// Raw issuer public key bytes (for CertID computation in signer mode).
     /// Base64-encoded in config, decoded on load.
     pub issuer_key_bytes_b64: Option<String>,
+    /// Signing key configuration (required for signer/combined mode).
+    pub signing_key: Option<SigningKeyConfig>,
+}
+
+/// How to obtain the signing key for OCSP response production.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum SigningKeyConfig {
+    /// Load from a PKCS#8 PEM or DER file on disk.
+    #[serde(rename = "file")]
+    File { path: PathBuf },
+
+    /// Sign via a PKCS#11 hardware security module.
+    ///
+    /// Supported HSMs: Thales Luna, Entrust nShield, Utimaco CryptoServer,
+    /// FutureX Vectera Plus, SoftHSM2 (testing).
+    #[serde(rename = "pkcs11")]
+    Pkcs11 {
+        /// Path to the vendor's PKCS#11 shared library.
+        module: String,
+        /// Find slot by token label (e.g., Luna partition name).
+        token_label: Option<String>,
+        /// Explicit slot ID (alternative to token_label).
+        slot_id: Option<u64>,
+        /// Login PIN (plaintext — prefer pin_env for production).
+        pin: Option<String>,
+        /// Environment variable containing the login PIN.
+        pin_env: Option<String>,
+        /// Find key by CKA_LABEL.
+        key_label: Option<String>,
+        /// Find key by CKA_ID (hex-encoded).
+        key_id: Option<String>,
+    },
+
+    /// Ephemeral demo key for testing only. Produces a warning on every use.
+    #[serde(rename = "demo")]
+    Demo,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -141,6 +178,25 @@ impl Config {
                         "CA '{}' has no source configured, required for {} mode",
                         ca.label, self.server.mode
                     )));
+                }
+                if ca.signing_key.is_none() {
+                    return Err(crate::error::CoreError::Config(format!(
+                        "CA '{}' has no signing_key configured, required for {} mode. \
+                         Use type='file' with a PKCS#8 key, type='pkcs11' for HSM, \
+                         or type='demo' for testing only.",
+                        ca.label, self.server.mode
+                    )));
+                }
+                if let Some(SigningKeyConfig::Pkcs11 {
+                    pin, pin_env, ..
+                }) = &ca.signing_key
+                {
+                    if pin.is_none() && pin_env.is_none() {
+                        return Err(crate::error::CoreError::Config(format!(
+                            "CA '{}' PKCS#11 signing_key has neither pin nor pin_env",
+                            ca.label
+                        )));
+                    }
                 }
             }
             if self.ca.is_empty() {

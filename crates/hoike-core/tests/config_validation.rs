@@ -81,6 +81,9 @@ batch_interval = 60
 [ca.source]
 type = "crl"
 path = "{crl}"
+
+[ca.signing_key]
+type = "demo"
 "#,
             dir = dir.path().display(),
             crl = crl_path.display(),
@@ -93,6 +96,131 @@ path = "{crl}"
     assert!(config.is_combined());
     assert!(config.needs_signing());
     assert_eq!(config.ca[0].batch_interval, 60);
+}
+
+#[test]
+fn combined_mode_without_signing_key_is_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("hoike.toml");
+    let crl_path = dir.path().join("test.crl");
+    std::fs::write(&crl_path, b"placeholder").unwrap();
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+mode = "combined"
+
+[storage]
+bundle_dir = "{dir}"
+
+[[ca]]
+label = "test-ca"
+
+[ca.source]
+type = "crl"
+path = "{crl}"
+"#,
+            dir = dir.path().display(),
+            crl = crl_path.display(),
+        ),
+    )
+    .unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+    let result = config.validate_for_mode();
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("signing_key"), "got: {msg}");
+}
+
+#[test]
+fn pkcs11_config_without_pin_is_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("hoike.toml");
+    let crl_path = dir.path().join("test.crl");
+    std::fs::write(&crl_path, b"placeholder").unwrap();
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+mode = "combined"
+
+[storage]
+bundle_dir = "{dir}"
+
+[[ca]]
+label = "test-ca"
+
+[ca.source]
+type = "crl"
+path = "{crl}"
+
+[ca.signing_key]
+type = "pkcs11"
+module = "/usr/lib/libCryptoki2_64.so"
+token_label = "my-partition"
+key_label = "hoike-responder"
+"#,
+            dir = dir.path().display(),
+            crl = crl_path.display(),
+        ),
+    )
+    .unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+    let result = config.validate_for_mode();
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("pin"), "got: {msg}");
+}
+
+#[test]
+fn file_signing_key_config_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("hoike.toml");
+    let crl_path = dir.path().join("test.crl");
+    let key_path = dir.path().join("responder.pem");
+    std::fs::write(&crl_path, b"placeholder").unwrap();
+    std::fs::write(&key_path, b"placeholder").unwrap();
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+mode = "combined"
+
+[storage]
+bundle_dir = "{dir}"
+
+[[ca]]
+label = "test-ca"
+
+[ca.source]
+type = "crl"
+path = "{crl}"
+
+[ca.signing_key]
+type = "file"
+path = "{key}"
+"#,
+            dir = dir.path().display(),
+            crl = crl_path.display(),
+            key = key_path.display(),
+        ),
+    )
+    .unwrap();
+
+    let config = Config::from_file(&config_path).unwrap();
+    assert!(config.validate_for_mode().is_ok());
+    assert!(matches!(
+        config.ca[0].signing_key,
+        Some(hoike_core::config::SigningKeyConfig::File { .. })
+    ));
 }
 
 #[test]
