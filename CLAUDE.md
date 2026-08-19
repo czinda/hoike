@@ -56,9 +56,15 @@ cargo run --bin hoike -- sign --ca test --crl test.crl -o test.ahu
   described in `hoike-design.md` but not coded.
 - **Delegated signing**: Only CA-direct. `responder_cert` / `responder_key` config
   fields are not wired.
-- **nextUpdate enforcement**: `handlers.rs` computes HTTP Expires/max-age from
-  `next_update_min` but doesn't refuse to serve expired bundles.
 - **Gossip authentication**: Messages are unauthenticated; design doc requires signing.
+
+### Mitigations for unauthenticated seal
+
+Since the CMS seal is a placeholder, the manifest is unauthenticated:
+- `MAX_EPOCH_JUMP` (10,000) prevents a poisoned bundle from setting
+  `epoch = u64::MAX` and permanently locking a CA's high-water mark.
+- `nextUpdate` enforcement now rejects expired bundles at serve time.
+- Epoch uses a persisted counter (high_water + 1), not wall-clock time.
 
 ## Current state
 

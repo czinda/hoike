@@ -12,7 +12,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   # ──────────────────────────────────────────────
@@ -22,15 +21,15 @@ jobs:
     name: Check & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
@@ -45,8 +44,14 @@ jobs:
       fail-fast: false
       matrix:
         toolchain: [stable, nightly]
+        include:
+          - toolchain: stable
+            allow-fail: false
+          - toolchain: nightly
+            allow-fail: true
+    continue-on-error: ${{ matrix.allow-fail }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -55,7 +60,7 @@ jobs:
           key: test-${{ matrix.toolchain }}
       - name: Run tests
         run: |
-          cargo test --workspace 2>&1 | tee test-output.txt
+          cargo test --workspace --locked 2>&1 | tee test-output.txt
           exit ${PIPESTATUS[0]}
       - name: Test summary
         if: always()
@@ -91,7 +96,7 @@ jobs:
             os: macos-latest
             use_cross: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -105,25 +110,25 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
           VERSION="${GITHUB_REF_NAME:-dev}"
           ARCHIVE="hoike-${VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/hoike" dist/ || true
-          cp "target/${{ matrix.target }}/release/ahu" dist/ || true
+          cp "target/${{ matrix.target }}/release/hoike" dist/
+          cp "target/${{ matrix.target }}/release/ahu" dist/
           cd dist && tar czf "../${ARCHIVE}" hoike ahu && cd ..
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hoike-${{ matrix.target }}
           path: |
@@ -142,11 +147,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
 
@@ -157,37 +162,8 @@ jobs:
           find artifacts -name '*.sha256' -exec mv {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Generate changelog
-        id: changelog
-        run: |
-          PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
-          if [ -z "$PREV_TAG" ]; then
-            CHANGES=$(git log --oneline)
-          else
-            CHANGES=$(git log --oneline "${PREV_TAG}..HEAD")
-          fi
-          {
-            echo 'body<<BODY_EOF'
-            echo "## Changes"
-            echo ""
-            echo "$CHANGES"
-            echo ""
-            echo "## Downloads"
-            echo ""
-            echo "| Platform | Archive |"
-            echo "|----------|---------|"
-            echo "| Linux x86_64 (glibc) | \`hoike-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz\` |"
-            echo "| Linux x86_64 (musl, static) | \`hoike-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz\` |"
-            echo "| Linux ARM64 | \`hoike-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz\` |"
-            echo "| macOS ARM64 | \`hoike-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz\` |"
-            echo ""
-            echo "Each archive contains \`hoike\` (OCSP responder) and \`ahu\` (bundle tool)."
-            echo 'BODY_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          body: ${{ steps.changelog.outputs.body }}
           files: release-assets/*
           generate_release_notes: true
 
@@ -203,12 +179,12 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -216,7 +192,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -226,7 +202,7 @@ jobs:
             type=sha
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Containerfile
@@ -245,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

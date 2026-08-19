@@ -647,3 +647,116 @@ nonce_policy = "bogus"
         "expected unknown policy error, got: {msg}"
     );
 }
+
+fn build_expired_bundle(entries: &[(u64, &[u8])]) -> Vec<u8> {
+    let manifest = Manifest {
+        format_version: 1,
+        bundle_id: Uuid::nil(),
+        producer_id: "e2e-test".into(),
+        created_at: 1000000000,
+        bundle_type: BundleType::Full,
+        ca_scopes: vec![CaScope {
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
+            issuer_name_hash: Sha256::digest(b"CN=Test CA,O=Hoike Test").to_vec(),
+            issuer_key_hash: Sha256::digest(b"test-ca-public-key").to_vec(),
+            epoch: 1,
+            responder_id: ResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: vec![0xCC; 20],
+            },
+            responder_chain: None,
+            signature_algorithm: vec![0x02],
+            completeness: Completeness::AuthoritativeComplete,
+        }],
+        window: Window {
+            produced_at: 1000000000,
+            this_update_min: 1000000000,
+            next_update_min: 1000086400, // ~2001-09-09 — long expired
+            next_update_max: 1000093600,
+        },
+        integrity: Integrity {
+            index_digest: [0; 32],
+            data_digest: [0; 32],
+        },
+        entry_count: 0,
+        continuity: Continuity {
+            prev_manifest_digest: None,
+            base_manifest_digest: None,
+            chain_length: 0,
+        },
+        shard: None,
+        compression: None,
+        extensions: None,
+    };
+
+    let mut builder = BundleBuilder::new(manifest);
+
+    for (serial, response_bytes) in entries {
+        let cert_id = build_certid(*serial);
+        let certid_der = cert_id.to_der().unwrap();
+        let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
+        builder.add_entry(entry_key, response_bytes.to_vec());
+    }
+
+    builder
+        .build(|m| Ok(Sha256::digest(m).to_vec()))
+        .expect("build failed")
+}
+
+#[tokio::test]
+async fn expired_bundle_returns_try_later() {
+    let bundle_bytes = build_expired_bundle(&[(42, b"EXPIRED-RESPONSE")]);
+    let (port, _dir) = start_test_server(bundle_bytes).await;
+
+    let cert_id = build_certid(42);
+    let request_der = build_ocsp_request(&cert_id);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/"))
+        .header("Content-Type", "application/ocsp-request")
+        .body(request_der)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    // tryLater = 30 03 0A 01 03
+    assert_eq!(
+        &body[..],
+        &[0x30, 0x03, 0x0A, 0x01, 0x03],
+        "expired bundle should return tryLater"
+    );
+}
+
+#[tokio::test]
+async fn success_response_has_last_modified() {
+    let response_bytes = b"MOCK-RESPONSE";
+    let bundle_bytes = build_test_bundle_with_real_certids(&[(42, response_bytes)]);
+
+    let (port, _dir) = start_test_server(bundle_bytes).await;
+
+    let cert_id = build_certid(42);
+    let request_der = build_ocsp_request(&cert_id);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/"))
+        .header("Content-Type", "application/ocsp-request")
+        .body(request_der)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("last-modified").is_some(),
+        "successful response should have Last-Modified header"
+    );
+    let lm = resp.headers().get("last-modified").unwrap().to_str().unwrap();
+    assert!(
+        lm.ends_with("GMT"),
+        "Last-Modified should be HTTP-date in GMT: {lm}"
+    );
+}

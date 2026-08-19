@@ -1,5 +1,10 @@
 # hoike GitLab CI/CD Pipeline
 #
+# This is the secondary CI system. GitHub Actions (.github/workflows/ci.yml)
+# is authoritative and has additional jobs (container image, security audit,
+# multi-target cross-compilation). This pipeline covers the core gate for
+# the GitLab mirror.
+#
 # Runner requirements:
 #   - Docker executor (uses rust:1.97-slim image)
 #   - At least 4GB RAM for ML-DSA compilation
@@ -18,7 +23,6 @@ stages:
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
   CARGO_INCREMENTAL: "0"
-  RUSTFLAGS: "-D warnings"
 
 # ── Reusable cache template ──────────────────────────────────────────
 .rust-cache:
@@ -50,8 +54,8 @@ cargo-check:
       - target/
   script:
     - rustup component add clippy rustfmt
-    - cargo check --workspace
-    - cargo clippy --workspace -- -D warnings
+    - cargo check --workspace --locked
+    - cargo clippy --workspace --locked -- -D warnings
     - cargo fmt --all -- --check
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -75,7 +79,7 @@ cargo-test:
       - .cargo/git/db
       - target/
   script:
-    - cargo test --workspace 2>&1 | tee test-output.txt
+    - cargo test --workspace --locked 2>&1 | tee test-output.txt
     - echo "Test summary:"
     - grep "^test result" test-output.txt
   artifacts:
@@ -83,8 +87,6 @@ cargo-test:
     paths:
       - test-output.txt
     expire_in: 30 days
-    reports:
-      junit: test-output.txt
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
@@ -107,7 +109,7 @@ build-linux-x86_64:
       - .cargo/git/db
       - target/
   script:
-    - cargo build --release
+    - cargo build --release --locked
     - strip target/release/hoike target/release/ahu || true
     - mkdir -p artifacts
     - cp target/release/hoike target/release/ahu artifacts/
@@ -136,7 +138,6 @@ upload-release-assets:
   script:
     - |
       TARBALL="hoike-${CI_COMMIT_TAG}-x86_64-unknown-linux-gnu.tar.gz"
-      # Rename the dev tarball to the tagged name
       if [ -f "artifacts/hoike-dev-x86_64-unknown-linux-gnu.tar.gz" ]; then
         mv "artifacts/hoike-dev-x86_64-unknown-linux-gnu.tar.gz" "artifacts/${TARBALL}"
       fi

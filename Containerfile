@@ -13,16 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . .
 
-RUN cargo build --release \
+RUN cargo build --release --locked \
     && strip target/release/hoike target/release/ahu
 
 # ── Stage 2: Runtime ────────────────────────────
-FROM gcr.io/distroless/cc-debian12
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /build/target/release/hoike /usr/local/bin/hoike
 COPY --from=builder /build/target/release/ahu /usr/local/bin/ahu
 
 EXPOSE 2560
+USER nonroot:nonroot
 
 ENTRYPOINT ["hoike"]
 CMD ["serve", "--config", "/etc/hoike/hoike.toml"]

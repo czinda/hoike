@@ -53,6 +53,12 @@ enum Commands {
         /// Signing algorithm: ecdsa-p256 (default), ml-dsa-44, ml-dsa-65, ml-dsa-87
         #[arg(long, default_value = "ecdsa-p256")]
         sig_alg: String,
+        /// Base64-encoded DER issuer name (for correct CertID hashes)
+        #[arg(long)]
+        issuer_name_b64: Option<String>,
+        /// Base64-encoded issuer public key bytes (for correct CertID hashes)
+        #[arg(long)]
+        issuer_key_b64: Option<String>,
     },
     /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
     Import {
@@ -95,8 +101,20 @@ fn main() {
             certid_compat,
             good_serials,
             sig_alg,
+            issuer_name_b64,
+            issuer_key_b64,
         } => {
-            run_sign(ca, crl, output, epoch, certid_compat, good_serials, sig_alg);
+            run_sign(
+                ca,
+                crl,
+                output,
+                epoch,
+                certid_compat,
+                good_serials,
+                sig_alg,
+                issuer_name_b64,
+                issuer_key_b64,
+            );
         }
         Commands::Import {
             bundle,
@@ -253,11 +271,19 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
             .snapshot(&ca)
             .map_err(|e| format!("snapshot failed for {}: {e}", ca_config.label))?;
 
-        // Epoch increments each pass; use current time as a simple monotonic value
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Derive epoch from persisted high-water mark — never from wall-clock
+        // time, which can step backward (NTP correction, VM restore) and
+        // permanently lock out mirrors.
+        let epoch = {
+            let state_db_path = config.storage.state_db.join("state.json");
+            let store = hoike_core::StateStore::open(&state_db_path)
+                .map_err(|e| format!("state store: {e}"))?;
+            let issuer_key_hash_hex = hex::encode(sha2_v010::Sha256::digest(&ca.issuer_key_bytes));
+            store
+                .get_high_water("hoike-combined", &issuer_key_hash_hex)
+                .unwrap_or(0)
+                + 1
+        };
 
         let gen_config = GenerationConfig {
             producer_id: "hoike-combined".into(),
@@ -510,6 +536,8 @@ fn run_sign(
     certid_compat: String,
     good_serials: Option<PathBuf>,
     sig_alg: String,
+    issuer_name_b64: Option<String>,
+    issuer_key_b64: Option<String>,
 ) {
     use hoike_sign::{
         CaIdentity, CertIdCompat, CertificateStatus, CrlSource, GenerationConfig, RevocationSource,
@@ -547,10 +575,39 @@ fn run_sign(
         })
     };
 
+    let issuer_name_der = decode_b64_field(
+        &issuer_name_b64,
+        "issuer_name_b64",
+        &ca_label,
+        &format!("CN={ca_label}"),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    if issuer_name_b64.is_none() {
+        warn!(
+            ca = ca_label,
+            "no --issuer-name-b64 provided — using synthetic placeholder. \
+             CertID hashes will not match real client requests."
+        );
+    }
+
+    let issuer_key_bytes = decode_b64_field(
+        &issuer_key_b64,
+        "issuer_key_b64",
+        &ca_label,
+        &format!("{ca_label}-key"),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+
     let ca = CaIdentity {
         label: ca_label.clone(),
-        issuer_name_der: format!("CN={ca_label}").into_bytes(),
-        issuer_key_bytes: format!("{ca_label}-key").into_bytes(),
+        issuer_name_der,
+        issuer_key_bytes,
     };
 
     let mut snapshot = source.snapshot(&ca).unwrap_or_else(|e| {

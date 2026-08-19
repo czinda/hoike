@@ -8,6 +8,12 @@ use tracing::info;
 use crate::error::{CoreError, Result};
 use ahu::Bundle;
 
+/// Maximum allowed epoch jump from the current high-water mark.
+/// Prevents a poisoned bundle with epoch = u64::MAX from permanently
+/// locking out a CA (since the seal is currently a hash placeholder
+/// and the manifest is unauthenticated).
+pub const MAX_EPOCH_JUMP: u64 = 10_000;
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PersistedState {
     high_water_marks: HashMap<String, u64>,
@@ -106,6 +112,16 @@ impl StateStore {
                         scope: format!("{}:{}", producer_id, &ikh[..16.min(ikh.len())]),
                         epoch: scope.epoch,
                         high_water: hw,
+                    });
+                }
+                let jump = scope.epoch - hw;
+                if jump > MAX_EPOCH_JUMP {
+                    return Err(CoreError::EpochJumpTooLarge {
+                        scope: format!("{}:{}", producer_id, &ikh[..16.min(ikh.len())]),
+                        epoch: scope.epoch,
+                        high_water: hw,
+                        jump,
+                        max_jump: MAX_EPOCH_JUMP,
                     });
                 }
             }

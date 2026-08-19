@@ -32,7 +32,21 @@ cargo test --workspace
 - Unit tests: `cargo test -p ahu`
 - Integration tests: `cargo test -p ahu --test integration`
 - End-to-end: `cargo test -p hoike-server --test e2e`
+- Conformance: `cargo test -p hoike-server --test conformance`
 - Generate test bundles: `cargo run --example generate_test_bundle -- /tmp/test.ahu`
+
+## CI/CD
+
+**GitHub Actions** (`.github/workflows/ci.yml`) is the authoritative CI system.
+It runs check/clippy/fmt, test (stable + nightly), cross-platform builds (4
+targets), container image push to GHCR, and a weekly security audit.
+
+**GitLab CI** (`.gitlab-ci.yml`) is a secondary mirror pipeline covering
+check, test, build, and release for the `gitlab.heebh.st` mirror. It does not
+include the container image or audit stages.
+
+All `cargo` commands in CI use `--locked` to build exactly what `Cargo.lock`
+specifies.
 
 ## License
 

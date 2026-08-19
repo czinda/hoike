@@ -364,7 +364,7 @@ fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {
     }
 
     // Select the bundle with the highest max epoch across its CA scopes.
-    // Falls back to mtime if a bundle can't be parsed.
+    // Bundles that fail to parse are skipped with a warning.
     let mut best: Option<(std::path::PathBuf, u64)> = None;
     for path in &ahu_files {
         let max_epoch = match ahu::Bundle::from_file(path) {

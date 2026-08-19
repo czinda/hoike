@@ -200,8 +200,16 @@ The following items from the [design document](hoike-design.md) are not yet impl
   validation. Only `ignore` and `forward` are available.
 - **Delegated signing** — only CA-direct signing is implemented. The design
   doc's `responder_cert` / `responder_key` config has no code behind it.
-- **`--issuer` flag** — accepted by `hoike sign` but currently ignored. CertID
-  hashes are computed from synthetic placeholder bytes derived from the CA label.
+- **`--issuer` flag** — accepted by `hoike sign` but currently ignored. Use
+  `--issuer-name-b64` and `--issuer-key-b64` for correct CertID hashes, or
+  configure `issuer_name_der_b64` / `issuer_key_bytes_b64` in `[[ca]]` blocks.
+- **Gossip messages are unsigned** — the design doc (§6.3) requires every gossip
+  message to be signed. The current implementation uses foca's postcard codec
+  with no authentication.
+- **Multi-CertID requests** — only the first `CertID` in a multi-Request
+  `OCSPRequest` is answered. Subsequent CertIDs are silently dropped. This is
+  defensible under RFC 9919's single-Request profile but provides no signal to
+  the client.
 
 ## License
 

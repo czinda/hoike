@@ -111,12 +111,7 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
             if has_nonce {
                 match result.nonce_policy.as_str() {
                     "live" => {
-                        // Live signing requires key access — placeholder for M3.
-                        warn!(
-                            ca = result.ca_label,
-                            "live nonce signing not yet implemented — returning internalError"
-                        );
-                        return ocsp_error_response(INTERNAL_ERROR);
+                        unreachable!("live nonce policy rejected at config validation")
                     }
                     "forward" => {
                         if let Some(url) = &result.forward_to {
