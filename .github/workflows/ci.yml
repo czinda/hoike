@@ -20,10 +20,13 @@ jobs:
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.97"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
@@ -50,6 +53,8 @@ jobs:
           - toolchain: nightly
             allow-fail: true
     continue-on-error: ${{ matrix.allow-fail }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@master
@@ -95,10 +100,13 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
+    env:
+      RUSTUP_TOOLCHAIN: "1.97"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
