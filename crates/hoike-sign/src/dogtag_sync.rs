@@ -400,18 +400,25 @@ impl RevocationSource for DogtagSyncSource {
 
 /// Parse a `certificateRecord` LDAP entry into a serial and status.
 fn parse_cert_entry(entry: &SearchEntry) -> Option<(SerialBytes, CertificateStatus)> {
-    // Serial: prefer `serialno` (hex) over `cn` (decimal)
+    // Serial: prefer `cn` (decimal) — Dogtag's `serialno` is also decimal
+    // (despite the name, it is NOT hex unless prefixed with 0x).
     let serial_bytes = entry
         .attrs
-        .get("serialno")
+        .get("cn")
         .and_then(|v| v.first())
-        .and_then(|hex| parse_hex_serial(hex))
+        .and_then(|dec| parse_decimal_serial(dec))
         .or_else(|| {
             entry
                 .attrs
-                .get("cn")
+                .get("serialno")
                 .and_then(|v| v.first())
-                .and_then(|dec| parse_decimal_serial(dec))
+                .and_then(|s| {
+                    if s.starts_with("0x") || s.starts_with("0X") {
+                        parse_hex_serial(s)
+                    } else {
+                        parse_decimal_serial(s)
+                    }
+                })
         })?;
 
     // Status
