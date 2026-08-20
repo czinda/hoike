@@ -604,8 +604,8 @@ nonce_policy = "live"
         Ok(_) => panic!("expected config validation error for nonce_policy=live"),
     };
     assert!(
-        msg.contains("live") && msg.contains("not yet implemented"),
-        "expected live/not-implemented error, got: {msg}"
+        msg.contains("live") && (msg.contains("edge") || msg.contains("signing key")),
+        "expected live-on-edge rejection, got: {msg}"
     );
 }
 
@@ -765,4 +765,157 @@ async fn success_response_has_last_modified() {
         lm.ends_with("GMT"),
         "Last-Modified should be HTTP-date in GMT: {lm}"
     );
+}
+
+#[tokio::test]
+async fn live_nonce_signing_returns_nonce_in_response() {
+    use std::collections::BTreeMap;
+    use x509_ocsp::{BasicOcspResponse, OcspResponse};
+    use der::Decode;
+
+    // Build a real bundle with proper DER-encoded OCSP responses
+    let issuer_name = b"CN=Live Test CA,O=Hoike Test";
+    let issuer_key = b"live-test-ca-public-key";
+
+    let ca = hoike_sign::CaIdentity {
+        label: "live-test".into(),
+        issuer_name_der: issuer_name.to_vec(),
+        issuer_key_bytes: issuer_key.to_vec(),
+    };
+    let mut entries = BTreeMap::new();
+    entries.insert(vec![42u8], hoike_sign::CertificateStatus::Good);
+    let snapshot = hoike_sign::StatusSnapshot {
+        entries,
+        this_update: 4102444800,
+        next_update: Some(4102531200),
+    };
+    let config = hoike_sign::GenerationConfig {
+        producer_id: "live-test".into(),
+        epoch: 1,
+        validity_secs: 86400,
+        certid_compat: hoike_sign::CertIdCompat::Sha256Only,
+        completeness: ahu::Completeness::AuthoritativeComplete,
+        bucket_size: 1,
+        ..Default::default()
+    };
+    let mut key = hoike_sign::demo_ecdsa_p256_key();
+    let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+        &ca, &snapshot, &config, &mut key,
+        |m| {
+            use sha2_v010::Digest as _;
+            Ok(sha2_v010::Sha256::digest(m).to_vec())
+        },
+    ).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("test.ahu");
+    std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+
+    // Config with nonce_policy = "live" in combined mode
+    let config_toml = format!(
+        r#"
+[server]
+mode = "combined"
+listen = "127.0.0.1:0"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+
+[[ca]]
+label = "live-test"
+bundle_file = "{bundle}"
+nonce_policy = "live"
+
+[ca.source]
+type = "crl"
+path = "{dir}/dummy.crl"
+
+[ca.signing_key]
+type = "demo"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+    );
+
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    std::fs::write(dir.path().join("dummy.crl"), b"").unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    let state = hoike_core::ResponderState::load(config).unwrap();
+
+    let demo_key = hoike_sign::demo_ecdsa_p256_key();
+    let live = hoike_server::LiveSignerState {
+        signer: tokio::sync::Mutex::new(demo_key),
+        responder_key_bytes: issuer_key.to_vec(),
+        validity_secs: 86400,
+    };
+    let app_state = hoike_server::AppState::new(state).with_live_signer(live);
+    let app = hoike_server::build_router(app_state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Build a request WITH a 16-byte nonce.
+    // Must use explicit NULL parameter to match produce_bundle's AlgorithmIdentifier.
+    let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+    let cert_id = CertId {
+        hash_algorithm: spki::AlgorithmIdentifier {
+            oid: sha256_oid,
+            parameters: Some(der::asn1::Null.into()),
+        },
+        issuer_name_hash: der::asn1::OctetString::new(Sha256::digest(issuer_name).to_vec()).unwrap(),
+        issuer_key_hash: der::asn1::OctetString::new(Sha256::digest(issuer_key).to_vec()).unwrap(),
+        serial_number: x509_cert::serial_number::SerialNumber::new(&[42u8]).unwrap(),
+    };
+    let nonce_bytes = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                           0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+
+    let nonce_ext = x509_ocsp::ext::Nonce::new(nonce_bytes.clone()).unwrap();
+    use x509_cert::ext::AsExtension;
+    let nonce_ext_val = nonce_ext.to_extension(&x509_cert::name::Name::default(), &[]).unwrap();
+
+    let request = Request {
+        req_cert: cert_id,
+        single_request_extensions: None,
+    };
+    let tbs = TbsRequest {
+        version: Default::default(),
+        requestor_name: None,
+        request_list: vec![request],
+        request_extensions: Some(vec![nonce_ext_val]),
+    };
+    let ocsp_req = OcspRequest {
+        tbs_request: tbs,
+        optional_signature: None,
+    };
+    let request_der = ocsp_req.to_der().unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/"))
+        .header("Content-Type", "application/ocsp-request")
+        .body(request_der)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+
+    // Parse and verify nonce is in the response
+    let ocsp_resp = OcspResponse::from_der(&body).unwrap();
+    assert_eq!(ocsp_resp.response_status, x509_ocsp::OcspResponseStatus::Successful);
+
+    let basic = BasicOcspResponse::from_der(
+        ocsp_resp.response_bytes.unwrap().response.as_bytes(),
+    ).unwrap();
+
+    let resp_nonce = basic.nonce().expect("live response should contain nonce");
+    assert_eq!(resp_nonce.0.as_bytes(), &nonce_bytes, "nonce should match request nonce");
 }

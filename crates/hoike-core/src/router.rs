@@ -190,11 +190,19 @@ fn validate_nonce_config(config: &Config) -> Result<()> {
         match ca.nonce_policy.as_str() {
             "ignore" => {}
             "live" => {
-                return Err(CoreError::Config(format!(
-                    "CA '{}': nonce_policy \"live\" is not yet implemented — \
-                     use \"ignore\" or \"forward\"",
-                    ca.label
-                )));
+                if config.server.mode == "edge" {
+                    return Err(CoreError::Config(format!(
+                        "CA '{}': nonce_policy \"live\" requires signer or combined mode \
+                         (edge nodes have no signing key)",
+                        ca.label
+                    )));
+                }
+                if ca.signing_key.is_none() {
+                    return Err(CoreError::Config(format!(
+                        "CA '{}': nonce_policy \"live\" requires a signing_key",
+                        ca.label
+                    )));
+                }
             }
             "forward" => {
                 if ca.forward_to.is_none() {

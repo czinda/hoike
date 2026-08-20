@@ -111,8 +111,47 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
             if has_nonce {
                 match result.nonce_policy.as_str() {
                     "live" => {
-                        debug!(ca = result.ca_label, "live nonce policy not implemented");
-                        return ocsp_error_response(hoike_core::INTERNAL_ERROR);
+                        if let Some(live) = &state.live_signer {
+                            let nonce_bytes = parsed.nonce.as_ref().unwrap();
+                            let status = match hoike_sign::extract_status_from_response(
+                                &result.response_bytes,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(error = %e, "failed to extract status for live signing");
+                                    return ocsp_error_response(INTERNAL_ERROR);
+                                }
+                            };
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let mut signer = live.signer.lock().await;
+                            match hoike_sign::sign_live_response::<_, p256::ecdsa::DerSignature>(
+                                &cert_id.certid_der,
+                                status,
+                                nonce_bytes,
+                                &live.responder_key_bytes,
+                                &mut *signer,
+                                now,
+                                live.validity_secs,
+                            ) {
+                                Ok(response_der) => {
+                                    debug!(
+                                        ca = result.ca_label,
+                                        nonce_len = nonce_bytes.len(),
+                                        "signed live response with nonce"
+                                    );
+                                    return live_response(&response_der);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "live signing failed");
+                                    return ocsp_error_response(INTERNAL_ERROR);
+                                }
+                            }
+                        }
+                        debug!(ca = result.ca_label, "live nonce policy but no signer configured");
+                        return ocsp_error_response(INTERNAL_ERROR);
                     }
                     "forward" => {
                         if let Some(url) = &result.forward_to {
@@ -305,6 +344,21 @@ fn ocsp_error_response(status_der: &[u8]) -> Response {
     );
 
     (StatusCode::OK, headers, status_der.to_vec()).into_response()
+}
+
+/// HTTP response for a live-signed OCSP response (nonce-bearing).
+/// Not cached — the nonce makes it unique.
+fn live_response(response_bytes: &[u8]) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(CONTENT_TYPE_OCSP_RESPONSE),
+    );
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store"),
+    );
+    (StatusCode::OK, headers, response_bytes.to_vec()).into_response()
 }
 
 fn httpdate_format(time: std::time::SystemTime) -> std::result::Result<String, ()> {

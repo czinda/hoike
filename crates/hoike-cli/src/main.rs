@@ -165,7 +165,24 @@ async fn run_server(config_path: PathBuf) {
         std::process::exit(1);
     });
 
-    let app_state = hoike_server::AppState::new(state);
+    let mut app_state = hoike_server::AppState::new(state);
+
+    // If any CA has nonce_policy=live, load a signing key for live responses
+    let has_live_nonce = config.ca.iter().any(|ca| ca.nonce_policy == "live");
+    if has_live_nonce && config.needs_signing() {
+        if let Some(ca) = config.ca.iter().find(|ca| ca.nonce_policy == "live") {
+            match load_live_signer(ca) {
+                Ok(live) => {
+                    info!("live nonce signing enabled");
+                    app_state = app_state.with_live_signer(live);
+                }
+                Err(e) => {
+                    eprintln!("Failed to load live signer: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     // In combined mode, start the background signer loop
     if is_combined {
@@ -499,6 +516,40 @@ fn resolve_ldap_password(
         });
     }
     Err("no LDAP bind password: set bind_password or bind_password_env in config".into())
+}
+
+fn load_live_signer(
+    ca: &hoike_core::config::CaConfig,
+) -> std::result::Result<hoike_server::LiveSignerState, String> {
+    let responder_key_bytes = decode_issuer_key(ca)?;
+
+    let signing_key = match &ca.signing_key {
+        Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+            hoike_sign::load_ecdsa_p256_key(path)
+                .map_err(|e| format!("failed to load live signing key: {e}"))?
+        }
+        Some(hoike_core::config::SigningKeyConfig::Demo) => {
+            warn!("live nonce signer using demo key — NOT FOR PRODUCTION");
+            hoike_sign::demo_ecdsa_p256_key()
+        }
+        Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+            return Err(
+                "PKCS#11 live nonce signing not yet supported — use file key or demo".into(),
+            );
+        }
+        None => {
+            return Err(format!(
+                "CA '{}': nonce_policy=live requires a signing_key",
+                ca.label
+            ));
+        }
+    };
+
+    Ok(hoike_server::LiveSignerState {
+        signer: tokio::sync::Mutex::new(signing_key),
+        responder_key_bytes,
+        validity_secs: ca.validity_secs,
+    })
 }
 
 fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {

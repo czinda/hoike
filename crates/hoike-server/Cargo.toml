@@ -21,6 +21,9 @@ hex = { workspace = true }
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+hoike-sign = { path = "../hoike-sign" }
+p256 = { version = "0.13", features = ["ecdsa"] }
+signature = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -317,12 +317,12 @@ fn add_shared_entries(builder: &mut BundleBuilder, keys: &[[u8; 32]], response_d
     }
 }
 
-fn ocsp_time(epoch_secs: u64) -> Result<OcspGeneralizedTime> {
+pub fn ocsp_time(epoch_secs: u64) -> Result<OcspGeneralizedTime> {
     let dt = epoch_to_datetime(epoch_secs)?;
     Ok(OcspGeneralizedTime::from(dt))
 }
 
-fn epoch_to_datetime(secs: u64) -> Result<der::DateTime> {
+pub fn epoch_to_datetime(secs: u64) -> Result<der::DateTime> {
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = (time_of_day / 3600) as u8;
