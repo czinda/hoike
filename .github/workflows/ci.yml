@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:  # manual trigger from Actions tab
   schedule:
-    - cron: '0 7 * * 1'  # Weekly Monday 07:00 UTC — security audit
+    - cron: '0 7 1 * *'  # Monthly 1st, 07:00 UTC — security audit
 
 env:
   CARGO_TERM_COLOR: always
