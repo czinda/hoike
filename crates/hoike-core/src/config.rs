@@ -80,6 +80,33 @@ pub struct CaConfig {
     pub issuer_key_bytes_b64: Option<String>,
     /// Signing key configuration (required for signer/combined mode).
     pub signing_key: Option<SigningKeyConfig>,
+    /// Path to the delegated OCSP signing certificate (DER or PEM).
+    /// Embedded in each OCSPResponse per RFC 9919 §3.2.2 so clients
+    /// can validate the response without pre-caching the responder cert.
+    pub responder_cert: Option<PathBuf>,
+    /// Key rotation monitoring configuration.
+    pub key_rotation: Option<KeyRotationConfigToml>,
+}
+
+/// TOML-level key rotation configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct KeyRotationConfigToml {
+    /// Days before cert expiry to trigger rotation warning/action (default: 7).
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u64,
+    /// Hours between rotation checks (default: 1).
+    #[serde(default = "default_check_interval_hours")]
+    pub check_interval_hours: u64,
+    /// Shell command to execute when rotation is needed.
+    /// The command receives CA label and cert path as arguments.
+    pub rotation_command: Option<String>,
+}
+
+fn default_renew_before_days() -> u64 {
+    7
+}
+fn default_check_interval_hours() -> u64 {
+    1
 }
 
 /// How to obtain the signing key for OCSP response production.

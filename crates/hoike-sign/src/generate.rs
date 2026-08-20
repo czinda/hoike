@@ -1,5 +1,5 @@
-use der::Encode;
 use der::asn1::{Null, OctetString};
+use der::{Decode, Encode};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use signature::Signer;
@@ -56,6 +56,7 @@ pub fn produce_bundle<S, Sig>(
     config: &GenerationConfig,
     signer: &mut S,
     seal_fn: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+    responder_cert_der: Option<&[u8]>,
 ) -> Result<Vec<u8>>
 where
     S: Signer<Sig> + DynSignatureAlgorithmIdentifier,
@@ -77,6 +78,8 @@ where
     let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
     let sha1_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
 
+    let responder_chain = responder_cert_der.map(|cert| vec![cert.to_vec()]);
+
     let mut ca_scopes = vec![ahu::CaScope {
         hash_algorithm: sha256_oid.as_bytes().to_vec(),
         issuer_name_hash: issuer_name_hash_sha256.to_vec(),
@@ -86,7 +89,7 @@ where
             id_type: ResponderIdType::ByKey,
             value: responder_key_hash.to_vec(),
         },
-        responder_chain: None,
+        responder_chain: responder_chain.clone(),
         signature_algorithm: vec![],
         completeness: config.completeness,
     }];
@@ -106,7 +109,7 @@ where
                 id_type: ResponderIdType::ByKey,
                 value: responder_key_hash.to_vec(),
             },
-            responder_chain: None,
+            responder_chain: responder_chain.clone(),
             signature_algorithm: vec![],
             completeness: config.completeness,
         });
@@ -259,8 +262,14 @@ where
             all_keys.extend_from_slice(&entry.entry_keys);
         }
 
+        let certs = responder_cert_der
+            .map(|c| {
+                let cert = x509_cert::Certificate::from_der(c).map_err(SignError::Der)?;
+                Ok::<_, SignError>(vec![cert])
+            })
+            .transpose()?;
         let ocsp_response = response_builder
-            .sign(signer, None, produced_at)
+            .sign(signer, certs, produced_at)
             .map_err(SignError::from)?;
         let response_der = ocsp_response.to_der().map_err(SignError::Der)?;
 
@@ -320,6 +329,33 @@ fn add_shared_entries(builder: &mut BundleBuilder, keys: &[[u8; 32]], response_d
 pub fn ocsp_time(epoch_secs: u64) -> Result<OcspGeneralizedTime> {
     let dt = epoch_to_datetime(epoch_secs)?;
     Ok(OcspGeneralizedTime::from(dt))
+}
+
+pub fn datetime_to_epoch(dt: der::DateTime) -> u64 {
+    let year = dt.year() as u64;
+    let month = dt.month() as u64;
+    let day = dt.day() as u64;
+    let hour = dt.hour() as u64;
+    let minutes = dt.minutes() as u64;
+    let seconds = dt.seconds() as u64;
+
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+    }
+    let mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += mdays[m as usize] as u64;
+        if m == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+    days * 86400 + hour * 3600 + minutes * 60 + seconds
 }
 
 pub fn epoch_to_datetime(secs: u64) -> Result<der::DateTime> {
@@ -405,6 +441,7 @@ mod tests {
             &config,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 
@@ -432,6 +469,7 @@ mod tests {
             &config,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 
@@ -459,6 +497,7 @@ mod tests {
             &config,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 
@@ -525,6 +564,7 @@ mod tests {
             &config,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 
@@ -554,6 +594,7 @@ mod tests {
             &config,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 
@@ -603,6 +644,7 @@ mod tests {
             &config_1,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 
@@ -618,6 +660,7 @@ mod tests {
             &config_10,
             &mut key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .unwrap();
 

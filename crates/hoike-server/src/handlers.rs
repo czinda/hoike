@@ -135,6 +135,7 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                                 &mut *signer,
                                 now,
                                 live.validity_secs,
+                                live.responder_cert_der.as_deref(),
                             ) {
                                 Ok(response_der) => {
                                     debug!(
@@ -150,7 +151,10 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                                 }
                             }
                         }
-                        debug!(ca = result.ca_label, "live nonce policy but no signer configured");
+                        debug!(
+                            ca = result.ca_label,
+                            "live nonce policy but no signer configured"
+                        );
                         return ocsp_error_response(INTERNAL_ERROR);
                     }
                     "forward" => {

@@ -264,14 +264,21 @@ impl DogtagSyncSource {
 
         let handle = std::thread::spawn(move || -> Result<u64> {
             Self::do_sync_inner(
-                &ldap_url, &bind_dn, &bind_password, &base_dn, &filter,
-                cookie_owned.as_deref(), &entries, &cookie_state, &cookie_path,
+                &ldap_url,
+                &bind_dn,
+                &bind_password,
+                &base_dn,
+                &filter,
+                cookie_owned.as_deref(),
+                &entries,
+                &cookie_state,
+                &cookie_path,
             )
         });
 
-        handle.join().unwrap_or_else(|e| {
-            Err(SignError::Config(format!("LDAP thread panicked: {e:?}")))
-        })
+        handle
+            .join()
+            .unwrap_or_else(|e| Err(SignError::Config(format!("LDAP thread panicked: {e:?}"))))
     }
 
     fn do_sync_inner(
@@ -303,12 +310,7 @@ impl DogtagSyncSource {
 
         let (results, ldap_result) = conn
             .with_controls(vec![sync_control])
-            .search(
-                base_dn,
-                Scope::Subtree,
-                filter,
-                DogtagSyncConfig::attrs(),
-            )
+            .search(base_dn, Scope::Subtree, filter, DogtagSyncConfig::attrs())
             .map_err(|e| SignError::Config(format!("LDAP search: {e}")))?
             .success()
             .map_err(|e| SignError::Config(format!("LDAP search result: {e}")))?;
@@ -459,7 +461,10 @@ fn parse_cert_entry(entry: &SearchEntry) -> Option<(SerialBytes, CertificateStat
 
 /// Parse a hex serial like `0x2a` or `2a` into bytes.
 fn parse_hex_serial(hex: &str) -> Option<SerialBytes> {
-    let hex = hex.strip_prefix("0x").or(hex.strip_prefix("0X")).unwrap_or(hex);
+    let hex = hex
+        .strip_prefix("0x")
+        .or(hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     // Pad to even length
     let hex = if hex.len() % 2 != 0 {
         format!("0{hex}")

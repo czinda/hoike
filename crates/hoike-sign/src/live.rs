@@ -35,6 +35,7 @@ pub enum LiveCertStatus {
 /// This is the hot path for `nonce_policy = "live"`. It builds a
 /// `BasicOCSPResponse` containing one `SingleResponse` for the requested
 /// CertID, adds the nonce as a response extension, and signs it.
+#[allow(clippy::too_many_arguments)]
 pub fn sign_live_response<S, Sig>(
     cert_id_der: &[u8],
     status: LiveCertStatus,
@@ -43,14 +44,13 @@ pub fn sign_live_response<S, Sig>(
     signer: &mut S,
     now: u64,
     validity_secs: u64,
+    responder_cert_der: Option<&[u8]>,
 ) -> Result<Vec<u8>>
 where
     S: Signer<Sig> + DynSignatureAlgorithmIdentifier,
     Sig: SignatureBitStringEncoding,
 {
-    let cert_id = CertId::from_der(cert_id_der).map_err(|e| {
-        SignError::Der(e)
-    })?;
+    let cert_id = CertId::from_der(cert_id_der).map_err(SignError::Der)?;
 
     let cert_status = match status {
         LiveCertStatus::Good => CertStatus::good(),
@@ -70,13 +70,12 @@ where
     let next_update = ocsp_time(now + validity_secs)?;
     let produced_at = ocsp_time(now)?;
 
-    let single = SingleResponse::new(cert_id, cert_status, this_update)
-        .with_next_update(next_update);
+    let single =
+        SingleResponse::new(cert_id, cert_status, this_update).with_next_update(next_update);
 
     let responder_key_hash = Sha1::digest(responder_key_bytes);
-    let responder_id = ResponderId::ByKey(
-        OctetString::new(responder_key_hash.to_vec()).map_err(SignError::Der)?,
-    );
+    let responder_id =
+        ResponderId::ByKey(OctetString::new(responder_key_hash.to_vec()).map_err(SignError::Der)?);
 
     let nonce = Nonce::new(nonce_bytes.to_vec()).map_err(SignError::Der)?;
 
@@ -85,8 +84,14 @@ where
         .with_extension(nonce)
         .map_err(|e| SignError::OcspBuilder(e.to_string()))?;
 
+    let certs = responder_cert_der
+        .map(|c| {
+            let cert = x509_cert::Certificate::from_der(c).map_err(SignError::Der)?;
+            Ok::<_, SignError>(vec![cert])
+        })
+        .transpose()?;
     let ocsp_response = builder
-        .sign(signer, None, produced_at)
+        .sign(signer, certs, produced_at)
         .map_err(SignError::from)?;
 
     ocsp_response.to_der().map_err(SignError::Der)
@@ -104,8 +109,8 @@ pub fn extract_status_from_response(response_der: &[u8]) -> Result<LiveCertStatu
         .as_ref()
         .ok_or_else(|| SignError::OcspBuilder("no responseBytes in stored response".into()))?;
 
-    let basic = BasicOcspResponse::from_der(response_bytes.response.as_bytes())
-        .map_err(SignError::Der)?;
+    let basic =
+        BasicOcspResponse::from_der(response_bytes.response.as_bytes()).map_err(SignError::Der)?;
 
     let single = basic
         .tbs_response_data
@@ -178,8 +183,10 @@ mod tests {
         };
         let cert_id_der = cert_id.to_der().unwrap();
 
-        let nonce = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                         0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+        let nonce = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
 
         let mut key = test_key();
         let resp_der = sign_live_response::<_, p256::ecdsa::DerSignature>(
@@ -190,6 +197,7 @@ mod tests {
             &mut key,
             1700000000,
             86400,
+            None,
         )
         .unwrap();
 
@@ -199,10 +207,8 @@ mod tests {
             x509_ocsp::OcspResponseStatus::Successful
         );
 
-        let basic = BasicOcspResponse::from_der(
-            resp.response_bytes.unwrap().response.as_bytes(),
-        )
-        .unwrap();
+        let basic =
+            BasicOcspResponse::from_der(resp.response_bytes.unwrap().response.as_bytes()).unwrap();
 
         // Verify nonce is in the response
         let resp_nonce = basic.nonce().expect("response should contain nonce");
@@ -237,6 +243,7 @@ mod tests {
             &mut key,
             1700000000,
             86400,
+            None,
         )
         .unwrap();
 
@@ -270,6 +277,7 @@ mod tests {
             &mut key,
             1700000000,
             86400,
+            None,
         )
         .unwrap();
 

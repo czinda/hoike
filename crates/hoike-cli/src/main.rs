@@ -296,7 +296,8 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                 cookie_path,
                 filter,
             } => {
-                let password = resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
+                let password =
+                    resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
                 let cookie = cookie_path
                     .clone()
                     .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
@@ -306,7 +307,9 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                     bind_dn: bind_dn.clone(),
                     bind_password: password,
                     cookie_path: cookie,
-                    filter: filter.clone().unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
+                    filter: filter
+                        .clone()
+                        .unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
                 };
                 Box::new(hoike_sign::DogtagSyncSource::new(sync_config))
             }
@@ -322,6 +325,13 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
             issuer_name_der: decode_issuer_name(ca_config)?,
             issuer_key_bytes: decode_issuer_key(ca_config)?,
         };
+
+        let responder_cert_der = ca_config
+            .responder_cert
+            .as_ref()
+            .map(std::fs::read)
+            .transpose()
+            .map_err(|e| format!("read responder cert: {e}"))?;
 
         let snapshot = source
             .snapshot(&ca)
@@ -360,6 +370,7 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                     &gen_config,
                     &mut signer,
                     |m| Ok(Sha256::digest(m).to_vec()),
+                    responder_cert_der.as_deref(),
                 )
             }
             Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
@@ -375,7 +386,8 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                         &snapshot,
                         &gen_config,
                         &mut bridge,
-                        |m| Ok(Sha256::digest(m).to_vec()),
+                        |m| Ok(Sha256::digest(m).to_vec()), responder_cert_der.as_deref(),
+                        None,
                     )
                 }
                 #[cfg(not(feature = "pkcs11"))]
@@ -399,6 +411,7 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                     &gen_config,
                     &mut signer,
                     |m| Ok(Sha256::digest(m).to_vec()),
+                    responder_cert_der.as_deref(),
                 )
             }
             None => {
@@ -447,6 +460,44 @@ async fn run_signer_loop(state: Arc<hoike_core::ResponderState>, config: hoike_c
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(min_interval)).await;
+
+        // Check certificate rotation before production
+        for ca_config in &config.ca {
+            if let Some(cert_path) = &ca_config.responder_cert {
+                if let Ok(cert_der) = std::fs::read(cert_path) {
+                    let renew_before = ca_config
+                        .key_rotation
+                        .as_ref()
+                        .map(|kr| kr.renew_before_days * 86400)
+                        .unwrap_or(7 * 86400);
+
+                    match hoike_sign::check_and_log_rotation(
+                        &ca_config.label,
+                        &cert_der,
+                        renew_before,
+                    ) {
+                        Ok(hoike_sign::RotationStatus::RenewSoon { .. }) => {
+                            if let Some(kr) = &ca_config.key_rotation {
+                                if let Some(cmd) = &kr.rotation_command {
+                                    if let Err(e) =
+                                        hoike_sign::run_rotation_command(&ca_config.label, cmd)
+                                    {
+                                        error!(ca = ca_config.label, error = %e, "rotation command failed");
+                                    }
+                                }
+                            }
+                        }
+                        Ok(hoike_sign::RotationStatus::Expired) => {
+                            error!(
+                                ca = ca_config.label,
+                                "OCSP signing cert EXPIRED — bundles will be rejected by clients"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         info!("signer loop: starting production cycle");
         match run_signer_pass(&config) {
@@ -519,6 +570,36 @@ fn resolve_ldap_password(
     Err("no LDAP bind password: set bind_password or bind_password_env in config".into())
 }
 
+fn load_responder_cert(
+    ca: &hoike_core::config::CaConfig,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    match &ca.responder_cert {
+        Some(path) => {
+            let data = std::fs::read(path)
+                .map_err(|e| format!("failed to read responder cert '{}': {e}", path.display()))?;
+            if data.starts_with(b"-----BEGIN") {
+                let pem_str = String::from_utf8(data)
+                    .map_err(|e| format!("responder cert PEM is not valid UTF-8: {e}"))?;
+                use base64::Engine;
+                let mut b64 = String::new();
+                for line in pem_str.lines() {
+                    if line.starts_with("-----") {
+                        continue;
+                    }
+                    b64.push_str(line.trim());
+                }
+                let der = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| format!("responder cert PEM base64 decode: {e}"))?;
+                Ok(Some(der))
+            } else {
+                Ok(Some(data))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
 fn load_live_signer(
     ca: &hoike_core::config::CaConfig,
 ) -> std::result::Result<hoike_server::LiveSignerState, String> {
@@ -546,10 +627,13 @@ fn load_live_signer(
         }
     };
 
+    let responder_cert_der = load_responder_cert(ca)?;
+
     Ok(hoike_server::LiveSignerState {
         signer: tokio::sync::Mutex::new(signing_key),
         responder_key_bytes,
         validity_secs: ca.validity_secs,
+        responder_cert_der,
     })
 }
 
@@ -662,6 +746,43 @@ fn run_check(config_path: PathBuf) {
     if let Err(e) = config.validate_for_mode() {
         eprintln!("  Mode:      FAIL — {e}");
         std::process::exit(1);
+    }
+
+    // Check responder certificate expiry for each CA
+    for ca in &config.ca {
+        if let Some(cert_path) = &ca.responder_cert {
+            match std::fs::read(cert_path) {
+                Ok(cert_der) => match hoike_sign::format_cert_info(&cert_der) {
+                    Ok(info) => {
+                        println!("\n  ── Responder Cert ({}) ──", ca.label);
+                        println!("    Subject:  {}", info.subject);
+                        println!("    Issuer:   {}", info.issuer);
+                        println!("    Days remaining: {}", info.days_remaining);
+                        println!(
+                            "    OCSP Signing EKU: {}",
+                            if info.has_ocsp_signing_eku {
+                                "yes"
+                            } else {
+                                "NOT FOUND — clients may reject"
+                            }
+                        );
+                        if info.is_expired {
+                            eprintln!("    STATUS: EXPIRED");
+                        } else if info.days_remaining <= 30 {
+                            eprintln!("    WARNING: expires in {} days", info.days_remaining);
+                        } else {
+                            println!("    Status:   OK");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("    Cert parse: FAIL — {e}");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("    Cert read ({})): FAIL — {e}", cert_path.display());
+                }
+            }
+        }
     }
 
     match hoike_core::ResponderState::load(config) {
@@ -846,6 +967,7 @@ fn run_sign(
                 &config,
                 &mut signer,
                 seal_fn,
+                None,
             )
         }
         "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87" => {
@@ -862,19 +984,19 @@ fn run_sign(
                 "ml-dsa-44" => {
                     let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
                     hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                        &ca, &snapshot, &config, &mut signer, seal_fn,
+                        &ca, &snapshot, &config, &mut signer, seal_fn, None,
                     )
                 }
                 "ml-dsa-65" => {
                     let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
                     hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                        &ca, &snapshot, &config, &mut signer, seal_fn,
+                        &ca, &snapshot, &config, &mut signer, seal_fn, None,
                     )
                 }
                 "ml-dsa-87" => {
                     let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
                     hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                        &ca, &snapshot, &config, &mut signer, seal_fn,
+                        &ca, &snapshot, &config, &mut signer, seal_fn, None,
                     )
                 }
                 _ => unreachable!(),

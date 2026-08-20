@@ -76,6 +76,7 @@ fn build_conformance_bundle() -> Vec<u8> {
         &config,
         &mut key,
         |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+        None,
     )
     .expect("produce_bundle failed")
 }

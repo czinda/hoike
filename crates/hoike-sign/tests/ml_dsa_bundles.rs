@@ -48,11 +48,15 @@ fn produce_ml_dsa_44_bundle() {
     };
     let mut signer = ml_dsa_44_signer(&[42u8; 32]);
 
-    let bundle_bytes =
-        produce_bundle::<_, MlDsaSignatureBytes>(&ca, &snapshot, &config, &mut signer, |m| {
-            Ok(Sha256::digest(m).to_vec())
-        })
-        .unwrap();
+    let bundle_bytes = produce_bundle::<_, MlDsaSignatureBytes>(
+        &ca,
+        &snapshot,
+        &config,
+        &mut signer,
+        |m| Ok(Sha256::digest(m).to_vec()),
+        None,
+    )
+    .unwrap();
 
     let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
     let result = ahu::verify_structure(&bundle).unwrap();
@@ -79,11 +83,15 @@ fn produce_ml_dsa_65_bundle() {
     };
     let mut signer = ml_dsa_65_signer(&[43u8; 32]);
 
-    let bundle_bytes =
-        produce_bundle::<_, MlDsaSignatureBytes>(&ca, &snapshot, &config, &mut signer, |m| {
-            Ok(Sha256::digest(m).to_vec())
-        })
-        .unwrap();
+    let bundle_bytes = produce_bundle::<_, MlDsaSignatureBytes>(
+        &ca,
+        &snapshot,
+        &config,
+        &mut signer,
+        |m| Ok(Sha256::digest(m).to_vec()),
+        None,
+    )
+    .unwrap();
 
     let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
     let result = ahu::verify_structure(&bundle).unwrap();
@@ -108,11 +116,15 @@ fn produce_ml_dsa_87_bundle() {
     };
     let mut signer = ml_dsa_87_signer(&[44u8; 32]);
 
-    let bundle_bytes =
-        produce_bundle::<_, MlDsaSignatureBytes>(&ca, &snapshot, &config, &mut signer, |m| {
-            Ok(Sha256::digest(m).to_vec())
-        })
-        .unwrap();
+    let bundle_bytes = produce_bundle::<_, MlDsaSignatureBytes>(
+        &ca,
+        &snapshot,
+        &config,
+        &mut signer,
+        |m| Ok(Sha256::digest(m).to_vec()),
+        None,
+    )
+    .unwrap();
 
     let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
     let result = ahu::verify_structure(&bundle).unwrap();
@@ -137,11 +149,15 @@ fn ml_dsa_response_is_valid_der() {
     };
     let mut signer = ml_dsa_65_signer(&[50u8; 32]);
 
-    let bundle_bytes =
-        produce_bundle::<_, MlDsaSignatureBytes>(&ca, &snapshot, &config, &mut signer, |m| {
-            Ok(Sha256::digest(m).to_vec())
-        })
-        .unwrap();
+    let bundle_bytes = produce_bundle::<_, MlDsaSignatureBytes>(
+        &ca,
+        &snapshot,
+        &config,
+        &mut signer,
+        |m| Ok(Sha256::digest(m).to_vec()),
+        None,
+    )
+    .unwrap();
 
     let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
 
@@ -177,16 +193,21 @@ fn ml_dsa_65_larger_than_ecdsa() {
         &config,
         &mut ecdsa_key,
         |m| Ok(Sha256::digest(m).to_vec()),
+        None,
     )
     .unwrap();
 
     // ML-DSA-65 bundle
     let mut ml_signer = ml_dsa_65_signer(&[1u8; 32]);
-    let ml_bytes =
-        produce_bundle::<_, MlDsaSignatureBytes>(&ca, &snapshot, &config, &mut ml_signer, |m| {
-            Ok(Sha256::digest(m).to_vec())
-        })
-        .unwrap();
+    let ml_bytes = produce_bundle::<_, MlDsaSignatureBytes>(
+        &ca,
+        &snapshot,
+        &config,
+        &mut ml_signer,
+        |m| Ok(Sha256::digest(m).to_vec()),
+        None,
+    )
+    .unwrap();
 
     println!(
         "ECDSA-P256: {} bytes | ML-DSA-65: {} bytes | ratio: {:.1}x",
@@ -213,11 +234,15 @@ fn ml_dsa_dual_certid_bundle() {
     };
     let mut signer = ml_dsa_44_signer(&[55u8; 32]);
 
-    let bundle_bytes =
-        produce_bundle::<_, MlDsaSignatureBytes>(&ca, &snapshot, &config, &mut signer, |m| {
-            Ok(Sha256::digest(m).to_vec())
-        })
-        .unwrap();
+    let bundle_bytes = produce_bundle::<_, MlDsaSignatureBytes>(
+        &ca,
+        &snapshot,
+        &config,
+        &mut signer,
+        |m| Ok(Sha256::digest(m).to_vec()),
+        None,
+    )
+    .unwrap();
 
     let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
     let result = ahu::verify_structure(&bundle).unwrap();

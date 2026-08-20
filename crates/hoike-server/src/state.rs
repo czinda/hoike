@@ -14,6 +14,7 @@ pub struct LiveSignerState {
     pub signer: Mutex<p256::ecdsa::SigningKey>,
     pub responder_key_bytes: Vec<u8>,
     pub validity_secs: u64,
+    pub responder_cert_der: Option<Vec<u8>>,
 }
 
 impl AppState {

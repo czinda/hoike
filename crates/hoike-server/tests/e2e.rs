@@ -769,9 +769,9 @@ async fn success_response_has_last_modified() {
 
 #[tokio::test]
 async fn live_nonce_signing_returns_nonce_in_response() {
+    use der::Decode;
     use std::collections::BTreeMap;
     use x509_ocsp::{BasicOcspResponse, OcspResponse};
-    use der::Decode;
 
     // Build a real bundle with proper DER-encoded OCSP responses
     let issuer_name = b"CN=Live Test CA,O=Hoike Test";
@@ -800,12 +800,17 @@ async fn live_nonce_signing_returns_nonce_in_response() {
     };
     let mut key = hoike_sign::demo_ecdsa_p256_key();
     let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-        &ca, &snapshot, &config, &mut key,
+        &ca,
+        &snapshot,
+        &config,
+        &mut key,
         |m| {
             use sha2_v010::Digest as _;
             Ok(sha2_v010::Sha256::digest(m).to_vec())
         },
-    ).unwrap();
+        None,
+    )
+    .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("test.ahu");
@@ -850,6 +855,7 @@ type = "demo"
         signer: tokio::sync::Mutex::new(demo_key),
         responder_key_bytes: issuer_key.to_vec(),
         validity_secs: 86400,
+        responder_cert_der: None,
     };
     let app_state = hoike_server::AppState::new(state).with_live_signer(live);
     let app = hoike_server::build_router(app_state);
@@ -869,16 +875,21 @@ type = "demo"
             oid: sha256_oid,
             parameters: Some(der::asn1::Null.into()),
         },
-        issuer_name_hash: der::asn1::OctetString::new(Sha256::digest(issuer_name).to_vec()).unwrap(),
+        issuer_name_hash: der::asn1::OctetString::new(Sha256::digest(issuer_name).to_vec())
+            .unwrap(),
         issuer_key_hash: der::asn1::OctetString::new(Sha256::digest(issuer_key).to_vec()).unwrap(),
         serial_number: x509_cert::serial_number::SerialNumber::new(&[42u8]).unwrap(),
     };
-    let nonce_bytes = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                           0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+    let nonce_bytes = vec![
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10,
+    ];
 
     let nonce_ext = x509_ocsp::ext::Nonce::new(nonce_bytes.clone()).unwrap();
     use x509_cert::ext::AsExtension;
-    let nonce_ext_val = nonce_ext.to_extension(&x509_cert::name::Name::default(), &[]).unwrap();
+    let nonce_ext_val = nonce_ext
+        .to_extension(&x509_cert::name::Name::default(), &[])
+        .unwrap();
 
     let request = Request {
         req_cert: cert_id,
@@ -910,12 +921,18 @@ type = "demo"
 
     // Parse and verify nonce is in the response
     let ocsp_resp = OcspResponse::from_der(&body).unwrap();
-    assert_eq!(ocsp_resp.response_status, x509_ocsp::OcspResponseStatus::Successful);
+    assert_eq!(
+        ocsp_resp.response_status,
+        x509_ocsp::OcspResponseStatus::Successful
+    );
 
-    let basic = BasicOcspResponse::from_der(
-        ocsp_resp.response_bytes.unwrap().response.as_bytes(),
-    ).unwrap();
+    let basic =
+        BasicOcspResponse::from_der(ocsp_resp.response_bytes.unwrap().response.as_bytes()).unwrap();
 
     let resp_nonce = basic.nonce().expect("live response should contain nonce");
-    assert_eq!(resp_nonce.0.as_bytes(), &nonce_bytes, "nonce should match request nonce");
+    assert_eq!(
+        resp_nonce.0.as_bytes(),
+        &nonce_bytes,
+        "nonce should match request nonce"
+    );
 }

@@ -89,31 +89,7 @@ fn time_to_epoch(time: x509_cert::time::Time) -> u64 {
 }
 
 fn datetime_to_epoch(dt: der::DateTime) -> u64 {
-    let year = dt.year() as u64;
-    let month = dt.month() as u64;
-    let day = dt.day() as u64;
-    let hour = dt.hour() as u64;
-    let minutes = dt.minutes() as u64;
-    let seconds = dt.seconds() as u64;
-
-    // Approximate calculation — good enough for OCSP validity windows
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    let mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days += mdays[m as usize] as u64;
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-    }
-    days += day - 1;
-    days * 86400 + hour * 3600 + minutes * 60 + seconds
-}
-
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    crate::generate::datetime_to_epoch(dt)
 }
 
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {

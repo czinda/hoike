@@ -85,6 +85,7 @@ fn main() {
             &config,
             &mut signing_key,
             |m| Ok(Sha256::digest(m).to_vec()),
+            None,
         )
         .expect("bundle production failed");
         let elapsed = start.elapsed();
