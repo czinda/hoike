@@ -500,6 +500,7 @@ fn decode_issuer_key(ca: &hoike_core::config::CaConfig) -> std::result::Result<V
 }
 
 /// Resolve LDAP bind password from config value or environment variable.
+#[cfg(feature = "dogtag-sync")]
 fn resolve_ldap_password(
     password: Option<&str>,
     env_var: Option<&str>,
