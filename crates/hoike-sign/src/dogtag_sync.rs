@@ -35,7 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ldap3::{LdapConn, Scope, SearchEntry};
 use tracing::{debug, info, warn};
@@ -184,9 +184,9 @@ impl DogtagSyncConfig {
 pub struct DogtagSyncSource {
     config: DogtagSyncConfig,
     /// Accumulated snapshot from all syncrepl passes.
-    entries: Mutex<BTreeMap<SerialBytes, CertificateStatus>>,
+    entries: Arc<Mutex<BTreeMap<SerialBytes, CertificateStatus>>>,
     /// Sync cookie from the last successful refresh.
-    cookie: Mutex<Option<Vec<u8>>>,
+    cookie: Arc<Mutex<Option<Vec<u8>>>>,
     /// Epoch counter — incremented each successful refresh.
     epoch: Mutex<u64>,
 }
@@ -204,8 +204,8 @@ impl DogtagSyncSource {
 
         DogtagSyncSource {
             config,
-            entries: Mutex::new(BTreeMap::new()),
-            cookie: Mutex::new(cookie),
+            entries: Arc::new(Mutex::new(BTreeMap::new())),
+            cookie: Arc::new(Mutex::new(cookie)),
             epoch: Mutex::new(0),
         }
     }
@@ -247,12 +247,49 @@ impl DogtagSyncSource {
     }
 
     /// Perform the actual LDAP syncrepl search.
+    ///
+    /// Runs on a dedicated thread because `LdapConn` creates its own tokio
+    /// runtime internally, which panics if called from within an existing
+    /// runtime (hoike's axum server).
     fn do_sync(&self, cookie: Option<&[u8]>) -> Result<u64> {
-        let mut conn = LdapConn::new(&self.config.ldap_url)
-            .map_err(|e| SignError::Config(format!("LDAP connect {}: {e}", self.config.ldap_url)))?;
+        let ldap_url = self.config.ldap_url.clone();
+        let bind_dn = self.config.bind_dn.clone();
+        let bind_password = self.config.bind_password.clone();
+        let base_dn = self.config.base_dn.clone();
+        let filter = self.config.filter.clone();
+        let cookie_owned = cookie.map(|c| c.to_vec());
+        let entries = self.entries.clone();
+        let cookie_state = self.cookie.clone();
+        let cookie_path = self.config.cookie_path.clone();
 
-        conn.simple_bind(&self.config.bind_dn, &self.config.bind_password)
-            .map_err(|e| SignError::Config(format!("LDAP bind as {}: {e}", self.config.bind_dn)))?
+        let handle = std::thread::spawn(move || -> Result<u64> {
+            Self::do_sync_inner(
+                &ldap_url, &bind_dn, &bind_password, &base_dn, &filter,
+                cookie_owned.as_deref(), &entries, &cookie_state, &cookie_path,
+            )
+        });
+
+        handle.join().unwrap_or_else(|e| {
+            Err(SignError::Config(format!("LDAP thread panicked: {e:?}")))
+        })
+    }
+
+    fn do_sync_inner(
+        ldap_url: &str,
+        bind_dn: &str,
+        bind_password: &str,
+        base_dn: &str,
+        filter: &str,
+        cookie: Option<&[u8]>,
+        entries: &Mutex<BTreeMap<SerialBytes, CertificateStatus>>,
+        cookie_state: &Mutex<Option<Vec<u8>>>,
+        cookie_path: &Path,
+    ) -> Result<u64> {
+        let mut conn = LdapConn::new(ldap_url)
+            .map_err(|e| SignError::Config(format!("LDAP connect {ldap_url}: {e}")))?;
+
+        conn.simple_bind(bind_dn, bind_password)
+            .map_err(|e| SignError::Config(format!("LDAP bind as {bind_dn}: {e}")))?
             .success()
             .map_err(|e| SignError::Config(format!("LDAP bind failed: {e}")))?;
 
@@ -267,22 +304,22 @@ impl DogtagSyncSource {
         let (results, ldap_result) = conn
             .with_controls(vec![sync_control])
             .search(
-                &self.config.base_dn,
+                base_dn,
                 Scope::Subtree,
-                &self.config.filter,
+                filter,
                 DogtagSyncConfig::attrs(),
             )
             .map_err(|e| SignError::Config(format!("LDAP search: {e}")))?
             .success()
             .map_err(|e| SignError::Config(format!("LDAP search result: {e}")))?;
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries_guard = entries.lock().unwrap();
         let mut changed = 0u64;
 
         for result_entry in results {
             let se = SearchEntry::construct(result_entry);
             if let Some((serial, status)) = parse_cert_entry(&se) {
-                entries.insert(serial, status);
+                entries_guard.insert(serial, status);
                 changed += 1;
             }
         }
@@ -297,8 +334,8 @@ impl DogtagSyncSource {
                             cookie_len = new_cookie.len(),
                             "received sync cookie from 389 DS"
                         );
-                        *self.cookie.lock().unwrap() = Some(new_cookie.clone());
-                        save_cookie(&self.config.cookie_path, &new_cookie);
+                        *cookie_state.lock().unwrap() = Some(new_cookie.clone());
+                        save_cookie(cookie_path, &new_cookie);
                     }
                 }
             }
