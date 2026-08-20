@@ -32,7 +32,7 @@ ml-dsa = { workspace = true }
 cryptoki = { version = "0.12", optional = true }
 
 # LDAP syncrepl (optional — for Dogtag 389 DS source)
-ldap3 = { version = "0.12", optional = true, default-features = false }
+ldap3 = { version = "0.12", optional = true }
 
 # CMS seal
 cms = "0.3.0-pre.2"

@@ -288,18 +288,17 @@ impl DogtagSyncSource {
         }
 
         // Extract sync cookie from the result controls (Sync Done Control)
-        if let Some(controls) = &ldap_result.ctrls {
-            for ctrl in controls {
-                if ctrl.ctype == SYNC_DONE_OID {
-                    if let Some(ref val) = ctrl.val {
-                        if let Some(new_cookie) = parse_sync_done_cookie(val) {
-                            debug!(
-                                cookie_len = new_cookie.len(),
-                                "received sync cookie from 389 DS"
-                            );
-                            *self.cookie.lock().unwrap() = Some(new_cookie.clone());
-                            save_cookie(&self.config.cookie_path, &new_cookie);
-                        }
+        for ctrl in &ldap_result.ctrls {
+            let raw = &ctrl.1;
+            if raw.ctype == SYNC_DONE_OID {
+                if let Some(ref val) = raw.val {
+                    if let Some(new_cookie) = parse_sync_done_cookie(val) {
+                        debug!(
+                            cookie_len = new_cookie.len(),
+                            "received sync cookie from 389 DS"
+                        );
+                        *self.cookie.lock().unwrap() = Some(new_cookie.clone());
+                        save_cookie(&self.config.cookie_path, &new_cookie);
                     }
                 }
             }
@@ -447,7 +446,7 @@ fn crl_reason_from_u32(code: u32) -> Option<CrlReason> {
         4 => Some(CrlReason::Superseded),
         5 => Some(CrlReason::CessationOfOperation),
         6 => Some(CrlReason::CertificateHold),
-        8 => Some(CrlReason::RemoveFromCrl),
+        8 => Some(CrlReason::RemoveFromCRL),
         9 => Some(CrlReason::PrivilegeWithdrawn),
         10 => Some(CrlReason::AaCompromise),
         _ => None,
