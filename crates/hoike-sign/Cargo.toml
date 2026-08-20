@@ -34,8 +34,11 @@ cryptoki = { version = "0.12", optional = true }
 # LDAP syncrepl (optional — for Dogtag 389 DS source)
 ldap3 = { version = "0.12", optional = true }
 
-# CMS seal
-cms = "0.3.0-pre.2"
+# CMS seal (uses der 0.8 ecosystem — separate from OCSP's der 0.7)
+cms = { version = "0.3.0-pre.2", features = ["std"] }
+der_v08 = { package = "der", version = "0.8", features = ["alloc", "derive", "std", "oid"] }
+spki_v08 = { package = "spki", version = "0.8", features = ["alloc", "std"] }
+x509-cert-v03 = { package = "x509-cert", version = "0.3", features = ["std"] }
 
 # General
 thiserror = { workspace = true }

@@ -9,6 +9,7 @@ pub mod ml_dsa_bridge;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 pub mod rotation;
+pub mod seal;
 pub mod source;
 
 pub use crl::CrlSource;
@@ -25,6 +26,7 @@ pub use ml_dsa_bridge::{
 };
 #[cfg(feature = "pkcs11")]
 pub use pkcs11::{Pkcs11Config, Pkcs11EcdsaSignature, Pkcs11Signer, Pkcs11SignerBridge};
+pub use seal::{create_cms_seal, generate_seal_cert};
 pub use rotation::{
     CertInfo, RotationStatus, check_and_log_rotation, check_rotation_needed, format_cert_info,
     run_rotation_command,
