@@ -653,8 +653,6 @@ fn load_seal_materials(
 fn load_live_signer(
     ca: &hoike_core::config::CaConfig,
 ) -> std::result::Result<hoike_server::LiveSignerState, String> {
-    let responder_key_bytes = decode_issuer_key(ca)?;
-
     let signing_key = match &ca.signing_key {
         Some(hoike_core::config::SigningKeyConfig::File { path }) => {
             hoike_sign::load_ecdsa_p256_key(path)
@@ -678,6 +676,23 @@ fn load_live_signer(
     };
 
     let responder_cert_der = load_responder_cert(ca)?;
+
+    // RFC 6960: KeyHash = SHA-1(responder's subjectPublicKey).
+    // When delegated (cert provided), hash the cert's SPKI.
+    // When CA-direct, hash the CA's key bytes.
+    let responder_key_bytes = if let Some(cert_der) = &responder_cert_der {
+        use sha1::Digest;
+        let cert = <x509_cert::Certificate as der::Decode>::from_der(cert_der)
+            .map_err(|e| format!("parse responder cert for SPKI: {e}"))?;
+        let key_bytes = cert
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes();
+        sha1::Sha1::digest(key_bytes).to_vec()
+    } else {
+        decode_issuer_key(ca)?
+    };
 
     Ok(hoike_server::LiveSignerState {
         signer: tokio::sync::Mutex::new(signing_key),

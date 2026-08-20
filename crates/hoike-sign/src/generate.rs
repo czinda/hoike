@@ -71,9 +71,16 @@ where
     let issuer_name_hash_sha1 = Sha1::digest(&ca.issuer_name_der);
     let issuer_key_hash_sha1 = Sha1::digest(&ca.issuer_key_bytes);
 
-    let responder_key_hash = Sha1::digest(&ca.issuer_key_bytes);
+    // RFC 6960: KeyHash = SHA-1 of the responder's public key.
+    // When delegated (responder_cert provided), hash the cert's SPKI.
+    // When CA-direct, hash the CA's key bytes.
+    let responder_key_hash = if let Some(cert_der) = responder_cert_der {
+        extract_spki_key_hash(cert_der)?
+    } else {
+        Sha1::digest(&ca.issuer_key_bytes).to_vec()
+    };
     let responder_id =
-        ResponderId::ByKey(OctetString::new(responder_key_hash.to_vec()).map_err(SignError::Der)?);
+        ResponderId::ByKey(OctetString::new(responder_key_hash.clone()).map_err(SignError::Der)?);
 
     let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
     let sha1_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
@@ -324,6 +331,18 @@ fn add_shared_entries(builder: &mut BundleBuilder, keys: &[[u8; 32]], response_d
             }
         }
     }
+}
+
+/// Extract SHA-1 hash of the subject public key from a DER-encoded certificate.
+/// This is the ResponderID KeyHash per RFC 6960: SHA-1 of the BIT STRING
+/// subjectPublicKey value (excluding tag and length).
+fn extract_spki_key_hash(cert_der: &[u8]) -> Result<Vec<u8>> {
+    use der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| SignError::KeyLoad(format!("parse responder cert for SPKI: {e}")))?;
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let key_bytes = spki.subject_public_key.raw_bytes();
+    Ok(Sha1::digest(key_bytes).to_vec())
 }
 
 pub fn ocsp_time(epoch_secs: u64) -> Result<OcspGeneralizedTime> {

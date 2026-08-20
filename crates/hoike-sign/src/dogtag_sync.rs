@@ -432,7 +432,7 @@ fn parse_cert_entry(entry: &SearchEntry) -> Option<(SerialBytes, CertificateStat
         .unwrap_or("VALID");
 
     let status = match status_str {
-        "REVOKED" => {
+        "REVOKED" | "REVOKED_EXPIRED" => {
             let revocation_time = entry
                 .attrs
                 .get("revokedOn")
@@ -453,7 +453,23 @@ fn parse_cert_entry(entry: &SearchEntry) -> Option<(SerialBytes, CertificateStat
                 reason,
             }
         }
-        _ => CertificateStatus::Good,
+        "VALID" => CertificateStatus::Good,
+        "EXPIRED" | "INVALID" => {
+            tracing::debug!(
+                serial = hex::encode(&serial_bytes),
+                status = status_str,
+                "skipping non-active certificate"
+            );
+            return None;
+        }
+        other => {
+            tracing::warn!(
+                serial = hex::encode(&serial_bytes),
+                status = other,
+                "unknown Dogtag certStatus — skipping (never map unknown to Good)"
+            );
+            return None;
+        }
     };
 
     Some((serial_bytes, status))

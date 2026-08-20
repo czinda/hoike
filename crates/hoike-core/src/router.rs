@@ -231,7 +231,7 @@ fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<Scope
     let mut loaded_paths: HashMap<std::path::PathBuf, usize> = HashMap::new();
 
     if config.ca.is_empty() {
-        let bundle = load_single_bundle(&config.storage.bundle_dir, None)?;
+        let bundle = load_single_bundle(&config.storage.bundle_dir, None, config)?;
         state_store.check_rollback(&bundle)?;
         state_store.check_continuity(&bundle)?;
         state_store.advance_from_bundle(&bundle)?;
@@ -259,7 +259,7 @@ fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<Scope
             let bundle_idx = if let Some(&idx) = loaded_paths.get(&canonical) {
                 idx
             } else {
-                let bundle = load_and_verify_bundle(&bundle_path)?;
+                let bundle = load_and_verify_bundle(&bundle_path, config)?;
                 state_store.check_rollback(&bundle)?;
                 state_store.check_continuity(&bundle)?;
                 state_store.advance_from_bundle(&bundle)?;
@@ -327,16 +327,20 @@ fn register_bundle_scopes(
     }
 }
 
-fn load_single_bundle(bundle_dir: &Path, bundle_file: Option<&Path>) -> Result<Bundle> {
+fn load_single_bundle(
+    bundle_dir: &Path,
+    bundle_file: Option<&Path>,
+    config: &Config,
+) -> Result<Bundle> {
     let path = if let Some(bf) = bundle_file {
         bf.to_path_buf()
     } else {
         find_newest_bundle(bundle_dir)?
     };
-    load_and_verify_bundle(&path)
+    load_and_verify_bundle(&path, config)
 }
 
-fn load_and_verify_bundle(path: &Path) -> Result<Bundle> {
+fn load_and_verify_bundle(path: &Path, config: &Config) -> Result<Bundle> {
     info!(path = %path.display(), "loading bundle");
     let bundle = Bundle::from_file(path)?;
 
@@ -347,6 +351,9 @@ fn load_and_verify_bundle(path: &Path) -> Result<Bundle> {
         }
     }
 
+    // CMS seal verification
+    verify_bundle_seal(&bundle, config)?;
+
     info!(
         entry_count = bundle.manifest.entry_count,
         producer = %bundle.manifest.producer_id,
@@ -355,6 +362,36 @@ fn load_and_verify_bundle(path: &Path) -> Result<Bundle> {
     );
 
     Ok(bundle)
+}
+
+fn verify_bundle_seal(bundle: &Bundle, config: &Config) -> Result<()> {
+    let has_trust_anchors = config
+        .storage
+        .seal_trust_anchors
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+
+    if has_trust_anchors {
+        if bundle.seal_bytes.is_empty() {
+            return Err(CoreError::Config(
+                "seal_trust_anchors configured but bundle has no seal".into(),
+            ));
+        }
+
+        // Verify the CMS seal integrity (signature over manifest).
+        // NOTE: The current verify_seal checks the signature against the cert
+        // embedded in the seal itself. This proves internal consistency (the seal
+        // wasn't corrupted) but not provenance — a full trust-anchor chain
+        // validation is needed for that. This is an integrity check, not a
+        // provenance check.
+        let _verification = ahu::verify_seal(&bundle.manifest_bytes, &bundle.seal_bytes)
+            .map_err(|e| CoreError::Config(format!("seal verification failed: {e}")))?;
+        info!("CMS seal verified (integrity check)");
+    } else if !bundle.seal_bytes.is_empty() {
+        warn!("bundle has a CMS seal but no seal_trust_anchors configured — seal not verified");
+    }
+
+    Ok(())
 }
 
 fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {

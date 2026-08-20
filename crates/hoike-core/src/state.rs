@@ -10,8 +10,8 @@ use ahu::Bundle;
 
 /// Maximum allowed epoch jump from the current high-water mark.
 /// Prevents a poisoned bundle with epoch = u64::MAX from permanently
-/// locking out a CA (since the seal is currently a hash placeholder
-/// and the manifest is unauthenticated).
+/// locking out a CA. Kept as defense-in-depth even with CMS seal
+/// verification, since seal trust-anchor enforcement is optional.
 pub const MAX_EPOCH_JUMP: u64 = 10_000;
 
 #[derive(Debug, Serialize, Deserialize, Default)]

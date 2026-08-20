@@ -46,6 +46,10 @@ pub struct StorageConfig {
     pub state_db: PathBuf,
     #[serde(default = "default_max_chain")]
     pub max_chain: u32,
+    /// DER or PEM certificates trusted as seal signers.
+    /// When set, bundles without a valid CMS seal are rejected on load.
+    #[serde(default)]
+    pub seal_trust_anchors: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
