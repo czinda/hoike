@@ -346,7 +346,7 @@ impl DogtagSyncSource {
 
         info!(
             changed,
-            total = entries.len(),
+            total = entries_guard.len(),
             had_cookie = cookie.is_some(),
             "syncrepl pass complete"
         );
