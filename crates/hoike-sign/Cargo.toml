@@ -31,6 +31,9 @@ ml-dsa = { workspace = true }
 # PKCS#11 (optional — requires vendor C library at link time)
 cryptoki = { version = "0.12", optional = true }
 
+# LDAP syncrepl (optional — for Dogtag 389 DS source)
+ldap3 = { version = "0.12", optional = true, default-features = false }
+
 # CMS seal
 cms = "0.3.0-pre.2"
 
@@ -45,6 +48,7 @@ base64 = { workspace = true }
 [features]
 default = []
 pkcs11 = ["dep:cryptoki"]
+dogtag-sync = ["dep:ldap3"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,4 +1,6 @@
 pub mod crl;
+#[cfg(feature = "dogtag-sync")]
+pub mod dogtag_sync;
 pub mod error;
 pub mod generate;
 pub mod keyfile;
@@ -15,6 +17,8 @@ pub use ml_dsa_bridge::{
     ML_DSA_44_OID, ML_DSA_65_OID, ML_DSA_87_OID, MlDsaSignatureBytes, MlDsaSigner,
     ml_dsa_44_signer, ml_dsa_65_signer, ml_dsa_87_signer, ml_dsa_signature_size,
 };
+#[cfg(feature = "dogtag-sync")]
+pub use dogtag_sync::{DogtagSyncConfig, DogtagSyncSource};
 #[cfg(feature = "pkcs11")]
 pub use pkcs11::{Pkcs11Config, Pkcs11EcdsaSignature, Pkcs11Signer, Pkcs11SignerBridge};
 pub use source::{

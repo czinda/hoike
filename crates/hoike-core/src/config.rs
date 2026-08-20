@@ -122,6 +122,40 @@ pub enum SigningKeyConfig {
 pub enum SourceConfig {
     #[serde(rename = "crl")]
     Crl { path: PathBuf },
+
+    /// RFC 4533 syncrepl against a Dogtag 389 DS certificate repository.
+    ///
+    /// Initial refresh loads the full cert population; subsequent refreshes
+    /// send the stored sync cookie so 389 DS returns only changes.
+    /// Produces both `Good` and `Revoked` entries — enables
+    /// `authoritative-complete` bundles.
+    #[serde(rename = "dogtag-sync")]
+    DogtagSync {
+        /// LDAP URL, e.g. `ldap://ds-iot.cert-lab.local:3389`
+        ldap_url: String,
+        /// Search base DN, e.g. `ou=certificateRepository,ou=ca,o=pki-iot-ca-CA`
+        base_dn: String,
+        /// Bind DN (e.g. `cn=Directory Manager`)
+        #[serde(default = "default_bind_dn")]
+        bind_dn: String,
+        /// Bind password (plaintext — prefer `bind_password_env`)
+        bind_password: Option<String>,
+        /// Environment variable holding the bind password
+        bind_password_env: Option<String>,
+        /// Path to checkpoint the sync cookie (default: state_db/sync-cookie.dat)
+        cookie_path: Option<PathBuf>,
+        /// LDAP filter (default: `(objectClass=certificateRecord)`)
+        #[serde(default = "default_sync_filter")]
+        filter: Option<String>,
+    },
+}
+
+fn default_bind_dn() -> String {
+    "cn=Directory Manager".into()
+}
+
+fn default_sync_filter() -> Option<String> {
+    Some("(objectClass=certificateRecord)".into())
 }
 
 fn default_mode() -> String {

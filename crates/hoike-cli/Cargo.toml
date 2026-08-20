@@ -40,3 +40,4 @@ rpassword = "7"
 [features]
 default = []
 pkcs11 = ["hoike-sign/pkcs11"]
+dogtag-sync = ["hoike-sign/dogtag-sync"]

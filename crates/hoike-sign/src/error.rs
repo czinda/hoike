@@ -23,6 +23,9 @@ pub enum SignError {
     #[error("key loading error: {0}")]
     KeyLoad(String),
 
+    #[error("LDAP error: {0}")]
+    Ldap(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 

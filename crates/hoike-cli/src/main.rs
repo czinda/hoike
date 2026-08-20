@@ -268,6 +268,36 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                     Box::new(CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?)
                 }
             }
+
+            #[cfg(feature = "dogtag-sync")]
+            hoike_core::config::SourceConfig::DogtagSync {
+                ldap_url,
+                base_dn,
+                bind_dn,
+                bind_password,
+                bind_password_env,
+                cookie_path,
+                filter,
+            } => {
+                let password = resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
+                let cookie = cookie_path
+                    .clone()
+                    .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
+                let sync_config = hoike_sign::DogtagSyncConfig {
+                    ldap_url: ldap_url.clone(),
+                    base_dn: base_dn.clone(),
+                    bind_dn: bind_dn.clone(),
+                    bind_password: password,
+                    cookie_path: cookie,
+                    filter: filter.clone().unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
+                };
+                Box::new(hoike_sign::DogtagSyncSource::new(sync_config))
+            }
+
+            #[cfg(not(feature = "dogtag-sync"))]
+            hoike_core::config::SourceConfig::DogtagSync { .. } => {
+                return Err("dogtag-sync source requires the 'dogtag-sync' feature flag".into());
+            }
         };
 
         let ca = CaIdentity {
@@ -450,6 +480,25 @@ fn decode_issuer_key(ca: &hoike_core::config::CaConfig) -> std::result::Result<V
         &ca.label,
         &format!("{}-key", ca.label),
     )
+}
+
+/// Resolve LDAP bind password from config value or environment variable.
+fn resolve_ldap_password(
+    password: Option<&str>,
+    env_var: Option<&str>,
+) -> std::result::Result<String, String> {
+    if let Some(pw) = password {
+        return Ok(pw.to_string());
+    }
+    if let Some(var) = env_var {
+        return std::env::var(var).map_err(|_| {
+            format!(
+                "LDAP bind password env var '{var}' not set. \
+                 Set it or use bind_password in config."
+            )
+        });
+    }
+    Err("no LDAP bind password: set bind_password or bind_password_env in config".into())
 }
 
 fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
