@@ -265,7 +265,7 @@ async fn run_server(config_path: PathBuf) {
 
 fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), String> {
     use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
-    use sha2_v010::{Digest, Sha256};
+    use sha2_v010::Digest as _;
 
     for ca_config in &config.ca {
         let source_config = match &ca_config.source {
@@ -359,17 +359,24 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
             ..Default::default()
         };
 
+        // Load seal key and cert for CMS sealing
+        let (seal_key, seal_cert_der) = load_seal_materials(ca_config)?;
+
         let bundle_bytes = match &ca_config.signing_key {
             Some(hoike_core::config::SigningKeyConfig::File { path }) => {
                 let mut signer = hoike_sign::load_ecdsa_p256_key(path)
                     .map_err(|e| format!("load signing key: {e}"))?;
                 info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
+                let sk = seal_key.clone();
+                let sc = seal_cert_der.clone();
                 hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca,
                     &snapshot,
                     &gen_config,
                     &mut signer,
-                    |m| Ok(Sha256::digest(m).to_vec()),
+                    move |m| {
+                        hoike_sign::create_cms_seal(m, &sk, &sc)
+                    },
                     responder_cert_der.as_deref(),
                 )
             }
@@ -381,13 +388,18 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                     let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
                         .map_err(|e| format!("PKCS#11 init: {e}"))?;
                     let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
                     hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
                         &ca,
                         &snapshot,
                         &gen_config,
                         &mut bridge,
-                        |m| Ok(Sha256::digest(m).to_vec()), responder_cert_der.as_deref(),
-                        None,
+                        move |m| {
+                            hoike_sign::create_cms_seal(m, &sk, &sc)
+                                .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
+                        },
+                        responder_cert_der.as_deref(),
                     )
                 }
                 #[cfg(not(feature = "pkcs11"))]
@@ -405,12 +417,16 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
                     "using ephemeral demo signing key — NOT FOR PRODUCTION"
                 );
                 let mut signer = hoike_sign::demo_ecdsa_p256_key();
+                let sk = seal_key.clone();
+                let sc = seal_cert_der.clone();
                 hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca,
                     &snapshot,
                     &gen_config,
                     &mut signer,
-                    |m| Ok(Sha256::digest(m).to_vec()),
+                    move |m| {
+                        hoike_sign::create_cms_seal(m, &sk, &sc)
+                    },
                     responder_cert_der.as_deref(),
                 )
             }
@@ -598,6 +614,40 @@ fn load_responder_cert(
         }
         None => Ok(None),
     }
+}
+
+/// Load seal key and certificate for CMS bundle sealing.
+/// Falls back to the OCSP signing key if no seal_key is configured.
+fn load_seal_materials(
+    ca_config: &hoike_core::config::CaConfig,
+) -> std::result::Result<(p256::ecdsa::SigningKey, Vec<u8>), String> {
+    let seal_key = if let Some(path) = &ca_config.seal_key {
+        hoike_sign::load_ecdsa_p256_key(path)
+            .map_err(|e| format!("load seal key: {e}"))?
+    } else if let Some(hoike_core::config::SigningKeyConfig::File { path }) = &ca_config.signing_key
+    {
+        warn!(
+            ca = ca_config.label,
+            "using OCSP signing key as seal key — configure seal_key for production"
+        );
+        hoike_sign::load_ecdsa_p256_key(path)
+            .map_err(|e| format!("load signing key for seal: {e}"))?
+    } else {
+        warn!(
+            ca = ca_config.label,
+            "no seal_key configured — generating ephemeral seal key"
+        );
+        hoike_sign::demo_ecdsa_p256_key()
+    };
+
+    let seal_cert_der = if let Some(path) = &ca_config.seal_cert {
+        std::fs::read(path).map_err(|e| format!("read seal cert: {e}"))?
+    } else {
+        hoike_sign::generate_seal_cert(&seal_key)
+            .map_err(|e| format!("generate seal cert: {e}"))?
+    };
+
+    Ok((seal_key, seal_cert_der))
 }
 
 fn load_live_signer(
@@ -819,7 +869,6 @@ fn run_sign(
     use hoike_sign::{
         CaIdentity, CertIdCompat, CertificateStatus, CrlSource, GenerationConfig, RevocationSource,
     };
-    use sha2_v010::{Digest, Sha256};
 
     // Resolve signing key — require explicit --signing-key or --demo-key
     if signing_key_path.is_none() && !demo_key {
@@ -945,7 +994,23 @@ fn run_sign(
         ..Default::default()
     };
 
-    let seal_fn = |m: &[u8]| -> hoike_sign::Result<Vec<u8>> { Ok(Sha256::digest(m).to_vec()) };
+    // For CLI signing, use the OCSP signing key as the seal key too.
+    // In production, the seal key should be separate (per ahu spec §2.3).
+    let cli_seal_key = if let Some(key_path) = &signing_key_path {
+        hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+            eprintln!("Failed to load seal key: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        hoike_sign::demo_ecdsa_p256_key()
+    };
+    let cli_seal_cert = hoike_sign::generate_seal_cert(&cli_seal_key).unwrap_or_else(|e| {
+        eprintln!("Failed to generate seal cert: {e}");
+        std::process::exit(1);
+    });
+    let seal_fn = move |m: &[u8]| -> hoike_sign::Result<Vec<u8>> {
+        hoike_sign::create_cms_seal(m, &cli_seal_key, &cli_seal_cert)
+    };
 
     let bundle_bytes = match sig_alg.as_str() {
         "ecdsa-p256" => {

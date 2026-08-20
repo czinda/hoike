@@ -17,9 +17,20 @@ hex = { workspace = true }
 byteorder = { workspace = true }
 bitflags = { workspace = true }
 
+# CMS seal verification (der 0.8 ecosystem)
+cms = { version = "0.3.0-pre.2", features = ["std"], optional = true }
+der = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }
+spki = { workspace = true, optional = true }
+p256 = { version = "0.14", features = ["ecdsa"], optional = true }
+ecdsa_v017 = { package = "ecdsa", version = "0.17", features = ["der"], optional = true }
+
 [features]
-default = ["compression"]
+default = ["compression", "seal-verify"]
 compression = ["dep:zstd"]
+seal-verify = ["dep:cms", "dep:der", "dep:x509-cert", "dep:spki", "dep:p256", "dep:ecdsa_v017"]
 
 [dev-dependencies]
 tempfile = "3"
+hoike-sign = { path = "../hoike-sign" }
+p256_v013 = { package = "p256", version = "0.13", features = ["ecdsa"] }

@@ -3,6 +3,7 @@ pub mod error;
 pub mod header;
 pub mod index;
 pub mod manifest;
+pub mod seal;
 pub mod verify;
 
 pub use bundle::{Bundle, BundleBuilder};
@@ -14,3 +15,5 @@ pub use manifest::{
     Manifest, ResponderId, ResponderIdType, Shard, Window,
 };
 pub use verify::{VerifyResult, check_epochs, manifest_digest, verify_structure};
+#[cfg(feature = "seal-verify")]
+pub use seal::{SealVerification, verify_seal};

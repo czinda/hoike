@@ -86,6 +86,13 @@ pub struct CaConfig {
     pub responder_cert: Option<PathBuf>,
     /// Key rotation monitoring configuration.
     pub key_rotation: Option<KeyRotationConfigToml>,
+    /// Path to PKCS#8 PEM/DER key for bundle seal signing.
+    /// If absent, falls back to the OCSP signing key (with a warning).
+    /// The seal key SHOULD be different from the OCSP signing key.
+    pub seal_key: Option<PathBuf>,
+    /// Path to the DER/PEM certificate for the seal signer.
+    /// If absent, generates a self-signed cert (for testing only).
+    pub seal_cert: Option<PathBuf>,
 }
 
 /// TOML-level key rotation configuration.
