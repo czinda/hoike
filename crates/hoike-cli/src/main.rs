@@ -394,7 +394,7 @@ fn run_signer_pass_with_sources(
             Some(hoike_core::config::SigningKeyConfig::File { path }) => {
                 let mut signing_key = hoike_sign::load_ecdsa_p256_key(path)
                     .map_err(|e| format!("signing key: {e}"))?;
-                let bundle_bytes = hoike_sign::produce_bundle(
+                let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca, &snapshot, &gen_config, &mut signing_key,
                     |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
                 ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
@@ -422,7 +422,7 @@ fn run_signer_pass_with_sources(
                 let signer = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
                     .map_err(|e| format!("PKCS#11 init: {e}"))?;
                 let mut signer = hoike_sign::Pkcs11SignerBridge::new(signer);
-                let bundle_bytes = hoike_sign::produce_bundle(
+                let bundle_bytes = hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
                     &ca, &snapshot, &gen_config, &mut signer,
                     |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
                 ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
@@ -434,7 +434,7 @@ fn run_signer_pass_with_sources(
             }
             Some(hoike_core::config::SigningKeyConfig::Demo) => {
                 let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
-                let bundle_bytes = hoike_sign::produce_bundle(
+                let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca, &snapshot, &gen_config, &mut signing_key,
                     |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
                 ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
