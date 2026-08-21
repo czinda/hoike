@@ -16,6 +16,7 @@ zstd = { workspace = true, optional = true }
 hex = { workspace = true }
 byteorder = { workspace = true }
 bitflags = { workspace = true }
+memmap2 = { workspace = true }
 
 # CMS seal verification (der 0.8 ecosystem)
 cms = { version = "0.3.0-pre.2", features = ["std"], optional = true }

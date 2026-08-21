@@ -150,11 +150,23 @@ async fn run_server(config_path: PathBuf) {
     let listen = config.server.listen.clone();
     let is_combined = config.is_combined();
 
+    // Create persistent revocation sources — stateful sources like DogtagSync
+    // must survive across signer loop iterations to retain their in-memory
+    // snapshot and sync cookie.
+    let persistent_sources = if is_combined {
+        Some(create_persistent_sources(&config).unwrap_or_else(|e| {
+            eprintln!("Failed to create revocation sources: {e}");
+            std::process::exit(1);
+        }))
+    } else {
+        None
+    };
+
     // In combined mode, run an initial signing pass before loading bundles
     // so there's something to serve immediately.
     if is_combined {
         info!("combined mode: running initial bundle production");
-        if let Err(e) = run_signer_pass(&config) {
+        if let Err(e) = run_signer_pass_with_sources(&config, persistent_sources.as_ref().unwrap()) {
             eprintln!("Initial signer pass failed: {e}");
             std::process::exit(1);
         }
@@ -188,8 +200,9 @@ async fn run_server(config_path: PathBuf) {
     if is_combined {
         let signer_state = app_state.responder.clone();
         let signer_config = config.clone();
+        let sources = persistent_sources.unwrap();
         tokio::spawn(async move {
-            run_signer_loop(signer_state, signer_config).await;
+            run_signer_loop(signer_state, signer_config, sources).await;
         });
     }
 
@@ -263,6 +276,184 @@ async fn run_server(config_path: PathBuf) {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Map of CA label → persistent revocation source. Stateful sources (DogtagSync)
+/// retain their in-memory snapshot and sync cookie across signer loop iterations.
+type PersistentSources = std::collections::HashMap<String, Box<dyn hoike_sign::RevocationSource>>;
+
+fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result<PersistentSources, String> {
+    let mut sources = PersistentSources::new();
+    for ca_config in &config.ca {
+        let source_config = match &ca_config.source {
+            Some(s) => s,
+            None => continue,
+        };
+        let source: Box<dyn hoike_sign::RevocationSource> = match source_config {
+            #[cfg(feature = "dogtag-sync")]
+            hoike_core::config::SourceConfig::DogtagSync {
+                ldap_url, base_dn, bind_dn, bind_password,
+                bind_password_env, cookie_path, filter,
+            } => {
+                let password = resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
+                let cookie = cookie_path.clone()
+                    .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
+                let sync_config = hoike_sign::DogtagSyncConfig {
+                    ldap_url: ldap_url.clone(),
+                    base_dn: base_dn.clone(),
+                    bind_dn: bind_dn.clone(),
+                    bind_password: password,
+                    cookie_path: cookie,
+                    filter: filter.clone().unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
+                };
+                Box::new(hoike_sign::DogtagSyncSource::new(sync_config))
+            }
+            // CRL and other stateless sources are created fresh each pass
+            _ => continue,
+        };
+        sources.insert(ca_config.label.clone(), source);
+    }
+    Ok(sources)
+}
+
+fn run_signer_pass_with_sources(
+    config: &hoike_core::Config,
+    persistent_sources: &PersistentSources,
+) -> std::result::Result<(), String> {
+    use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
+    use sha2_v010::{Digest, Sha256};
+
+    for ca_config in &config.ca {
+        let source_config = match &ca_config.source {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Use persistent source if available, otherwise create a fresh one
+        let fresh_source: Option<Box<dyn RevocationSource>>;
+        let source: &dyn RevocationSource = if let Some(ps) = persistent_sources.get(&ca_config.label) {
+            ps.as_ref()
+        } else {
+            fresh_source = Some(match source_config {
+                hoike_core::config::SourceConfig::Crl { path } => {
+                    let crl_data = std::fs::read(path)
+                        .map_err(|e| format!("failed to read CRL {}: {e}", path.display()))?;
+                    if crl_data.starts_with(b"-----BEGIN") {
+                        let pem = String::from_utf8(crl_data)
+                            .map_err(|e| format!("CRL not valid UTF-8: {e}"))?;
+                        Box::new(CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?)
+                    } else {
+                        Box::new(CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?)
+                    }
+                }
+                #[cfg(feature = "dogtag-sync")]
+                hoike_core::config::SourceConfig::DogtagSync { .. } => {
+                    // Should never hit this — DogtagSync sources are always persistent
+                    return Err("DogtagSync source not found in persistent sources".into());
+                }
+                #[cfg(not(feature = "dogtag-sync"))]
+                hoike_core::config::SourceConfig::DogtagSync { .. } => {
+                    return Err("dogtag-sync requires the 'dogtag-sync' feature flag".into());
+                }
+            });
+            fresh_source.as_ref().unwrap().as_ref()
+        };
+
+        let ca = CaIdentity {
+            label: ca_config.label.clone(),
+            issuer_name_der: decode_issuer_name(ca_config)?,
+            issuer_key_bytes: decode_issuer_key(ca_config)?,
+        };
+
+        let snapshot = source
+            .snapshot(&ca)
+            .map_err(|e| format!("snapshot failed for {}: {e}", ca_config.label))?;
+
+        let epoch = {
+            let state_db_path = config.storage.state_db.join("state.json");
+            let store = hoike_core::StateStore::open(&state_db_path)
+                .map_err(|e| format!("state store: {e}"))?;
+            let issuer_key_hash_hex = hex::encode(sha2_v010::Sha256::digest(&ca.issuer_key_bytes));
+            store
+                .get_high_water("hoike-combined", &issuer_key_hash_hex)
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+
+        let gen_config = GenerationConfig {
+            producer_id: "hoike-combined".into(),
+            epoch,
+            validity_secs: ca_config.validity_secs,
+            certid_compat: hoike_sign::CertIdCompat::Dual,
+            ..Default::default()
+        };
+
+        // Continue with signing (rest of the function follows the same pattern)
+        // Get the signing key and produce the bundle
+        let bundle_path = config.storage.bundle_dir.join(format!("{}.ahu", ca_config.label));
+
+        match &ca_config.signing_key {
+            Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+                let mut signing_key = hoike_sign::load_ecdsa_p256_key(path)
+                    .map_err(|e| format!("signing key: {e}"))?;
+                let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                    &ca, &snapshot, &gen_config, &mut signing_key,
+                    |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+                ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
+                std::fs::write(&bundle_path, &bundle_bytes)
+                    .map_err(|e| format!("write bundle: {e}"))?;
+                info!(ca = ca_config.label, size = bundle_bytes.len(),
+                      path = %bundle_path.display(), entries = snapshot.entries.len(),
+                      "bundle produced");
+            }
+            #[cfg(feature = "pkcs11")]
+            Some(hoike_core::config::SigningKeyConfig::Pkcs11 {
+                module, token_label, key_label, pin, pin_env, slot_id, key_id,
+            }) => {
+                let pin_val = pin.clone().or_else(|| {
+                    pin_env.as_ref().and_then(|e| std::env::var(e).ok())
+                }).unwrap_or_default();
+                let pkcs11_config = hoike_sign::Pkcs11Config {
+                    module_path: module.clone(),
+                    slot_id: *slot_id,
+                    token_label: token_label.clone(),
+                    pin: pin_val,
+                    key_label: key_label.clone(),
+                    key_id: key_id.as_ref().and_then(|h| hex::decode(h).ok()),
+                };
+                let signer = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
+                    .map_err(|e| format!("PKCS#11 init: {e}"))?;
+                let mut signer = hoike_sign::Pkcs11SignerBridge::new(signer);
+                let bundle_bytes = hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
+                    &ca, &snapshot, &gen_config, &mut signer,
+                    |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+                ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
+                std::fs::write(&bundle_path, &bundle_bytes)
+                    .map_err(|e| format!("write bundle: {e}"))?;
+                info!(ca = ca_config.label, size = bundle_bytes.len(),
+                      path = %bundle_path.display(), entries = snapshot.entries.len(),
+                      "bundle produced");
+            }
+            Some(hoike_core::config::SigningKeyConfig::Demo) => {
+                let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
+                let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                    &ca, &snapshot, &gen_config, &mut signing_key,
+                    |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+                ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
+                std::fs::write(&bundle_path, &bundle_bytes)
+                    .map_err(|e| format!("write bundle: {e}"))?;
+                warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
+                info!(ca = ca_config.label, size = bundle_bytes.len(),
+                      path = %bundle_path.display(), entries = snapshot.entries.len(),
+                      "bundle produced");
+            }
+            _ => {
+                return Err(format!("CA '{}': no signing_key configured", ca_config.label));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Keep old function for non-combined modes that don't need persistent sources
 fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), String> {
     use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
     use sha2_v010::Digest as _;
@@ -461,7 +652,11 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
     Ok(())
 }
 
-async fn run_signer_loop(state: Arc<hoike_core::ResponderState>, config: hoike_core::Config) {
+async fn run_signer_loop(
+    state: Arc<hoike_core::ResponderState>,
+    config: hoike_core::Config,
+    sources: PersistentSources,
+) {
     let min_interval = config
         .ca
         .iter()
@@ -516,7 +711,7 @@ async fn run_signer_loop(state: Arc<hoike_core::ResponderState>, config: hoike_c
         }
 
         info!("signer loop: starting production cycle");
-        match run_signer_pass(&config) {
+        match run_signer_pass_with_sources(&config, &sources) {
             Ok(()) => {
                 if let Err(e) = state.reload() {
                     error!(error = %e, "signer loop: reload failed after production");
