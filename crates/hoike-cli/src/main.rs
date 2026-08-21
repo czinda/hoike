@@ -280,6 +280,7 @@ async fn run_server(config_path: PathBuf) {
 /// retain their in-memory snapshot and sync cookie across signer loop iterations.
 type PersistentSources = std::collections::HashMap<String, Box<dyn hoike_sign::RevocationSource>>;
 
+#[allow(unused_mut)]
 fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result<PersistentSources, String> {
     let mut sources = PersistentSources::new();
     for ca_config in &config.ca {
@@ -287,6 +288,7 @@ fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result
             Some(s) => s,
             None => continue,
         };
+        #[allow(unused_variables)]
         let source: Box<dyn hoike_sign::RevocationSource> = match source_config {
             #[cfg(feature = "dogtag-sync")]
             hoike_core::config::SourceConfig::DogtagSync {
@@ -319,7 +321,7 @@ fn run_signer_pass_with_sources(
     persistent_sources: &PersistentSources,
 ) -> std::result::Result<(), String> {
     use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
-    use sha2_v010::{Digest, Sha256};
+    use sha2_v010::Digest;
 
     for ca_config in &config.ca {
         let source_config = match &ca_config.source {
@@ -397,6 +399,7 @@ fn run_signer_pass_with_sources(
                 let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca, &snapshot, &gen_config, &mut signing_key,
                     |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+                    None,
                 ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
                 std::fs::write(&bundle_path, &bundle_bytes)
                     .map_err(|e| format!("write bundle: {e}"))?;
@@ -437,6 +440,7 @@ fn run_signer_pass_with_sources(
                 let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca, &snapshot, &gen_config, &mut signing_key,
                     |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+                    None,
                 ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
                 std::fs::write(&bundle_path, &bundle_bytes)
                     .map_err(|e| format!("write bundle: {e}"))?;
