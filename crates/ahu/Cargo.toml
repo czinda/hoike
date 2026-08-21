@@ -16,6 +16,7 @@ zstd = { workspace = true, optional = true }
 hex = { workspace = true }
 byteorder = { workspace = true }
 bitflags = { workspace = true }
+memmap2 = { workspace = true }
 
 [features]
 default = ["compression"]
