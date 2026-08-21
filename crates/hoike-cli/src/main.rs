@@ -406,14 +406,22 @@ fn run_signer_pass_with_sources(
             }
             #[cfg(feature = "pkcs11")]
             Some(hoike_core::config::SigningKeyConfig::Pkcs11 {
-                module, token_label, key_label, pin, pin_env, ..
+                module, token_label, key_label, pin, pin_env, slot_id, key_id,
             }) => {
                 let pin_val = pin.clone().or_else(|| {
                     pin_env.as_ref().and_then(|e| std::env::var(e).ok())
                 }).unwrap_or_default();
-                let mut signer = hoike_sign::Pkcs11SignerBridge::new(
-                    module, token_label.as_deref(), key_label.as_deref(), &pin_val,
-                ).map_err(|e| format!("PKCS#11 init: {e}"))?;
+                let pkcs11_config = hoike_sign::Pkcs11Config {
+                    module_path: module.clone(),
+                    slot_id: *slot_id,
+                    token_label: token_label.clone(),
+                    pin: pin_val,
+                    key_label: key_label.clone(),
+                    key_id: key_id.as_ref().and_then(|h| hex::decode(h).ok()),
+                };
+                let signer = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
+                    .map_err(|e| format!("PKCS#11 init: {e}"))?;
+                let mut signer = hoike_sign::Pkcs11SignerBridge::new(signer);
                 let bundle_bytes = hoike_sign::produce_bundle(
                     &ca, &snapshot, &gen_config, &mut signer,
                     |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
