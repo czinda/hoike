@@ -6,6 +6,11 @@
 **Author:** Chris Zinda
 **Companion:** `ahu-format-spec.md`
 
+> **Implementation status:** This document is the target architecture and
+> roadmap. For what is currently implemented vs planned, see
+> [README.md](README.md) — specifically the Known Limitations section.
+> Not every adapter, mode, or configuration described here has code behind it yet.
+
 ---
 
 ## 1. What this is and why
