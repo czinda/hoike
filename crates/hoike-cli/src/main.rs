@@ -388,71 +388,78 @@ fn run_signer_pass_with_sources(
             ..Default::default()
         };
 
-        // Continue with signing (rest of the function follows the same pattern)
-        // Get the signing key and produce the bundle
+        // Load responder cert and seal materials (same path as run_sign)
+        let responder_cert_der = load_responder_cert(ca_config)?;
+        let (seal_key, seal_cert_der) = load_seal_materials(ca_config)?;
+
+        // Ensure bundle_dir exists
+        std::fs::create_dir_all(&config.storage.bundle_dir)
+            .map_err(|e| format!("create bundle_dir: {e}"))?;
+
         let bundle_path = config.storage.bundle_dir.join(format!("{}.ahu", ca_config.label));
 
-        match &ca_config.signing_key {
+        let bundle_bytes = match &ca_config.signing_key {
             Some(hoike_core::config::SigningKeyConfig::File { path }) => {
                 let mut signing_key = hoike_sign::load_ecdsa_p256_key(path)
                     .map_err(|e| format!("signing key: {e}"))?;
-                let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                let sk = seal_key.clone();
+                let sc = seal_cert_der.clone();
+                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
                     &ca, &snapshot, &gen_config, &mut signing_key,
-                    |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
-                    None,
-                ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
-                std::fs::write(&bundle_path, &bundle_bytes)
-                    .map_err(|e| format!("write bundle: {e}"))?;
-                info!(ca = ca_config.label, size = bundle_bytes.len(),
-                      path = %bundle_path.display(), entries = snapshot.entries.len(),
-                      "bundle produced");
+                    move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                    responder_cert_der.as_deref(),
+                )
             }
             #[cfg(feature = "pkcs11")]
-            Some(hoike_core::config::SigningKeyConfig::Pkcs11 {
-                module, token_label, key_label, pin, pin_env, slot_id, key_id,
-            }) => {
-                let pin_val = pin.clone().or_else(|| {
-                    pin_env.as_ref().and_then(|e| std::env::var(e).ok())
-                }).unwrap_or_default();
-                let pkcs11_config = hoike_sign::Pkcs11Config {
-                    module_path: module.clone(),
-                    slot_id: *slot_id,
-                    token_label: token_label.clone(),
-                    pin: pin_val,
-                    key_label: key_label.clone(),
-                    key_id: key_id.as_ref().and_then(|h| hex::decode(h).ok()),
-                };
-                let signer = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
+            Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                let pkcs11_config = resolve_pkcs11_config(ca_config)?;
+                let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
                     .map_err(|e| format!("PKCS#11 init: {e}"))?;
-                let mut signer = hoike_sign::Pkcs11SignerBridge::new(signer);
-                let bundle_bytes = hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
-                    &ca, &snapshot, &gen_config, &mut signer,
-                    |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
-                ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
-                std::fs::write(&bundle_path, &bundle_bytes)
-                    .map_err(|e| format!("write bundle: {e}"))?;
-                info!(ca = ca_config.label, size = bundle_bytes.len(),
-                      path = %bundle_path.display(), entries = snapshot.entries.len(),
-                      "bundle produced");
+                let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
+                let sk = seal_key.clone();
+                let sc = seal_cert_der.clone();
+                hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
+                    &ca, &snapshot, &gen_config, &mut bridge,
+                    move |m| {
+                        hoike_sign::create_cms_seal(m, &sk, &sc)
+                            .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
+                    },
+                    responder_cert_der.as_deref(),
+                )
+            }
+            #[cfg(not(feature = "pkcs11"))]
+            Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                return Err(format!(
+                    "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
+                    ca_config.label
+                ));
             }
             Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
-                let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                    &ca, &snapshot, &gen_config, &mut signing_key,
-                    |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
-                    None,
-                ).map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
-                std::fs::write(&bundle_path, &bundle_bytes)
-                    .map_err(|e| format!("write bundle: {e}"))?;
                 warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
-                info!(ca = ca_config.label, size = bundle_bytes.len(),
-                      path = %bundle_path.display(), entries = snapshot.entries.len(),
-                      "bundle produced");
+                let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
+                let sk = seal_key.clone();
+                let sc = seal_cert_der.clone();
+                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                    &ca, &snapshot, &gen_config, &mut signing_key,
+                    move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                    responder_cert_der.as_deref(),
+                )
             }
-            _ => {
+            None => {
                 return Err(format!("CA '{}': no signing_key configured", ca_config.label));
             }
         }
+        .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
+
+        std::fs::write(&bundle_path, &bundle_bytes)
+            .map_err(|e| format!("write bundle: {e}"))?;
+        info!(
+            ca = ca_config.label,
+            size = bundle_bytes.len(),
+            path = %bundle_path.display(),
+            entries = snapshot.entries.len(),
+            "bundle produced (CMS sealed)"
+        );
     }
     Ok(())
 }
