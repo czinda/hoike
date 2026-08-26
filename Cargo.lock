@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ahu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "hoike-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahu",
  "axum",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "hoike-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahu",
  "arc-swap",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "hoike-gossip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "foca",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "hoike-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahu",
  "arc-swap",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "hoike-sign"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahu",
  "base64 0.22.1",

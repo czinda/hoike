@@ -1,6 +1,6 @@
 [package]
 name = "hoike-sign"
-version = "0.1.0"
+version = "0.2.0"
 description = "Signing, generation production, and revocation source adapters for hoike"
 license = "GPL-3.0-or-later"
 edition.workspace = true

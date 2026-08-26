@@ -1,6 +1,6 @@
 [package]
 name = "ahu"
-version = "0.1.0"
+version = "0.2.0"
 description = "The ahu pre-signed OCSP response bundle format: read, write, verify"
 license = "Apache-2.0 OR MIT"
 edition.workspace = true

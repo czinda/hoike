@@ -1,6 +1,6 @@
 [package]
 name = "hoike-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "HTTP request path for hoike OCSP responder"
 license = "GPL-3.0-or-later"
 edition.workspace = true
