@@ -40,8 +40,14 @@ rpassword = "7"
 der = { version = "0.7", features = ["alloc"] }
 x509-cert = { version = "0.2", features = ["std"] }
 sha1 = { version = "0.10" }
+x509-ocsp = { workspace = true }
+ureq = "3"
+spki = { version = "0.7", features = ["alloc"] }
+const-oid = { version = "0.9" }
+
+cryptoki = { version = "0.12", optional = true }
 
 [features]
 default = []
-pkcs11 = ["hoike-sign/pkcs11"]
+pkcs11 = ["hoike-sign/pkcs11", "dep:cryptoki"]
 dogtag-sync = ["hoike-sign/dogtag-sync"]

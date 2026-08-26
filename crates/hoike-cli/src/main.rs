@@ -62,9 +62,37 @@ enum Commands {
         /// Path to PKCS#8 PEM or DER signing key file
         #[arg(long, conflicts_with = "demo_key")]
         signing_key: Option<PathBuf>,
+        /// Path to PKCS#8 PEM or DER P-256 seal key file (separate from signing key)
+        #[arg(long)]
+        seal_key: Option<PathBuf>,
+        /// Produce a dual-algorithm bundle: --sig-alg is the classical algorithm,
+        /// --dual-alg is the post-quantum algorithm (e.g. ml-dsa-87)
+        #[arg(long)]
+        dual_alg: Option<String>,
+        /// Path to PKCS#8 PEM or DER PQ signing key file (for --dual-alg)
+        #[arg(long)]
+        pq_signing_key: Option<PathBuf>,
         /// Use an ephemeral demo key (NOT FOR PRODUCTION)
         #[arg(long)]
         demo_key: bool,
+    },
+    /// Query a running OCSP responder with optional algorithm preference
+    Query {
+        /// Responder URL (e.g. http://localhost:2560)
+        #[arg(long)]
+        url: String,
+        /// Hex-encoded serial number
+        #[arg(long)]
+        serial: String,
+        /// Base64-encoded DER issuer name
+        #[arg(long)]
+        issuer_name_b64: String,
+        /// Base64-encoded issuer public key bytes
+        #[arg(long)]
+        issuer_key_b64: String,
+        /// Preferred signature algorithms (comma-separated, e.g. "ml-dsa-87,ecdsa-p256")
+        #[arg(long)]
+        prefer: Option<String>,
     },
     /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
     Import {
@@ -110,6 +138,9 @@ fn main() {
             issuer_name_b64,
             issuer_key_b64,
             signing_key,
+            seal_key,
+            dual_alg,
+            pq_signing_key,
             demo_key,
         } => {
             run_sign(
@@ -123,8 +154,20 @@ fn main() {
                 issuer_name_b64,
                 issuer_key_b64,
                 signing_key,
+                seal_key,
+                dual_alg,
+                pq_signing_key,
                 demo_key,
             );
+        }
+        Commands::Query {
+            url,
+            serial,
+            issuer_name_b64,
+            issuer_key_b64,
+            prefer,
+        } => {
+            run_query(url, serial, issuer_name_b64, issuer_key_b64, prefer);
         }
         Commands::Import {
             bundle,
@@ -398,55 +441,116 @@ fn run_signer_pass_with_sources(
 
         let bundle_path = config.storage.bundle_dir.join(format!("{}.ahu", ca_config.label));
 
-        let bundle_bytes = match &ca_config.signing_key {
-            Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                let mut signing_key = hoike_sign::load_ecdsa_p256_key(path)
-                    .map_err(|e| format!("signing key: {e}"))?;
-                let sk = seal_key.clone();
-                let sc = seal_cert_der.clone();
-                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                    &ca, &snapshot, &gen_config, &mut signing_key,
-                    move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                    responder_cert_der.as_deref(),
-                )
+        let bundle_bytes = if ca_config.is_ml_dsa() {
+            match &ca_config.signing_key {
+                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+                    let mut v = hoike_sign::load_ml_dsa_key(path)
+                        .map_err(|e| format!("signing key: {e}"))?;
+                    if v.algorithm_name() != ca_config.sig_alg {
+                        return Err(format!(
+                            "CA '{}': key is {} but sig_alg is {}",
+                            ca_config.label, v.algorithm_name(), ca_config.sig_alg
+                        ));
+                    }
+                    info!(ca = ca_config.label, key = %path.display(), alg = v.algorithm_name(), "using file-based ML-DSA signing key");
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    v.sign_bundle(
+                        &ca, &snapshot, &gen_config,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                Some(hoike_core::config::SigningKeyConfig::Demo) => {
+                    warn!(ca = ca_config.label, "using demo ML-DSA key — NOT FOR PRODUCTION");
+                    let mut v = hoike_sign::MlDsaSignerVariant::demo(&ca_config.sig_alg)
+                        .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    v.sign_bundle(
+                        &ca, &snapshot, &gen_config,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                #[cfg(feature = "pkcs11")]
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
+                    let (param_set, oid) = ml_dsa_pkcs11_params(&ca_config.sig_alg)?;
+                    let inner = hoike_sign::Pkcs11MlDsaSigner::new(&pkcs11_config, param_set, oid)
+                        .map_err(|e| format!("PKCS#11 ML-DSA init: {e}"))?;
+                    let mut bridge = hoike_sign::Pkcs11MlDsaSignerBridge::new(inner);
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11MlDsaSignature>(
+                        &ca, &snapshot, &gen_config, &mut bridge,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc)
+                            .map_err(|e| hoike_sign::SignError::Seal(e.to_string())),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                #[cfg(not(feature = "pkcs11"))]
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                    return Err(format!(
+                        "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
+                        ca_config.label
+                    ));
+                }
+                None => {
+                    return Err(format!("CA '{}': no signing_key configured", ca_config.label));
+                }
             }
-            #[cfg(feature = "pkcs11")]
-            Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                let pkcs11_config = resolve_pkcs11_config(ca_config)?;
-                let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
-                    .map_err(|e| format!("PKCS#11 init: {e}"))?;
-                let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
-                let sk = seal_key.clone();
-                let sc = seal_cert_der.clone();
-                hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
-                    &ca, &snapshot, &gen_config, &mut bridge,
-                    move |m| {
-                        hoike_sign::create_cms_seal(m, &sk, &sc)
-                            .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
-                    },
-                    responder_cert_der.as_deref(),
-                )
-            }
-            #[cfg(not(feature = "pkcs11"))]
-            Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                return Err(format!(
-                    "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
-                    ca_config.label
-                ));
-            }
-            Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
-                let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
-                let sk = seal_key.clone();
-                let sc = seal_cert_der.clone();
-                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                    &ca, &snapshot, &gen_config, &mut signing_key,
-                    move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                    responder_cert_der.as_deref(),
-                )
-            }
-            None => {
-                return Err(format!("CA '{}': no signing_key configured", ca_config.label));
+        } else {
+            match &ca_config.signing_key {
+                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+                    let mut signing_key = hoike_sign::load_ecdsa_p256_key(path)
+                        .map_err(|e| format!("signing key: {e}"))?;
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                        &ca, &snapshot, &gen_config, &mut signing_key,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                #[cfg(feature = "pkcs11")]
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
+                    let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
+                        .map_err(|e| format!("PKCS#11 init: {e}"))?;
+                    let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
+                        &ca, &snapshot, &gen_config, &mut bridge,
+                        move |m| {
+                            hoike_sign::create_cms_seal(m, &sk, &sc)
+                                .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
+                        },
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                #[cfg(not(feature = "pkcs11"))]
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                    return Err(format!(
+                        "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
+                        ca_config.label
+                    ));
+                }
+                Some(hoike_core::config::SigningKeyConfig::Demo) => {
+                    warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
+                    let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                        &ca, &snapshot, &gen_config, &mut signing_key,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                None => {
+                    return Err(format!("CA '{}': no signing_key configured", ca_config.label));
+                }
             }
         }
         .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
@@ -564,79 +668,125 @@ fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), Strin
         // Load seal key and cert for CMS sealing
         let (seal_key, seal_cert_der) = load_seal_materials(ca_config)?;
 
-        let bundle_bytes = match &ca_config.signing_key {
-            Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                let mut signer = hoike_sign::load_ecdsa_p256_key(path)
-                    .map_err(|e| format!("load signing key: {e}"))?;
-                info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
-                let sk = seal_key.clone();
-                let sc = seal_cert_der.clone();
-                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                    &ca,
-                    &snapshot,
-                    &gen_config,
-                    &mut signer,
-                    move |m| {
-                        hoike_sign::create_cms_seal(m, &sk, &sc)
-                    },
-                    responder_cert_der.as_deref(),
-                )
-            }
-            Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                // PKCS#11 signing requires the `pkcs11` feature at compile time
-                #[cfg(feature = "pkcs11")]
-                {
-                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
-                    let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
-                        .map_err(|e| format!("PKCS#11 init: {e}"))?;
-                    let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
+        let bundle_bytes = if ca_config.is_ml_dsa() {
+            match &ca_config.signing_key {
+                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+                    let mut v = hoike_sign::load_ml_dsa_key(path)
+                        .map_err(|e| format!("load signing key: {e}"))?;
+                    if v.algorithm_name() != ca_config.sig_alg {
+                        return Err(format!(
+                            "CA '{}': key is {} but sig_alg is {}",
+                            ca_config.label, v.algorithm_name(), ca_config.sig_alg
+                        ));
+                    }
+                    info!(ca = ca_config.label, key = %path.display(), alg = v.algorithm_name(), "using file-based ML-DSA signing key");
                     let sk = seal_key.clone();
                     let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
-                        &ca,
-                        &snapshot,
-                        &gen_config,
-                        &mut bridge,
-                        move |m| {
-                            hoike_sign::create_cms_seal(m, &sk, &sc)
-                                .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
-                        },
+                    v.sign_bundle(
+                        &ca, &snapshot, &gen_config,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                Some(hoike_core::config::SigningKeyConfig::Demo) => {
+                    warn!(ca = ca_config.label, "using demo ML-DSA key — NOT FOR PRODUCTION");
+                    let mut v = hoike_sign::MlDsaSignerVariant::demo(&ca_config.sig_alg)
+                        .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    v.sign_bundle(
+                        &ca, &snapshot, &gen_config,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                #[cfg(feature = "pkcs11")]
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
+                    let (param_set, oid) = ml_dsa_pkcs11_params(&ca_config.sig_alg)?;
+                    let inner = hoike_sign::Pkcs11MlDsaSigner::new(&pkcs11_config, param_set, oid)
+                        .map_err(|e| format!("PKCS#11 ML-DSA init: {e}"))?;
+                    let mut bridge = hoike_sign::Pkcs11MlDsaSignerBridge::new(inner);
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11MlDsaSignature>(
+                        &ca, &snapshot, &gen_config, &mut bridge,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc)
+                            .map_err(|e| hoike_sign::SignError::Seal(e.to_string())),
                         responder_cert_der.as_deref(),
                     )
                 }
                 #[cfg(not(feature = "pkcs11"))]
-                {
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
                     return Err(format!(
-                        "CA '{}' requires PKCS#11 signing but hoike was built without the 'pkcs11' feature. \
-                         Rebuild with: cargo build --features pkcs11",
+                        "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
+                        ca_config.label
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "CA '{}' has no signing_key configured.",
                         ca_config.label
                     ));
                 }
             }
-            Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                warn!(
-                    ca = ca_config.label,
-                    "using ephemeral demo signing key — NOT FOR PRODUCTION"
-                );
-                let mut signer = hoike_sign::demo_ecdsa_p256_key();
-                let sk = seal_key.clone();
-                let sc = seal_cert_der.clone();
-                hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                    &ca,
-                    &snapshot,
-                    &gen_config,
-                    &mut signer,
-                    move |m| {
-                        hoike_sign::create_cms_seal(m, &sk, &sc)
-                    },
-                    responder_cert_der.as_deref(),
-                )
-            }
-            None => {
-                return Err(format!(
-                    "CA '{}' has no signing_key configured. Add [ca.signing_key] to config.",
-                    ca_config.label
-                ));
+        } else {
+            match &ca_config.signing_key {
+                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
+                    let mut signer = hoike_sign::load_ecdsa_p256_key(path)
+                        .map_err(|e| format!("load signing key: {e}"))?;
+                    info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                        &ca, &snapshot, &gen_config, &mut signer,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
+                    #[cfg(feature = "pkcs11")]
+                    {
+                        let pkcs11_config = resolve_pkcs11_config(ca_config)?;
+                        let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
+                            .map_err(|e| format!("PKCS#11 init: {e}"))?;
+                        let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
+                        let sk = seal_key.clone();
+                        let sc = seal_cert_der.clone();
+                        hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
+                            &ca, &snapshot, &gen_config, &mut bridge,
+                            move |m| {
+                                hoike_sign::create_cms_seal(m, &sk, &sc)
+                                    .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
+                            },
+                            responder_cert_der.as_deref(),
+                        )
+                    }
+                    #[cfg(not(feature = "pkcs11"))]
+                    {
+                        return Err(format!(
+                            "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
+                            ca_config.label
+                        ));
+                    }
+                }
+                Some(hoike_core::config::SigningKeyConfig::Demo) => {
+                    warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
+                    let mut signer = hoike_sign::demo_ecdsa_p256_key();
+                    let sk = seal_key.clone();
+                    let sc = seal_cert_der.clone();
+                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                        &ca, &snapshot, &gen_config, &mut signer,
+                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
+                        responder_cert_der.as_deref(),
+                    )
+                }
+                None => {
+                    return Err(format!(
+                        "CA '{}' has no signing_key configured.",
+                        ca_config.label
+                    ));
+                }
             }
         }
         .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
@@ -802,6 +952,15 @@ fn load_responder_cert(
             if data.starts_with(b"-----BEGIN") {
                 let pem_str = String::from_utf8(data)
                     .map_err(|e| format!("responder cert PEM is not valid UTF-8: {e}"))?;
+                // Validate the PEM label — reject non-certificate files
+                let first_line = pem_str.lines().next().unwrap_or("");
+                if !first_line.contains("CERTIFICATE") {
+                    return Err(format!(
+                        "responder cert '{}' has unexpected PEM label: {} — expected CERTIFICATE",
+                        path.display(),
+                        first_line.trim()
+                    ));
+                }
                 use base64::Engine;
                 let mut b64 = String::new();
                 for line in pem_str.lines() {
@@ -823,33 +982,45 @@ fn load_responder_cert(
 }
 
 /// Load seal key and certificate for CMS bundle sealing.
-/// Falls back to the OCSP signing key if no seal_key is configured.
+/// Falls back to the OCSP signing key if no seal_key is configured and the
+/// signing key is ECDSA P-256. For ML-DSA signing keys (which are not P-256),
+/// falls back to a demo seal key with a warning.
 fn load_seal_materials(
     ca_config: &hoike_core::config::CaConfig,
-) -> std::result::Result<(p256::ecdsa::SigningKey, Vec<u8>), String> {
+) -> std::result::Result<(hoike_sign::SealKey, Vec<u8>), String> {
     let seal_key = if let Some(path) = &ca_config.seal_key {
-        hoike_sign::load_ecdsa_p256_key(path)
-            .map_err(|e| format!("load seal key: {e}"))?
-    } else if let Some(hoike_core::config::SigningKeyConfig::File { path }) = &ca_config.signing_key
-    {
-        warn!(
-            ca = ca_config.label,
-            "using OCSP signing key as seal key — configure seal_key for production"
-        );
-        hoike_sign::load_ecdsa_p256_key(path)
-            .map_err(|e| format!("load signing key for seal: {e}"))?
+        let ecdsa_key = hoike_sign::load_ecdsa_p256_key(path)
+            .map_err(|e| format!("load seal key: {e}"))?;
+        hoike_sign::SealKey::EcdsaP256(ecdsa_key)
+    } else if !ca_config.is_ml_dsa() {
+        if let Some(hoike_core::config::SigningKeyConfig::File { path }) = &ca_config.signing_key {
+            warn!(
+                ca = ca_config.label,
+                "using OCSP signing key as seal key — configure seal_key for production"
+            );
+            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(path)
+                .map_err(|e| format!("load signing key for seal: {e}"))?;
+            hoike_sign::SealKey::EcdsaP256(ecdsa_key)
+        } else {
+            warn!(
+                ca = ca_config.label,
+                "no seal_key configured — generating ephemeral seal key"
+            );
+            hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
+        }
     } else {
         warn!(
             ca = ca_config.label,
-            "no seal_key configured — generating ephemeral seal key"
+            "ML-DSA signing key cannot be used as P-256 seal key — \
+             configure seal_key for production; using ephemeral seal key"
         );
-        hoike_sign::demo_ecdsa_p256_key()
+        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
     };
 
     let seal_cert_der = if let Some(path) = &ca_config.seal_cert {
         std::fs::read(path).map_err(|e| format!("read seal cert: {e}"))?
     } else {
-        hoike_sign::generate_seal_cert(&seal_key)
+        hoike_sign::generate_seal_cert_for_key(&seal_key)
             .map_err(|e| format!("generate seal cert: {e}"))?
     };
 
@@ -906,6 +1077,223 @@ fn load_live_signer(
         validity_secs: ca.validity_secs,
         responder_cert_der,
     })
+}
+
+fn run_query(
+    url: String,
+    serial_hex: String,
+    issuer_name_b64: String,
+    issuer_key_b64: String,
+    prefer: Option<String>,
+) {
+    use base64::Engine;
+    use der::{Decode, Encode, asn1::OctetString};
+    use sha2::{Digest, Sha256};
+
+
+    let issuer_name_der = base64::engine::general_purpose::STANDARD
+        .decode(&issuer_name_b64)
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid issuer_name_b64: {e}");
+            std::process::exit(1);
+        });
+    let issuer_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&issuer_key_b64)
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid issuer_key_b64: {e}");
+            std::process::exit(1);
+        });
+    let serial_bytes = hex::decode(&serial_hex).unwrap_or_else(|e| {
+        eprintln!("Invalid serial hex: {e}");
+        std::process::exit(1);
+    });
+
+    let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+    let name_hash = Sha256::digest(&issuer_name_der);
+    let key_hash = Sha256::digest(&issuer_key_bytes);
+
+    let cert_id = x509_ocsp::CertId {
+        hash_algorithm: spki::AlgorithmIdentifierOwned {
+            oid: sha256_oid,
+            parameters: Some(der::asn1::Any::from(der::asn1::Null)),
+        },
+        issuer_name_hash: OctetString::new(name_hash.to_vec()).unwrap(),
+        issuer_key_hash: OctetString::new(key_hash.to_vec()).unwrap(),
+        serial_number: x509_cert::serial_number::SerialNumber::new(&serial_bytes)
+            .unwrap_or_else(|e| {
+                eprintln!("Invalid serial: {e}");
+                std::process::exit(1);
+            }),
+    };
+
+    let request_item = x509_ocsp::Request {
+        req_cert: cert_id,
+        single_request_extensions: None,
+    };
+
+    let mut request_extensions = Vec::new();
+
+    if let Some(prefer_str) = &prefer {
+        let pref_ext_der = build_preferred_sig_algs_extension(prefer_str);
+        let pref_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.8");
+        request_extensions.push(x509_cert::ext::Extension {
+            extn_id: pref_oid,
+            critical: false,
+            extn_value: OctetString::new(pref_ext_der).unwrap(),
+        });
+    }
+
+    let tbs = x509_ocsp::TbsRequest {
+        version: Default::default(),
+        requestor_name: None,
+        request_list: vec![request_item],
+        request_extensions: if request_extensions.is_empty() {
+            None
+        } else {
+            Some(request_extensions)
+        },
+    };
+    let ocsp_request = x509_ocsp::OcspRequest {
+        tbs_request: tbs,
+        optional_signature: None,
+    };
+
+    let request_der = ocsp_request.to_der().unwrap_or_else(|e| {
+        eprintln!("Failed to encode OcspRequest: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Sending OCSP request to {url}");
+    println!("  Serial:    {serial_hex}");
+    println!("  Request:   {} bytes", request_der.len());
+    if let Some(p) = &prefer {
+        println!("  Prefer:    {p}");
+    }
+
+    let response = ureq::post(&url)
+        .header("Content-Type", "application/ocsp-request")
+        .send(&request_der);
+
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.into_body().read_to_vec().unwrap_or_else(|e| {
+                eprintln!("Failed to read response body: {e}");
+                std::process::exit(1);
+            });
+
+            println!("\n── Response ──");
+            println!("  HTTP status: {status}");
+            println!("  Body size:   {} bytes", body.len());
+
+            match x509_ocsp::OcspResponse::from_der(&body) {
+                Ok(ocsp_resp) => {
+                    println!(
+                        "  OCSP status: {:?}",
+                        ocsp_resp.response_status
+                    );
+                    if let Some(resp_bytes) = &ocsp_resp.response_bytes {
+                        match x509_ocsp::BasicOcspResponse::from_der(
+                            resp_bytes.response.as_bytes(),
+                        ) {
+                            Ok(basic) => {
+                                let alg_oid = basic.signature_algorithm.oid.to_string();
+                                let sig_len = basic.signature.raw_bytes().len();
+                                let alg_name = match alg_oid.as_str() {
+                                    "1.2.840.10045.4.3.2" => "ecdsa-p256-sha256",
+                                    "2.16.840.1.101.3.4.3.17" => "ml-dsa-44",
+                                    "2.16.840.1.101.3.4.3.18" => "ml-dsa-65",
+                                    "2.16.840.1.101.3.4.3.19" => "ml-dsa-87",
+                                    other => other,
+                                };
+                                println!("  Algorithm:   {alg_name}");
+                                println!("  Signature:   {sig_len} bytes");
+                                let resp_count = basic.tbs_response_data.responses.len();
+                                println!("  Responses:   {resp_count}");
+                            }
+                            Err(e) => {
+                                eprintln!("  Failed to parse BasicOcspResponse: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Failed to parse OcspResponse: {e}");
+                    eprintln!("  Raw (hex): {}", hex::encode(&body));
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("HTTP request failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the DER-encoded PreferredSignatureAlgorithms extension value.
+///
+/// Uses the same `#[derive(der::Sequence)]` struct used for parsing in
+/// hoike-core, ensuring encode/decode symmetry. RFC 6960 §4.4.7.1.
+fn build_preferred_sig_algs_extension(prefer_str: &str) -> Vec<u8> {
+    use der::Encode;
+
+    #[derive(der::Sequence)]
+    struct PreferredSignatureAlgorithm {
+        sig_identifier: spki::AlgorithmIdentifierOwned,
+    }
+
+    let alg_ids: Vec<PreferredSignatureAlgorithm> = prefer_str
+        .split(',')
+        .map(|alg| {
+            let (oid_str, params) = match alg.trim() {
+                // ECDSA-with-SHA256 requires parameters = NULL per RFC 5754 §3.2
+                "ecdsa-p256" => (
+                    "1.2.840.10045.4.3.2",
+                    Some(der::asn1::Any::from(der::asn1::Null)),
+                ),
+                // ML-DSA algorithms: parameters absent per RFC 9881 §9
+                "ml-dsa-44" => ("2.16.840.1.101.3.4.3.17", None),
+                "ml-dsa-65" => ("2.16.840.1.101.3.4.3.18", None),
+                "ml-dsa-87" => ("2.16.840.1.101.3.4.3.19", None),
+                other => {
+                    eprintln!("Unknown algorithm for --prefer: {other}");
+                    std::process::exit(1);
+                }
+            };
+            PreferredSignatureAlgorithm {
+                sig_identifier: spki::AlgorithmIdentifierOwned {
+                    oid: const_oid::ObjectIdentifier::new_unwrap(oid_str),
+                    parameters: params,
+                },
+            }
+        })
+        .collect();
+
+    alg_ids.to_der().unwrap_or_else(|e| {
+        eprintln!("Failed to encode PreferredSignatureAlgorithms: {e}");
+        std::process::exit(1);
+    })
+}
+
+#[cfg(feature = "pkcs11")]
+fn ml_dsa_pkcs11_params(
+    sig_alg: &str,
+) -> std::result::Result<(cryptoki::object::MlDsaParameterSetType, &'static str), String> {
+    match sig_alg {
+        "ml-dsa-44" => Ok((
+            cryptoki::object::MlDsaParameterSetType::ML_DSA_44,
+            hoike_sign::ML_DSA_44_OID,
+        )),
+        "ml-dsa-65" => Ok((
+            cryptoki::object::MlDsaParameterSetType::ML_DSA_65,
+            hoike_sign::ML_DSA_65_OID,
+        )),
+        "ml-dsa-87" => Ok((
+            cryptoki::object::MlDsaParameterSetType::ML_DSA_87,
+            hoike_sign::ML_DSA_87_OID,
+        )),
+        other => Err(format!("unknown ML-DSA variant for PKCS#11: {other}")),
+    }
 }
 
 fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
@@ -1085,6 +1473,9 @@ fn run_sign(
     issuer_name_b64: Option<String>,
     issuer_key_b64: Option<String>,
     signing_key_path: Option<PathBuf>,
+    seal_key_path: Option<PathBuf>,
+    dual_alg: Option<String>,
+    pq_signing_key_path: Option<PathBuf>,
     demo_key: bool,
 ) {
     use hoike_sign::{
@@ -1215,17 +1606,38 @@ fn run_sign(
         ..Default::default()
     };
 
-    // For CLI signing, use the OCSP signing key as the seal key too.
+    // Seal key resolution: --seal-key > ECDSA signing key fallback > demo key.
     // In production, the seal key should be separate (per ahu spec §2.3).
-    let cli_seal_key = if let Some(key_path) = &signing_key_path {
-        hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
-            eprintln!("Failed to load seal key: {e}");
+    let is_ml_dsa = matches!(sig_alg.as_str(), "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87");
+    let cli_seal_key: hoike_sign::SealKey = if let Some(seal_path) = &seal_key_path {
+        let ecdsa_key = hoike_sign::load_ecdsa_p256_key(seal_path).unwrap_or_else(|e| {
+            eprintln!("Failed to load seal key from {}: {e}", seal_path.display());
             std::process::exit(1);
-        })
+        });
+        hoike_sign::SealKey::EcdsaP256(ecdsa_key)
+    } else if !is_ml_dsa {
+        if let Some(key_path) = &signing_key_path {
+            warn!(
+                "using OCSP signing key as seal key — provide --seal-key for production"
+            );
+            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+                eprintln!("Failed to load seal key: {e}");
+                std::process::exit(1);
+            });
+            hoike_sign::SealKey::EcdsaP256(ecdsa_key)
+        } else {
+            hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
+        }
+    } else if signing_key_path.is_some() {
+        warn!(
+            "ML-DSA signing key cannot be used as P-256 seal key — \
+             provide --seal-key for production use"
+        );
+        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
     } else {
-        hoike_sign::demo_ecdsa_p256_key()
+        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
     };
-    let cli_seal_cert = hoike_sign::generate_seal_cert(&cli_seal_key).unwrap_or_else(|e| {
+    let cli_seal_cert = hoike_sign::generate_seal_cert_for_key(&cli_seal_key).unwrap_or_else(|e| {
         eprintln!("Failed to generate seal cert: {e}");
         std::process::exit(1);
     });
@@ -1233,7 +1645,69 @@ fn run_sign(
         hoike_sign::create_cms_seal(m, &cli_seal_key, &cli_seal_cert)
     };
 
-    let bundle_bytes = match sig_alg.as_str() {
+    let bundle_bytes = if let Some(pq_alg) = &dual_alg {
+        let disc_pq = match pq_alg.as_str() {
+            "ml-dsa-44" => ahu::ALG_DISC_ML_DSA_44,
+            "ml-dsa-65" => ahu::ALG_DISC_ML_DSA_65,
+            "ml-dsa-87" => ahu::ALG_DISC_ML_DSA_87,
+            other => {
+                eprintln!("Unknown --dual-alg: {other}");
+                std::process::exit(1);
+            }
+        };
+        let mut ecdsa_signer = if let Some(key_path) = &signing_key_path {
+            hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+                eprintln!("Failed to load classical signing key: {e}");
+                std::process::exit(1);
+            })
+        } else if demo_key {
+            warn!("using ephemeral ECDSA demo key — NOT FOR PRODUCTION");
+            hoike_sign::demo_ecdsa_p256_key()
+        } else {
+            eprintln!("--dual-alg requires --signing-key (classical) or --demo-key");
+            std::process::exit(1);
+        };
+        let mut pq_signer = if let Some(pq_path) = &pq_signing_key_path {
+            let v = hoike_sign::load_ml_dsa_key(pq_path).unwrap_or_else(|e| {
+                eprintln!("Failed to load PQ signing key: {e}");
+                std::process::exit(1);
+            });
+            if v.algorithm_name() != pq_alg.as_str() {
+                eprintln!(
+                    "PQ key is {} but --dual-alg is {}",
+                    v.algorithm_name(), pq_alg
+                );
+                std::process::exit(1);
+            }
+            v
+        } else if demo_key {
+            warn!("using ephemeral ML-DSA demo key — NOT FOR PRODUCTION");
+            hoike_sign::MlDsaSignerVariant::demo(pq_alg).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            })
+        } else {
+            eprintln!("--dual-alg requires --pq-signing-key or --demo-key");
+            std::process::exit(1);
+        };
+        match &mut pq_signer {
+            hoike_sign::MlDsaSignerVariant::MlDsa44(s) => {
+                hoike_sign::produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, hoike_sign::MlDsaSignatureBytes>(
+                    &ca, &snapshot, &config, &mut ecdsa_signer, s, disc_pq, seal_fn, None, None,
+                )
+            }
+            hoike_sign::MlDsaSignerVariant::MlDsa65(s) => {
+                hoike_sign::produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, hoike_sign::MlDsaSignatureBytes>(
+                    &ca, &snapshot, &config, &mut ecdsa_signer, s, disc_pq, seal_fn, None, None,
+                )
+            }
+            hoike_sign::MlDsaSignerVariant::MlDsa87(s) => {
+                hoike_sign::produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, hoike_sign::MlDsaSignatureBytes>(
+                    &ca, &snapshot, &config, &mut ecdsa_signer, s, disc_pq, seal_fn, None, None,
+                )
+            }
+        }
+    } else { match sig_alg.as_str() {
         "ecdsa-p256" => {
             let mut signer = if let Some(key_path) = &signing_key_path {
                 hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
@@ -1257,36 +1731,40 @@ fn run_sign(
             )
         }
         "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87" => {
-            if !demo_key {
-                eprintln!("ML-DSA key loading from file is not yet supported.");
-                eprintln!("Use --demo-key for testing, or use --sig-alg ecdsa-p256 with --signing-key for production.");
+            let mut variant = if let Some(key_path) = &signing_key_path {
+                let v = hoike_sign::load_ml_dsa_key(key_path).unwrap_or_else(|e| {
+                    eprintln!("Failed to load ML-DSA signing key: {e}");
+                    std::process::exit(1);
+                });
+                if v.algorithm_name() != sig_alg {
+                    eprintln!(
+                        "Key algorithm mismatch: key is {} but --sig-alg is {}",
+                        v.algorithm_name(),
+                        sig_alg
+                    );
+                    std::process::exit(1);
+                }
+                info!(
+                    ca = ca_label,
+                    key = %key_path.display(),
+                    alg = v.algorithm_name(),
+                    "using file-based ML-DSA signing key"
+                );
+                v
+            } else if demo_key {
+                warn!("using ephemeral ML-DSA demo key — NOT FOR PRODUCTION");
+                hoike_sign::MlDsaSignerVariant::demo(&sig_alg).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                })
+            } else {
+                eprintln!(
+                    "No signing key provided. Use --signing-key <path> for a PKCS#8 key file, \
+                     or --demo-key for testing."
+                );
                 std::process::exit(1);
-            }
-            warn!("using ephemeral ML-DSA demo key — NOT FOR PRODUCTION");
-            let mut seed = [0u8; 32];
-            use rand_core::RngCore;
-            rand_core::OsRng.fill_bytes(&mut seed);
-            match sig_alg.as_str() {
-                "ml-dsa-44" => {
-                    let mut signer = hoike_sign::ml_dsa_44_signer(&seed);
-                    hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                        &ca, &snapshot, &config, &mut signer, seal_fn, None,
-                    )
-                }
-                "ml-dsa-65" => {
-                    let mut signer = hoike_sign::ml_dsa_65_signer(&seed);
-                    hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                        &ca, &snapshot, &config, &mut signer, seal_fn, None,
-                    )
-                }
-                "ml-dsa-87" => {
-                    let mut signer = hoike_sign::ml_dsa_87_signer(&seed);
-                    hoike_sign::produce_bundle::<_, hoike_sign::MlDsaSignatureBytes>(
-                        &ca, &snapshot, &config, &mut signer, seal_fn, None,
-                    )
-                }
-                _ => unreachable!(),
-            }
+            };
+            variant.sign_bundle(&ca, &snapshot, &config, seal_fn, None)
         }
         other => {
             eprintln!(
@@ -1294,7 +1772,7 @@ fn run_sign(
             );
             std::process::exit(1);
         }
-    }
+    } }
     .unwrap_or_else(|e| {
         eprintln!("Failed to produce bundle: {e}");
         std::process::exit(1);

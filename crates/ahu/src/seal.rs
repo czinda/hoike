@@ -130,11 +130,19 @@ mod verify_impl {
         None
     }
 
+    const ID_ECDSA_SHA256_V: der::asn1::ObjectIdentifier =
+        der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    const ID_ML_DSA_44_V: der::asn1::ObjectIdentifier =
+        der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17");
+    const ID_ML_DSA_65_V: der::asn1::ObjectIdentifier =
+        der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.18");
+    const ID_ML_DSA_87_V: der::asn1::ObjectIdentifier =
+        der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
+
     fn verify_signature(
         signer_info: &cms::signed_data::SignerInfo,
         cert: &x509_cert::certificate::Certificate,
     ) -> Result<bool> {
-        // Get the signed attributes DER
         let signed_attrs = signer_info
             .signed_attrs
             .as_ref()
@@ -144,27 +152,59 @@ mod verify_impl {
             .to_der()
             .map_err(|e| AhuError::SealInvalid(format!("encode signed attrs: {e}")))?;
 
-        // Hash the signed attributes (the signer signed this hash)
-        let attrs_hash = Sha256::digest(&attrs_der);
-
-        // Extract the public key from the certificate
         let spki = cert.tbs_certificate().subject_public_key_info();
         let pub_key_bytes = spki
             .subject_public_key
             .as_bytes()
             .ok_or_else(|| AhuError::SealInvalid("no public key bits".into()))?;
 
-        let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(pub_key_bytes)
-            .map_err(|e| AhuError::SealInvalid(format!("parse public key: {e}")))?;
-
-        // Parse the DER-encoded ECDSA signature
         let sig_bytes = signer_info.signature.as_bytes();
-        let signature = p256::ecdsa::DerSignature::from_bytes(sig_bytes)
-            .map_err(|e| AhuError::SealInvalid(format!("parse signature: {e}")))?;
+        let sig_alg_oid = signer_info.signature_algorithm.oid;
 
-        // Verify: the signer prehashed the attrs, so we verify against the hash
+        if sig_alg_oid == ID_ECDSA_SHA256_V {
+            verify_ecdsa_seal(&attrs_der, sig_bytes, pub_key_bytes)
+        } else if sig_alg_oid == ID_ML_DSA_44_V {
+            verify_ml_dsa_seal::<ml_dsa::MlDsa44>(&attrs_der, sig_bytes, pub_key_bytes)
+        } else if sig_alg_oid == ID_ML_DSA_65_V {
+            verify_ml_dsa_seal::<ml_dsa::MlDsa65>(&attrs_der, sig_bytes, pub_key_bytes)
+        } else if sig_alg_oid == ID_ML_DSA_87_V {
+            verify_ml_dsa_seal::<ml_dsa::MlDsa87>(&attrs_der, sig_bytes, pub_key_bytes)
+        } else {
+            Err(AhuError::SealInvalid(format!(
+                "unsupported seal signature algorithm: {sig_alg_oid}"
+            )))
+        }
+    }
+
+    fn verify_ecdsa_seal(attrs_der: &[u8], sig_bytes: &[u8], pub_key_bytes: &[u8]) -> Result<bool> {
+        let attrs_hash = Sha256::digest(attrs_der);
+
+        let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(pub_key_bytes)
+            .map_err(|e| AhuError::SealInvalid(format!("parse P-256 public key: {e}")))?;
+
+        let signature = p256::ecdsa::DerSignature::from_bytes(sig_bytes)
+            .map_err(|e| AhuError::SealInvalid(format!("parse ECDSA signature: {e}")))?;
+
         use p256::ecdsa::signature::hazmat::PrehashVerifier;
         match verifying_key.verify_prehash(&attrs_hash, &signature) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn verify_ml_dsa_seal<P>(attrs_der: &[u8], sig_bytes: &[u8], pub_key_bytes: &[u8]) -> Result<bool>
+    where
+        P: ml_dsa::MlDsaParams,
+    {
+        let encoded = ml_dsa::EncodedVerifyingKey::<P>::try_from(pub_key_bytes)
+            .map_err(|_| AhuError::SealInvalid("invalid ML-DSA public key size".into()))?;
+        let vk = ml_dsa::VerifyingKey::<P>::decode(&encoded);
+
+        let sig = ml_dsa::Signature::<P>::try_from(sig_bytes)
+            .map_err(|_| AhuError::SealInvalid("invalid ML-DSA signature".into()))?;
+
+        use ml_dsa::Verifier;
+        match vk.verify(attrs_der, &sig) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }

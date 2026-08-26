@@ -105,7 +105,7 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
 
     let has_nonce = parsed.nonce.is_some();
 
-    match state.responder.lookup(cert_id) {
+    match state.responder.lookup(cert_id, &parsed.preferred_sig_algs) {
         Some(result) => {
             // Nonce policy only matters when the request carries a nonce.
             if has_nonce {

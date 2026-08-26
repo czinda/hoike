@@ -72,7 +72,7 @@ fn build_delta_bundle(
     for (key, data) in entries {
         match data {
             Some(d) => builder.add_entry(*key, d.to_vec()),
-            None => builder.add_tombstone(*key),
+            None => builder.add_tombstone(*key, 0),
         }
     }
     let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();

@@ -153,7 +153,7 @@ fn delta_bundle_with_tombstone() {
     builder.add_entry(added_key, b"new-response".to_vec());
 
     let removed_key = compute_entry_key(b"revoked-cert");
-    builder.add_tombstone(removed_key);
+    builder.add_tombstone(removed_key, 0);
 
     let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap();
 

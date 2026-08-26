@@ -12,6 +12,9 @@ pub const MAX_REQUEST_SIZE: usize = 8192;
 pub struct ParsedRequest {
     pub cert_ids: Vec<ParsedCertId>,
     pub nonce: Option<Vec<u8>>,
+    /// Algorithm discriminators from the Preferred Signature Algorithms
+    /// request extension (RFC 6960 §4.4.7.1), in client preference order.
+    pub preferred_sig_algs: Vec<u16>,
 }
 
 /// A CertID extracted from a request, with its precomputed entry key
@@ -94,7 +97,78 @@ pub fn parse_ocsp_request(der_bytes: &[u8]) -> Result<ParsedRequest> {
         None => None,
     };
 
-    Ok(ParsedRequest { cert_ids, nonce })
+    let preferred_sig_algs = parse_preferred_sig_algs(tbs.request_extensions.as_ref());
+
+    Ok(ParsedRequest {
+        cert_ids,
+        nonce,
+        preferred_sig_algs,
+    })
+}
+
+/// RFC 6960 §4.4.7.1 PreferredSignatureAlgorithm.
+#[derive(der::Sequence)]
+struct PreferredSignatureAlgorithm<'a> {
+    sig_identifier: spki::AlgorithmIdentifierRef<'a>,
+    #[asn1(optional = "true")]
+    cert_identifier: Option<spki::AlgorithmIdentifierRef<'a>>,
+}
+
+/// Map a signature algorithm OID to its bundle discriminator.
+/// Compares OID bytes directly to avoid heap-allocating a String on the hot path.
+fn sig_oid_to_discriminator(oid: &const_oid::ObjectIdentifier) -> Option<u16> {
+    const ECDSA_SHA256: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    const ML_DSA_44: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17");
+    const ML_DSA_65: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.18");
+    const ML_DSA_87: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
+
+    if *oid == ECDSA_SHA256 {
+        Some(ahu::ALG_DISC_DEFAULT)
+    } else if *oid == ML_DSA_44 {
+        Some(ahu::ALG_DISC_ML_DSA_44)
+    } else if *oid == ML_DSA_65 {
+        Some(ahu::ALG_DISC_ML_DSA_65)
+    } else if *oid == ML_DSA_87 {
+        Some(ahu::ALG_DISC_ML_DSA_87)
+    } else {
+        None
+    }
+}
+
+fn parse_preferred_sig_algs(
+    extensions: Option<&x509_cert::ext::Extensions>,
+) -> Vec<u16> {
+    use der::Decode;
+
+    let pref_sig_algs_oid =
+        const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.8");
+
+    let ext = match extensions {
+        Some(exts) => match exts.iter().find(|e| e.extn_id == pref_sig_algs_oid) {
+            Some(e) => e,
+            None => return Vec::new(),
+        },
+        None => return Vec::new(),
+    };
+
+    let raw = ext.extn_value.as_bytes();
+
+    let prefs: Vec<PreferredSignatureAlgorithm<'_>> = match Vec::from_der(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("failed to parse PreferredSignatureAlgorithms: {e}");
+            return Vec::new();
+        }
+    };
+
+    prefs
+        .iter()
+        .filter_map(|p| sig_oid_to_discriminator(&p.sig_identifier.oid))
+        .collect()
 }
 
 /// Decode a GET request path into DER bytes.

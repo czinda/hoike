@@ -156,14 +156,264 @@ where
     let mut builder = BundleBuilder::new(manifest);
     let this_update = ocsp_time(now)?;
 
-    // Prepare all entries: (entry_keys, cert_id(s), single_response(s)) per serial
-    struct PreparedEntry {
-        entry_keys: Vec<[u8; 32]>,
-        single_responses: Vec<SingleResponse>,
+    let prepared = prepare_entries(
+        snapshot, config, &sha256_oid, &sha1_oid,
+        &issuer_name_hash_sha256, &issuer_key_hash_sha256,
+        &issuer_name_hash_sha1, &issuer_key_hash_sha1,
+        this_update, next_update_base,
+    )?;
+
+    sign_and_add_entries(
+        &mut builder, &prepared, config.bucket_size,
+        signer, &responder_id, responder_cert_der, produced_at, 0,
+    )?;
+
+    builder
+        .build(|manifest_bytes| {
+            seal_fn(manifest_bytes).map_err(|e| ahu::AhuError::Write(e.to_string()))
+        })
+        .map_err(SignError::Bundle)
+}
+
+/// Produce a dual-algorithm bundle containing both classical and post-quantum
+/// signed responses for every serial, indexed under the same entry keys with
+/// different discriminators.
+#[allow(clippy::too_many_arguments)]
+pub fn produce_dual_bundle<S1, Sig1, S2, Sig2>(
+    ca: &CaIdentity,
+    snapshot: &StatusSnapshot,
+    config: &GenerationConfig,
+    signer_classical: &mut S1,
+    signer_pq: &mut S2,
+    disc_pq: u16,
+    seal_fn: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+    responder_cert_classical: Option<&[u8]>,
+    responder_cert_pq: Option<&[u8]>,
+) -> Result<Vec<u8>>
+where
+    S1: Signer<Sig1> + DynSignatureAlgorithmIdentifier,
+    Sig1: SignatureBitStringEncoding,
+    S2: Signer<Sig2> + DynSignatureAlgorithmIdentifier,
+    Sig2: SignatureBitStringEncoding,
+{
+    let now = snapshot.this_update;
+    let next_update_base = now + config.validity_secs;
+    let produced_at = ocsp_time(now)?;
+
+    let issuer_name_hash_sha256 = Sha256::digest(&ca.issuer_name_der);
+    let issuer_key_hash_sha256 = Sha256::digest(&ca.issuer_key_bytes);
+    let issuer_name_hash_sha1 = Sha1::digest(&ca.issuer_name_der);
+    let issuer_key_hash_sha1 = Sha1::digest(&ca.issuer_key_bytes);
+
+    let responder_key_hash_classical = if let Some(cert_der) = responder_cert_classical {
+        extract_spki_key_hash(cert_der)?
+    } else {
+        Sha1::digest(&ca.issuer_key_bytes).to_vec()
+    };
+
+    let responder_key_hash_pq = if let Some(cert_der) = responder_cert_pq {
+        extract_spki_key_hash(cert_der)?
+    } else {
+        Sha1::digest(&ca.issuer_key_bytes).to_vec()
+    };
+
+    let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+    let sha1_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
+
+    let responder_chain_classical = responder_cert_classical.map(|cert| vec![cert.to_vec()]);
+    let responder_chain_pq = responder_cert_pq.map(|cert| vec![cert.to_vec()]);
+
+    let mut ca_scopes = vec![
+        ahu::CaScope {
+            hash_algorithm: sha256_oid.as_bytes().to_vec(),
+            issuer_name_hash: issuer_name_hash_sha256.to_vec(),
+            issuer_key_hash: issuer_key_hash_sha256.to_vec(),
+            epoch: config.epoch,
+            responder_id: AhuResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: responder_key_hash_classical.to_vec(),
+            },
+            responder_chain: responder_chain_classical.clone(),
+            signature_algorithm: vec![],
+            completeness: config.completeness,
+        },
+        ahu::CaScope {
+            hash_algorithm: sha256_oid.as_bytes().to_vec(),
+            issuer_name_hash: issuer_name_hash_sha256.to_vec(),
+            issuer_key_hash: issuer_key_hash_sha256.to_vec(),
+            epoch: config.epoch,
+            responder_id: AhuResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: responder_key_hash_pq.to_vec(),
+            },
+            responder_chain: responder_chain_pq.clone(),
+            signature_algorithm: vec![],
+            completeness: config.completeness,
+        },
+    ];
+
+    if matches!(
+        config.certid_compat,
+        CertIdCompat::Dual | CertIdCompat::Sha1Only
+    ) {
+        ca_scopes.push(ahu::CaScope {
+            hash_algorithm: sha1_oid.as_bytes().to_vec(),
+            issuer_name_hash: issuer_name_hash_sha1.to_vec(),
+            issuer_key_hash: issuer_key_hash_sha1.to_vec(),
+            epoch: config.epoch,
+            responder_id: AhuResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: responder_key_hash_classical.to_vec(),
+            },
+            responder_chain: responder_chain_classical,
+            signature_algorithm: vec![],
+            completeness: config.completeness,
+        });
+        ca_scopes.push(ahu::CaScope {
+            hash_algorithm: sha1_oid.as_bytes().to_vec(),
+            issuer_name_hash: issuer_name_hash_sha1.to_vec(),
+            issuer_key_hash: issuer_key_hash_sha1.to_vec(),
+            epoch: config.epoch,
+            responder_id: AhuResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: responder_key_hash_pq.to_vec(),
+            },
+            responder_chain: responder_chain_pq,
+            signature_algorithm: vec![],
+            completeness: config.completeness,
+        });
     }
 
-    let mut prepared: Vec<PreparedEntry> = Vec::with_capacity(snapshot.entries.len());
+    let manifest = Manifest {
+        format_version: 1,
+        bundle_id: uuid::Uuid::nil(),
+        producer_id: config.producer_id.clone(),
+        created_at: now,
+        bundle_type: BundleType::Full,
+        ca_scopes,
+        window: Window {
+            produced_at: now,
+            this_update_min: now,
+            next_update_min: next_update_base,
+            next_update_max: next_update_base + config.jitter_secs,
+        },
+        integrity: Integrity {
+            index_digest: [0; 32],
+            data_digest: [0; 32],
+        },
+        entry_count: 0,
+        continuity: Continuity {
+            prev_manifest_digest: None,
+            base_manifest_digest: None,
+            chain_length: 0,
+        },
+        shard: None,
+        compression: None,
+        extensions: None,
+    };
 
+    let mut builder = BundleBuilder::new(manifest);
+    let this_update = ocsp_time(now)?;
+
+    let prepared = prepare_entries(
+        snapshot, config, &sha256_oid, &sha1_oid,
+        &issuer_name_hash_sha256, &issuer_key_hash_sha256,
+        &issuer_name_hash_sha1, &issuer_key_hash_sha1,
+        this_update, next_update_base,
+    )?;
+
+    let responder_id_classical =
+        ResponderId::ByKey(OctetString::new(responder_key_hash_classical).map_err(SignError::Der)?);
+    let responder_id_pq =
+        ResponderId::ByKey(OctetString::new(responder_key_hash_pq).map_err(SignError::Der)?);
+
+    sign_and_add_entries(
+        &mut builder, &prepared, config.bucket_size,
+        signer_classical, &responder_id_classical,
+        responder_cert_classical, produced_at, 0,
+    )?;
+    sign_and_add_entries(
+        &mut builder, &prepared, config.bucket_size,
+        signer_pq, &responder_id_pq,
+        responder_cert_pq, produced_at, disc_pq,
+    )?;
+
+    builder
+        .build(|manifest_bytes| {
+            seal_fn(manifest_bytes).map_err(|e| ahu::AhuError::Write(e.to_string()))
+        })
+        .map_err(SignError::Bundle)
+}
+
+fn build_certid(
+    hash_oid: const_oid::ObjectIdentifier,
+    name_hash: &[u8],
+    key_hash: &[u8],
+    serial: x509_cert::serial_number::SerialNumber,
+) -> Result<CertId> {
+    Ok(CertId {
+        hash_algorithm: AlgorithmIdentifierOwned {
+            oid: hash_oid,
+            parameters: Some(Null.into()),
+        },
+        issuer_name_hash: OctetString::new(name_hash.to_vec()).map_err(SignError::Der)?,
+        issuer_key_hash: OctetString::new(key_hash.to_vec()).map_err(SignError::Der)?,
+        serial_number: serial,
+    })
+}
+
+/// Add multiple entry keys all pointing to the same response blob.
+/// Pairs consecutive keys via add_dual_entry so ALIAS dedup stores the
+/// data once. An odd key out gets a regular add_entry (one extra data copy
+/// per bucket — negligible vs the signature amortization savings).
+fn add_shared_entries(
+    builder: &mut BundleBuilder,
+    keys: &[[u8; 32]],
+    response_der: Vec<u8>,
+    discriminator: u16,
+) {
+    match keys.len() {
+        0 => {}
+        1 => {
+            builder.add_entry_with_discriminator(keys[0], discriminator, response_der);
+        }
+        2 => {
+            builder.add_dual_entry_with_discriminator(keys[0], keys[1], response_der, discriminator);
+        }
+        _ => {
+            let mut i = 0;
+            while i + 1 < keys.len() {
+                builder.add_dual_entry_with_discriminator(
+                    keys[i], keys[i + 1], response_der.clone(), discriminator,
+                );
+                i += 2;
+            }
+            if i < keys.len() {
+                builder.add_entry_with_discriminator(keys[i], discriminator, response_der);
+            }
+        }
+    }
+}
+
+struct PreparedEntry {
+    entry_keys: Vec<[u8; 32]>,
+    single_responses: Vec<SingleResponse>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_entries(
+    snapshot: &StatusSnapshot,
+    config: &GenerationConfig,
+    sha256_oid: &const_oid::ObjectIdentifier,
+    sha1_oid: &const_oid::ObjectIdentifier,
+    issuer_name_hash_sha256: &[u8],
+    issuer_key_hash_sha256: &[u8],
+    issuer_name_hash_sha1: &[u8],
+    issuer_key_hash_sha1: &[u8],
+    this_update: OcspGeneralizedTime,
+    next_update_base: u64,
+) -> Result<Vec<PreparedEntry>> {
+    let mut prepared = Vec::with_capacity(snapshot.entries.len());
     for (serial, status) in &snapshot.entries {
         let cert_status = match status {
             CertificateStatus::Good => CertStatus::good(),
@@ -195,9 +445,9 @@ where
         match config.certid_compat {
             CertIdCompat::Sha256Only => {
                 let cert_id = build_certid(
-                    sha256_oid,
-                    &issuer_name_hash_sha256,
-                    &issuer_key_hash_sha256,
+                    *sha256_oid,
+                    issuer_name_hash_sha256,
+                    issuer_key_hash_sha256,
                     serial_number,
                 )?;
                 let certid_der = cert_id.to_der().map_err(SignError::Der)?;
@@ -211,9 +461,9 @@ where
             }
             CertIdCompat::Sha1Only => {
                 let cert_id = build_certid(
-                    sha1_oid,
-                    &issuer_name_hash_sha1,
-                    &issuer_key_hash_sha1,
+                    *sha1_oid,
+                    issuer_name_hash_sha1,
+                    issuer_key_hash_sha1,
                     serial_number,
                 )?;
                 let certid_der = cert_id.to_der().map_err(SignError::Der)?;
@@ -227,15 +477,15 @@ where
             }
             CertIdCompat::Dual => {
                 let cert_id_sha256 = build_certid(
-                    sha256_oid,
-                    &issuer_name_hash_sha256,
-                    &issuer_key_hash_sha256,
+                    *sha256_oid,
+                    issuer_name_hash_sha256,
+                    issuer_key_hash_sha256,
                     serial_number.clone(),
                 )?;
                 let cert_id_sha1 = build_certid(
-                    sha1_oid,
-                    &issuer_name_hash_sha1,
-                    &issuer_key_hash_sha1,
+                    *sha1_oid,
+                    issuer_name_hash_sha1,
+                    issuer_key_hash_sha1,
                     serial_number,
                 )?;
                 let ek256: [u8; 32] =
@@ -255,9 +505,32 @@ where
             }
         }
     }
+    Ok(prepared)
+}
 
-    // Group entries into buckets and sign
-    let bucket_size = config.bucket_size.max(1);
+#[allow(clippy::too_many_arguments)]
+fn sign_and_add_entries<S, Sig>(
+    builder: &mut BundleBuilder,
+    prepared: &[PreparedEntry],
+    bucket_size: usize,
+    signer: &mut S,
+    responder_id: &ResponderId,
+    responder_cert_der: Option<&[u8]>,
+    produced_at: OcspGeneralizedTime,
+    discriminator: u16,
+) -> Result<()>
+where
+    S: Signer<Sig> + DynSignatureAlgorithmIdentifier,
+    Sig: SignatureBitStringEncoding,
+{
+    let bucket_size = bucket_size.max(1);
+
+    // Parse the responder certificate once, outside the loop, to avoid
+    // redundant DER decoding on every bucket iteration.
+    let parsed_cert = responder_cert_der
+        .map(|c| x509_cert::Certificate::from_der(c).map_err(SignError::Der))
+        .transpose()?;
+
     for bucket in prepared.chunks(bucket_size) {
         let mut response_builder = OcspResponseBuilder::new(responder_id.clone());
         let mut all_keys: Vec<[u8; 32]> = Vec::new();
@@ -269,68 +542,15 @@ where
             all_keys.extend_from_slice(&entry.entry_keys);
         }
 
-        let certs = responder_cert_der
-            .map(|c| {
-                let cert = x509_cert::Certificate::from_der(c).map_err(SignError::Der)?;
-                Ok::<_, SignError>(vec![cert])
-            })
-            .transpose()?;
+        let certs = parsed_cert.as_ref().map(|c| vec![c.clone()]);
         let ocsp_response = response_builder
             .sign(signer, certs, produced_at)
             .map_err(SignError::from)?;
         let response_der = ocsp_response.to_der().map_err(SignError::Der)?;
 
-        add_shared_entries(&mut builder, &all_keys, response_der);
+        add_shared_entries(builder, &all_keys, response_der, discriminator);
     }
-
-    builder
-        .build(|manifest_bytes| {
-            seal_fn(manifest_bytes).map_err(|e| ahu::AhuError::Write(e.to_string()))
-        })
-        .map_err(SignError::Bundle)
-}
-
-fn build_certid(
-    hash_oid: const_oid::ObjectIdentifier,
-    name_hash: &[u8],
-    key_hash: &[u8],
-    serial: x509_cert::serial_number::SerialNumber,
-) -> Result<CertId> {
-    Ok(CertId {
-        hash_algorithm: AlgorithmIdentifierOwned {
-            oid: hash_oid,
-            parameters: Some(Null.into()),
-        },
-        issuer_name_hash: OctetString::new(name_hash.to_vec()).map_err(SignError::Der)?,
-        issuer_key_hash: OctetString::new(key_hash.to_vec()).map_err(SignError::Der)?,
-        serial_number: serial,
-    })
-}
-
-/// Add multiple entry keys all pointing to the same response blob.
-/// Pairs consecutive keys via add_dual_entry so ALIAS dedup stores the
-/// data once. An odd key out gets a regular add_entry (one extra data copy
-/// per bucket — negligible vs the signature amortization savings).
-fn add_shared_entries(builder: &mut BundleBuilder, keys: &[[u8; 32]], response_der: Vec<u8>) {
-    match keys.len() {
-        0 => {}
-        1 => {
-            builder.add_entry(keys[0], response_der);
-        }
-        2 => {
-            builder.add_dual_entry(keys[0], keys[1], response_der);
-        }
-        _ => {
-            let mut i = 0;
-            while i + 1 < keys.len() {
-                builder.add_dual_entry(keys[i], keys[i + 1], response_der.clone());
-                i += 2;
-            }
-            if i < keys.len() {
-                builder.add_entry(keys[i], response_der);
-            }
-        }
-    }
+    Ok(())
 }
 
 /// Extract SHA-1 hash of the subject public key from a DER-encoded certificate.
@@ -689,6 +909,87 @@ mod tests {
             "batched ({}) should be smaller than unbatched ({})",
             batched.len(),
             unbatched.len()
+        );
+    }
+
+    #[test]
+    fn produce_dual_bundle_round_trip() {
+        let ca = test_ca();
+        let snapshot = large_snapshot(5);
+        let config = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only,
+            ..Default::default()
+        };
+
+        let mut ecdsa_signer = test_signing_key();
+        let mut ml_dsa_signer = crate::ml_dsa_87_signer(&[42u8; 32]);
+
+        let bundle_bytes = produce_dual_bundle::<
+            _, p256::ecdsa::DerSignature,
+            _, crate::MlDsaSignatureBytes,
+        >(
+            &ca, &snapshot, &config,
+            &mut ecdsa_signer, &mut ml_dsa_signer,
+            ahu::ALG_DISC_ML_DSA_87,
+            |m| Ok(Sha256::digest(m).to_vec()),
+            None, None,
+        )
+        .unwrap();
+
+        let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
+        let result = ahu::verify_structure(&bundle).unwrap();
+        assert!(result.index_digest_ok);
+        assert!(result.data_digest_ok);
+        assert!(result.sort_order_ok);
+
+        assert_eq!(bundle.index.len(), 10, "5 serials × 2 algorithms");
+    }
+
+    #[test]
+    fn dual_bundle_lookup_by_discriminator() {
+        let ca = test_ca();
+        let snapshot = large_snapshot(3);
+        let config = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only,
+            ..Default::default()
+        };
+
+        let mut ecdsa_signer = test_signing_key();
+        let mut ml_dsa_signer = crate::ml_dsa_87_signer(&[7u8; 32]);
+
+        let bundle_bytes = produce_dual_bundle::<
+            _, p256::ecdsa::DerSignature,
+            _, crate::MlDsaSignatureBytes,
+        >(
+            &ca, &snapshot, &config,
+            &mut ecdsa_signer, &mut ml_dsa_signer,
+            ahu::ALG_DISC_ML_DSA_87,
+            |m| Ok(Sha256::digest(m).to_vec()),
+            None, None,
+        )
+        .unwrap();
+
+        let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
+
+        let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+        let name_hash = Sha256::digest(&ca.issuer_name_der);
+        let key_hash_val = Sha256::digest(&ca.issuer_key_bytes);
+
+        let serial = x509_cert::serial_number::SerialNumber::new(&[1u8]).unwrap();
+        let cert_id = build_certid(sha256_oid, &name_hash, &key_hash_val, serial).unwrap();
+        let certid_der = cert_id.to_der().unwrap();
+        let entry_key: [u8; 32] = Sha256::digest(&certid_der).into();
+
+        let classical = bundle.lookup(&entry_key);
+        assert!(classical.is_some(), "disc=0 lookup should find classical");
+
+        let pq = bundle.lookup_preferred(&entry_key, &[ahu::ALG_DISC_ML_DSA_87]);
+        assert!(pq.is_some(), "disc=4 lookup should find ML-DSA-87");
+
+        assert_ne!(
+            classical.unwrap().len(),
+            pq.unwrap().len(),
+            "classical and PQ responses should differ in size"
         );
     }
 }

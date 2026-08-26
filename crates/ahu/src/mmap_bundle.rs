@@ -101,35 +101,51 @@ impl MmapBundle {
     }
 
     /// Look up an entry by its entry key (SHA-256 of DER CertID).
-    ///
-    /// Returns a slice directly into the mmap'd region — zero allocation.
+    /// Returns the default (discriminator=0) entry.
     pub fn lookup(&self, entry_key: &[u8; 32]) -> Option<&[u8]> {
-        let idx = self.binary_search(entry_key)?;
-        let (offset, length, flags) = self.read_record_fields(idx);
+        let idx = self.binary_search_disc(entry_key, 0)?;
+        self.entry_at_mmap(idx)
+    }
 
+    /// Look up the best-matching entry given preferred discriminators.
+    pub fn lookup_preferred(&self, entry_key: &[u8; 32], preferences: &[u16]) -> Option<&[u8]> {
+        for &disc in preferences {
+            if let Some(idx) = self.binary_search_disc(entry_key, disc) {
+                return self.entry_at_mmap(idx);
+            }
+        }
+        if !preferences.contains(&0) {
+            if let Some(idx) = self.binary_search_disc(entry_key, 0) {
+                return self.entry_at_mmap(idx);
+            }
+        }
+        None
+    }
+
+    fn entry_at_mmap(&self, idx: usize) -> Option<&[u8]> {
+        let (offset, length, flags, _disc) = self.read_record_fields(idx);
         if flags.contains(IndexFlags::TOMBSTONE) {
             return None;
         }
-
         let start = self.data_offset + offset as usize;
         let end = start + length as usize;
         if end > self.data_offset + self.data_length {
             return None;
         }
-
         Some(&self.mmap[start..end])
     }
 
-    /// Binary search the index directly in the mmap'd region.
-    fn binary_search(&self, entry_key: &[u8; 32]) -> Option<usize> {
+    /// Binary search for `(entry_key, discriminator)` in the mmap'd index.
+    fn binary_search_disc(&self, entry_key: &[u8; 32], disc: u16) -> Option<usize> {
         let mut lo = 0usize;
         let mut hi = self.index_count;
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let key = self.read_entry_key(mid);
+            let mid_disc = self.read_discriminator(mid);
 
-            match key.cmp(entry_key) {
+            match key.cmp(entry_key).then(mid_disc.cmp(&disc)) {
                 std::cmp::Ordering::Equal => return Some(mid),
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -147,15 +163,23 @@ impl MmapBundle {
             .expect("slice is exactly 32 bytes")
     }
 
-    /// Read data_offset (u64), data_length (u32), flags (u16) from record `n`.
+    /// Read discriminator (u16) at bytes 46-47 of record `n`.
     #[inline]
-    fn read_record_fields(&self, n: usize) -> (u64, u32, IndexFlags) {
+    fn read_discriminator(&self, n: usize) -> u16 {
+        let base = self.index_offset + n * INDEX_RECORD_SIZE;
+        BigEndian::read_u16(&self.mmap[base + 46..base + 48])
+    }
+
+    /// Read data_offset (u64), data_length (u32), flags (u16), discriminator (u16) from record `n`.
+    #[inline]
+    fn read_record_fields(&self, n: usize) -> (u64, u32, IndexFlags, u16) {
         let base = self.index_offset + n * INDEX_RECORD_SIZE;
         let data_offset = BigEndian::read_u64(&self.mmap[base + 32..base + 40]);
         let data_length = BigEndian::read_u32(&self.mmap[base + 40..base + 44]);
         let flags_raw = BigEndian::read_u16(&self.mmap[base + 44..base + 46]);
         let flags = IndexFlags::from_bits_truncate(flags_raw);
-        (data_offset, data_length, flags)
+        let discriminator = BigEndian::read_u16(&self.mmap[base + 46..base + 48]);
+        (data_offset, data_length, flags, discriminator)
     }
 
     /// Get the raw manifest bytes (slice into mmap).

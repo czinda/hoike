@@ -25,11 +25,12 @@ x509-cert = { workspace = true, optional = true }
 spki = { workspace = true, optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 ecdsa_v017 = { package = "ecdsa", version = "0.17", features = ["der"], optional = true }
+ml-dsa = { workspace = true, optional = true }
 
 [features]
 default = ["compression", "seal-verify"]
 compression = ["dep:zstd"]
-seal-verify = ["dep:cms", "dep:der", "dep:x509-cert", "dep:spki", "dep:p256", "dep:ecdsa_v017"]
+seal-verify = ["dep:cms", "dep:der", "dep:x509-cert", "dep:spki", "dep:p256", "dep:ecdsa_v017", "dep:ml-dsa"]
 
 [dev-dependencies]
 tempfile = "3"

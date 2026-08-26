@@ -26,6 +26,12 @@ pub enum SignError {
     #[error("CMS seal error: {0}")]
     Seal(String),
 
+    #[error("verification error: {0}")]
+    Verify(String),
+
+    #[error("no embedded responder certificate — cannot extract public key")]
+    NoCert,
+
     #[error("LDAP error: {0}")]
     Ldap(String),
 

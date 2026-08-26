@@ -55,9 +55,20 @@ impl Bundle {
     }
 
     /// Look up an entry by its entry key (SHA-256 of DER CertID).
+    /// Returns the default (discriminator=0) entry.
     pub fn lookup(&self, entry_key: &[u8; 32]) -> Option<&[u8]> {
         let idx = crate::index::binary_search(&self.index, entry_key)?;
-        let record = &self.index[idx];
+        self.entry_at(idx)
+    }
+
+    /// Look up the best-matching entry given a list of preferred discriminators.
+    pub fn lookup_preferred(&self, entry_key: &[u8; 32], preferences: &[u16]) -> Option<&[u8]> {
+        let idx = crate::index::binary_search_preferred(&self.index, entry_key, preferences)?;
+        self.entry_at(idx)
+    }
+
+    pub fn entry_at(&self, idx: usize) -> Option<&[u8]> {
+        let record = self.index.get(idx)?;
         if record.is_tombstone() {
             return None;
         }
@@ -132,12 +143,22 @@ impl BundleBuilder {
     /// Add an entry. `certid_der` is the DER encoding of the CertID;
     /// `response_der` is the complete DER-encoded OCSPResponse.
     pub fn add_entry(&mut self, entry_key: [u8; 32], response_der: Vec<u8>) {
+        self.add_entry_with_discriminator(entry_key, 0, response_der);
+    }
+
+    pub fn add_entry_with_discriminator(
+        &mut self,
+        entry_key: [u8; 32],
+        discriminator: u16,
+        response_der: Vec<u8>,
+    ) {
         self.entries.push((
             IndexRecord {
                 entry_key,
-                data_offset: 0, // filled during build
+                data_offset: 0,
                 data_length: response_der.len() as u32,
                 flags: crate::index::IndexFlags::empty(),
+                discriminator,
             },
             response_der,
         ));
@@ -154,6 +175,16 @@ impl BundleBuilder {
         entry_key_2: [u8; 32],
         response_der: Vec<u8>,
     ) {
+        self.add_dual_entry_with_discriminator(entry_key_1, entry_key_2, response_der, 0);
+    }
+
+    pub fn add_dual_entry_with_discriminator(
+        &mut self,
+        entry_key_1: [u8; 32],
+        entry_key_2: [u8; 32],
+        response_der: Vec<u8>,
+        discriminator: u16,
+    ) {
         let len = response_der.len() as u32;
         let flags = crate::index::IndexFlags::ALIAS | crate::index::IndexFlags::MULTI;
         self.entries.push((
@@ -162,6 +193,7 @@ impl BundleBuilder {
                 data_offset: 0,
                 data_length: len,
                 flags,
+                discriminator,
             },
             response_der.clone(),
         ));
@@ -171,19 +203,22 @@ impl BundleBuilder {
                 data_offset: 0,
                 data_length: len,
                 flags,
+                discriminator,
             },
             response_der,
         ));
     }
 
-    /// Add a tombstone (delta only).
-    pub fn add_tombstone(&mut self, entry_key: [u8; 32]) {
+    /// Add a tombstone (delta only). The discriminator must match the
+    /// target record's discriminator to suppress the correct algorithm variant.
+    pub fn add_tombstone(&mut self, entry_key: [u8; 32], discriminator: u16) {
         self.entries.push((
             IndexRecord {
                 entry_key,
                 data_offset: 0,
                 data_length: 0,
                 flags: crate::index::IndexFlags::TOMBSTONE,
+                discriminator,
             },
             Vec::new(),
         ));
@@ -195,8 +230,9 @@ impl BundleBuilder {
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>>,
     {
-        // Sort entries by key, resolving alias data sharing.
-        self.entries.sort_by_key(|a| a.0.entry_key);
+        // Sort entries by (key, discriminator), resolving alias data sharing.
+        self.entries
+            .sort_by_key(|a| (a.0.entry_key, a.0.discriminator));
 
         // Build data section and fix up offsets.
         // For ALIAS entries, deduplicate identical payloads so the data

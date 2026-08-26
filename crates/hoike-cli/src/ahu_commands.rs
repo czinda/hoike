@@ -135,10 +135,28 @@ pub fn inspect(path: &Path) -> Result<()> {
         bundle.header.data_length
     );
 
+    let mut disc_counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    for record in &bundle.index {
+        *disc_counts.entry(record.discriminator).or_default() += 1;
+    }
+    if disc_counts.len() > 1 || disc_counts.keys().any(|&k| k != 0) {
+        println!("\n── Discriminators ──");
+        for (disc, count) in &disc_counts {
+            let name = match *disc {
+                0 => "default/classical",
+                2 => "ML-DSA-44",
+                3 => "ML-DSA-65",
+                4 => "ML-DSA-87",
+                _ => "unknown",
+            };
+            println!("  disc={disc}: {count} entries ({name})");
+        }
+    }
+
     Ok(())
 }
 
-pub fn verify(path: &Path, _verify_entries: bool) -> Result<()> {
+pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
     let bundle = Bundle::from_file(path)?;
 
     println!("Verifying {}...", path.display());
@@ -187,7 +205,74 @@ pub fn verify(path: &Path, _verify_entries: bool) -> Result<()> {
     let manifest_hash = ahu::manifest_digest(&bundle.manifest_bytes);
     println!("\n  Manifest digest: {}", hex::encode(manifest_hash));
 
-    // TODO: --entries flag would verify each OCSP response signature here.
+    if verify_entries {
+        println!("\n── Entry signature verification ──");
+        let mut verified = 0usize;
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        let mut missing = 0usize;
+        for record in &bundle.index {
+            if record.is_tombstone() {
+                continue;
+            }
+            if let Some(entry_bytes) = bundle.entry_bytes(record) {
+                match hoike_sign::verify_ocsp_response_signature(entry_bytes) {
+                    Ok(()) => verified += 1,
+                    Err(hoike_sign::SignError::NoCert) => {
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  FAIL: {} — {e}",
+                            hex::encode(&record.entry_key[..8])
+                        );
+                        failed += 1;
+                    }
+                }
+            } else {
+                eprintln!(
+                    "  MISSING DATA: {}",
+                    hex::encode(&record.entry_key[..8])
+                );
+                missing += 1;
+            }
+        }
+        let total = verified + failed + skipped + missing;
+        println!("  Total entries:    {total}");
+        println!("  Verified:         {verified}");
+        if skipped > 0 {
+            println!("  Skipped:          {skipped} (no embedded responder cert)");
+        }
+        if missing > 0 {
+            println!("  Missing data:     {missing}");
+        }
+        if failed > 0 || missing > 0 {
+            println!("  FAILED:           {failed}");
+            return Err("entry signature verification failed".into());
+        }
+        if verified == 0 && total > 0 {
+            println!("\n  WARNING: no entries had embedded certs — zero signatures verified");
+        }
+    }
+
+    // Discriminator distribution (show before final verdict)
+    let mut disc_counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    for record in &bundle.index {
+        *disc_counts.entry(record.discriminator).or_default() += 1;
+    }
+    if disc_counts.len() > 1 || disc_counts.keys().any(|&k| k != 0) {
+        println!("\n── Discriminators ──");
+        for (disc, count) in &disc_counts {
+            let name = match *disc {
+                0 => "default/classical",
+                2 => "ML-DSA-44",
+                3 => "ML-DSA-65",
+                4 => "ML-DSA-87",
+                _ => "unknown",
+            };
+            println!("  disc={disc}: {count} entries ({name})");
+        }
+    }
 
     println!("\nVerification passed.");
     Ok(())
@@ -232,17 +317,21 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
     let a = Bundle::from_file(a_path)?;
     let b = Bundle::from_file(b_path)?;
 
-    let a_keys: HashSet<[u8; 32]> = a.index.iter().map(|r| r.entry_key).collect();
-    let b_keys: HashSet<[u8; 32]> = b.index.iter().map(|r| r.entry_key).collect();
+    // Use (entry_key, discriminator) pairs to correctly handle dual-algorithm bundles
+    // where the same entry_key appears with different discriminators.
+    let a_keys: HashSet<([u8; 32], u16)> = a.index.iter().map(|r| (r.entry_key, r.discriminator)).collect();
+    let b_keys: HashSet<([u8; 32], u16)> = b.index.iter().map(|r| (r.entry_key, r.discriminator)).collect();
 
     let added: Vec<_> = b_keys.difference(&a_keys).collect();
     let removed: Vec<_> = a_keys.difference(&b_keys).collect();
     let common: Vec<_> = a_keys.intersection(&b_keys).collect();
 
     let mut changed = 0usize;
-    for key in &common {
-        let a_data = a.lookup(key);
-        let b_data = b.lookup(key);
+    for (key, disc) in &common {
+        let a_data = ahu::index::binary_search_with_discriminator(&a.index, key, *disc)
+            .and_then(|idx| a.entry_at(idx));
+        let b_data = ahu::index::binary_search_with_discriminator(&b.index, key, *disc)
+            .and_then(|idx| b.entry_at(idx));
         if a_data != b_data {
             changed += 1;
         }
@@ -277,14 +366,22 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
 
     if !added.is_empty() && added.len() <= 20 {
         println!("\n── Added ──");
-        for key in &added {
-            println!("  + {}", hex::encode(key));
+        for (key, disc) in &added {
+            if *disc == 0 {
+                println!("  + {}", hex::encode(key));
+            } else {
+                println!("  + {} (disc={})", hex::encode(key), disc);
+            }
         }
     }
     if !removed.is_empty() && removed.len() <= 20 {
         println!("\n── Removed ──");
-        for key in &removed {
-            println!("  - {}", hex::encode(key));
+        for (key, disc) in &removed {
+            if *disc == 0 {
+                println!("  - {}", hex::encode(key));
+            } else {
+                println!("  - {} (disc={})", hex::encode(key), disc);
+            }
         }
     }
 
@@ -304,11 +401,12 @@ pub fn apply(
         return Err("base bundle must be a full bundle, not a delta".into());
     }
 
-    // Build the working set from the base: entry_key -> response bytes
-    let mut working_set: BTreeMap<[u8; 32], (Vec<u8>, IndexFlags)> = BTreeMap::new();
+    // Build the working set from the base: (entry_key, discriminator) -> response bytes.
+    // Using the (key, disc) pair ensures dual-algorithm entries are tracked separately.
+    let mut working_set: BTreeMap<([u8; 32], u16), (Vec<u8>, IndexFlags)> = BTreeMap::new();
     for record in &base.index {
         if let Some(data) = base.entry_bytes(record) {
-            working_set.insert(record.entry_key, (data.to_vec(), record.flags));
+            working_set.insert((record.entry_key, record.discriminator), (data.to_vec(), record.flags));
         }
     }
 
@@ -376,13 +474,14 @@ pub fn apply(
         let mut removed = 0usize;
 
         for record in &delta.index {
+            let key = (record.entry_key, record.discriminator);
             if record.flags.contains(IndexFlags::TOMBSTONE) {
-                if working_set.remove(&record.entry_key).is_some() {
+                if working_set.remove(&key).is_some() {
                     removed += 1;
                 }
             } else if let Some(data) = delta.entry_bytes(record) {
                 if working_set
-                    .insert(record.entry_key, (data.to_vec(), record.flags))
+                    .insert(key, (data.to_vec(), record.flags))
                     .is_some()
                 {
                     replaced += 1;
@@ -419,14 +518,8 @@ pub fn apply(
 
     let mut builder = BundleBuilder::new(manifest);
 
-    for (entry_key, (data, flags)) in &working_set {
-        if flags.contains(IndexFlags::ALIAS) {
-            // For alias entries, just add as normal — the dedup in build()
-            // handles identical payloads
-            builder.add_entry(*entry_key, data.clone());
-        } else {
-            builder.add_entry(*entry_key, data.clone());
-        }
+    for ((entry_key, disc), (data, _flags)) in &working_set {
+        builder.add_entry_with_discriminator(*entry_key, *disc, data.clone());
     }
 
     let output_bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec()))?;

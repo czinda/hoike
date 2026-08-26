@@ -102,7 +102,7 @@ state_db = "{dir}/state"
         serial_number: vec![0x22],
     };
 
-    if state.lookup(&cert_id_22).is_some() {
+    if state.lookup(&cert_id_22, &[]).is_some() {
         found_22 = true;
     }
 
@@ -120,7 +120,7 @@ state_db = "{dir}/state"
         "expected epoch-10 bundle (key 0x22) to be selected"
     );
     assert!(
-        state.lookup(&cert_id_11).is_none(),
+        state.lookup(&cert_id_11, &[]).is_none(),
         "epoch-5 bundle (key 0x11) should NOT be loaded"
     );
 }

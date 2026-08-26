@@ -10,7 +10,10 @@ pub mod verify;
 pub use bundle::{Bundle, BundleBuilder};
 pub use error::{AhuError, Result};
 pub use header::FileHeader;
-pub use index::{IndexFlags, IndexRecord, compute_entry_key};
+pub use index::{
+    IndexFlags, IndexRecord, compute_entry_key,
+    ALG_DISC_DEFAULT, ALG_DISC_ML_DSA_44, ALG_DISC_ML_DSA_65, ALG_DISC_ML_DSA_87,
+};
 pub use manifest::{
     BundleType, CaScope, Completeness, Compression, CompressionAlgorithm, Continuity, Integrity,
     Manifest, ResponderId, ResponderIdType, Shard, Window,

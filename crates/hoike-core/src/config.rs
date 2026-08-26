@@ -82,6 +82,9 @@ pub struct CaConfig {
     /// Raw issuer public key bytes (for CertID computation in signer mode).
     /// Base64-encoded in config, decoded on load.
     pub issuer_key_bytes_b64: Option<String>,
+    /// Signing algorithm: ecdsa-p256 (default), ml-dsa-44, ml-dsa-65, ml-dsa-87
+    #[serde(default = "default_sig_alg")]
+    pub sig_alg: String,
     /// Signing key configuration (required for signer/combined mode).
     pub signing_key: Option<SigningKeyConfig>,
     /// Path to the delegated OCSP signing certificate (DER or PEM).
@@ -97,6 +100,16 @@ pub struct CaConfig {
     /// Path to the DER/PEM certificate for the seal signer.
     /// If absent, generates a self-signed cert (for testing only).
     pub seal_cert: Option<PathBuf>,
+}
+
+impl CaConfig {
+    /// Returns true if the configured sig_alg is an ML-DSA variant.
+    pub fn is_ml_dsa(&self) -> bool {
+        matches!(
+            self.sig_alg.as_str(),
+            "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87"
+        )
+    }
 }
 
 /// TOML-level key rotation configuration.
@@ -211,6 +224,9 @@ fn default_state_db() -> PathBuf {
 fn default_max_chain() -> u32 {
     24
 }
+fn default_sig_alg() -> String {
+    "ecdsa-p256".into()
+}
 fn default_nonce_policy() -> String {
     "ignore".into()
 }
@@ -243,6 +259,23 @@ impl Config {
     }
 
     pub fn validate_for_mode(&self) -> crate::error::Result<()> {
+        let valid_sig_algs = ["ecdsa-p256", "ml-dsa-44", "ml-dsa-65", "ml-dsa-87"];
+        for ca in &self.ca {
+            if !valid_sig_algs.contains(&ca.sig_alg.as_str()) {
+                return Err(crate::error::CoreError::Config(format!(
+                    "CA '{}' has invalid sig_alg '{}' — expected one of: {}",
+                    ca.label,
+                    ca.sig_alg,
+                    valid_sig_algs.join(", ")
+                )));
+            }
+            if ca.is_ml_dsa() && ca.nonce_policy == "live" {
+                return Err(crate::error::CoreError::Config(format!(
+                    "CA '{}': nonce_policy=live is not yet supported with {} signing",
+                    ca.label, ca.sig_alg
+                )));
+            }
+        }
         if self.needs_signing() {
             for ca in &self.ca {
                 if ca.source.is_none() {
@@ -259,9 +292,6 @@ impl Config {
                         ca.label, self.server.mode
                     )));
                 }
-                // PKCS#11 PIN resolution: pin (config) → pin_env (env var) → interactive prompt.
-                // All three are valid — no validation error if both pin and pin_env are absent,
-                // because the CLI will prompt interactively at startup.
             }
             if self.ca.is_empty() {
                 return Err(crate::error::CoreError::Config(format!(
