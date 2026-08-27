@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn verify_ecdsa_bundle_entries() {
         use crate::{
-            demo_ecdsa_p256_key, generate::GenerationConfig, produce_bundle, seal::generate_seal_cert,
+            demo_ecdsa_p256_key, generate::GenerationConfig, produce_bundle,
             source::{CaIdentity, CertificateStatus, StatusSnapshot},
         };
         use std::collections::BTreeMap;
@@ -116,7 +116,7 @@ mod tests {
         let mut signer = demo_ecdsa_p256_key();
         let seal_key = crate::SealKey::EcdsaP256(demo_ecdsa_p256_key());
         let seal_cert = crate::generate_seal_cert_for_key(&seal_key).unwrap();
-        let responder_cert = generate_seal_cert(&signer).unwrap();
+        let responder_cert = crate::generate_seal_cert(&signer).unwrap();
 
         let ca = CaIdentity {
             label: "test-ca".into(),
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn verify_ml_dsa_signature_direct() {
         use ml_dsa::{MlDsa87, SigningKey, Signer as Signer3, Keypair};
-        use ml_dsa::SignatureEncoding as SE3;
+
 
         let sk = SigningKey::<MlDsa87>::from_seed((&[42u8; 32]).into());
         let vk = sk.verifying_key();
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn verify_ml_dsa_44_signature_direct() {
         use ml_dsa::{MlDsa44, SigningKey, Signer as Signer3, Keypair};
-        use ml_dsa::SignatureEncoding as SE3;
+
 
         let sk = SigningKey::<MlDsa44>::from_seed((&[1u8; 32]).into());
         let vk = sk.verifying_key();
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn verify_wrong_message_fails() {
         use ml_dsa::{MlDsa65, SigningKey, Signer as Signer3, Keypair};
-        use ml_dsa::SignatureEncoding as SE3;
+
 
         let sk = SigningKey::<MlDsa65>::from_seed((&[5u8; 32]).into());
         let vk = sk.verifying_key();
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn verify_no_embedded_cert_errors() {
         use crate::{
-            demo_ecdsa_p256_key, generate::GenerationConfig, produce_bundle, seal::generate_seal_cert,
+            demo_ecdsa_p256_key, generate::GenerationConfig, produce_bundle,
             source::{CaIdentity, CertificateStatus, StatusSnapshot},
         };
         use std::collections::BTreeMap;
