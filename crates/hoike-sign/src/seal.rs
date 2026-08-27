@@ -137,9 +137,8 @@ pub fn create_cms_seal(
     let digest_algorithms = DigestAlgorithmIdentifiers::try_from(vec![digest_alg])
         .map_err(|e| SignError::Seal(format!("digest algs: {e}")))?;
 
-    let cert_set =
-        CertificateSet::try_from(vec![cms::cert::CertificateChoices::Certificate(cert)])
-            .map_err(|e| SignError::Seal(format!("cert set: {e}")))?;
+    let cert_set = CertificateSet::try_from(vec![cms::cert::CertificateChoices::Certificate(cert)])
+        .map_err(|e| SignError::Seal(format!("cert set: {e}")))?;
 
     let signer_infos = SignerInfos::try_from(vec![signer_info])
         .map_err(|e| SignError::Seal(format!("signer infos: {e}")))?;
@@ -254,15 +253,24 @@ pub fn generate_seal_cert_for_key(seal_key: &SealKey) -> Result<Vec<u8>> {
         }
         SealKey::MlDsa44(key) => {
             use ml_dsa::Keypair;
-            (key.verifying_key().encode().to_vec(), encode_ml_dsa_alg_id(ML_DSA_44_OID))
+            (
+                key.verifying_key().encode().to_vec(),
+                encode_ml_dsa_alg_id(ML_DSA_44_OID),
+            )
         }
         SealKey::MlDsa65(key) => {
             use ml_dsa::Keypair;
-            (key.verifying_key().encode().to_vec(), encode_ml_dsa_alg_id(ML_DSA_65_OID))
+            (
+                key.verifying_key().encode().to_vec(),
+                encode_ml_dsa_alg_id(ML_DSA_65_OID),
+            )
         }
         SealKey::MlDsa87(key) => {
             use ml_dsa::Keypair;
-            (key.verifying_key().encode().to_vec(), encode_ml_dsa_alg_id(ML_DSA_87_OID))
+            (
+                key.verifying_key().encode().to_vec(),
+                encode_ml_dsa_alg_id(ML_DSA_87_OID),
+            )
         }
     };
 
@@ -397,10 +405,7 @@ mod tests {
         let key = test_key();
         let cert_der = generate_seal_cert(&key).unwrap();
         let cert = Certificate::from_der(&cert_der).unwrap();
-        assert_eq!(
-            cert.tbs_certificate().serial_number().as_bytes(),
-            &[0x01]
-        );
+        assert_eq!(cert.tbs_certificate().serial_number().as_bytes(), &[0x01]);
     }
 
     #[test]
@@ -451,10 +456,7 @@ mod tests {
         let seal_key = SealKey::MlDsa87(sk);
         let cert_der = generate_seal_cert_for_key(&seal_key).unwrap();
         let cert = Certificate::from_der(&cert_der).unwrap();
-        assert_eq!(
-            cert.tbs_certificate().serial_number().as_bytes(),
-            &[0x01]
-        );
+        assert_eq!(cert.tbs_certificate().serial_number().as_bytes(), &[0x01]);
     }
 
     #[test]
@@ -473,6 +475,9 @@ mod tests {
 
         let sig_alg = si.signature_algorithm.oid.to_string();
         assert_eq!(sig_alg, ML_DSA_87_OID);
-        assert!(si.signature.as_bytes().len() > 4000, "ML-DSA-87 sig should be ~4627 bytes");
+        assert!(
+            si.signature.as_bytes().len() > 4000,
+            "ML-DSA-87 sig should be ~4627 bytes"
+        );
     }
 }

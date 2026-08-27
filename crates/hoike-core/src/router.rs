@@ -69,11 +69,7 @@ impl ResponderState {
     /// then searches each by entry_key. On collision (multiple bundles hold
     /// an entry for the same serial), logs a warning and returns the first
     /// by configuration order.
-    pub fn lookup(
-        &self,
-        cert_id: &ParsedCertId,
-        preferred_algs: &[u16],
-    ) -> Option<LookupResult> {
+    pub fn lookup(&self, cert_id: &ParsedCertId, preferred_algs: &[u16]) -> Option<LookupResult> {
         let map = self.scope_map.load();
         let key = (
             cert_id.issuer_name_hash.clone(),

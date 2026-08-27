@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::error::{Result, SignError};
-use crate::ml_dsa_bridge::{load_ml_dsa_signer_from_pkcs8_der, MlDsaSignerVariant};
+use crate::ml_dsa_bridge::{MlDsaSignerVariant, load_ml_dsa_signer_from_pkcs8_der};
 
 /// Decode a PEM block into DER bytes.
 ///

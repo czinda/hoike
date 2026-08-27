@@ -210,7 +210,8 @@ async fn run_server(config_path: PathBuf) {
     // so there's something to serve immediately.
     if is_combined {
         info!("combined mode: running initial bundle production");
-        if let Err(e) = run_signer_pass_with_sources(&config, persistent_sources.as_ref().unwrap()) {
+        if let Err(e) = run_signer_pass_with_sources(&config, persistent_sources.as_ref().unwrap())
+        {
             eprintln!("Initial signer pass failed: {e}");
             std::process::exit(1);
         }
@@ -326,7 +327,9 @@ type PersistentSources = std::collections::HashMap<String, Box<dyn hoike_sign::R
 
 #[allow(unused_mut)]
 #[allow(unreachable_code)]
-fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result<PersistentSources, String> {
+fn create_persistent_sources(
+    config: &hoike_core::Config,
+) -> std::result::Result<PersistentSources, String> {
     let mut sources = PersistentSources::new();
     for ca_config in &config.ca {
         let source_config = match &ca_config.source {
@@ -337,11 +340,18 @@ fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result
         let source: Box<dyn hoike_sign::RevocationSource> = match source_config {
             #[cfg(feature = "dogtag-sync")]
             hoike_core::config::SourceConfig::DogtagSync {
-                ldap_url, base_dn, bind_dn, bind_password,
-                bind_password_env, cookie_path, filter,
+                ldap_url,
+                base_dn,
+                bind_dn,
+                bind_password,
+                bind_password_env,
+                cookie_path,
+                filter,
             } => {
-                let password = resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
-                let cookie = cookie_path.clone()
+                let password =
+                    resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
+                let cookie = cookie_path
+                    .clone()
                     .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
                 let sync_config = hoike_sign::DogtagSyncConfig {
                     ldap_url: ldap_url.clone(),
@@ -349,7 +359,9 @@ fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result
                     bind_dn: bind_dn.clone(),
                     bind_password: password,
                     cookie_path: cookie,
-                    filter: filter.clone().unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
+                    filter: filter
+                        .clone()
+                        .unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
                 };
                 Box::new(hoike_sign::DogtagSyncSource::new(sync_config))
             }
@@ -376,7 +388,9 @@ fn run_signer_pass_with_sources(
 
         // Use persistent source if available, otherwise create a fresh one
         let fresh_source: Option<Box<dyn RevocationSource>>;
-        let source: &dyn RevocationSource = if let Some(ps) = persistent_sources.get(&ca_config.label) {
+        let source: &dyn RevocationSource = if let Some(ps) =
+            persistent_sources.get(&ca_config.label)
+        {
             ps.as_ref()
         } else {
             fresh_source = Some(match source_config {
@@ -388,7 +402,9 @@ fn run_signer_pass_with_sources(
                             .map_err(|e| format!("CRL not valid UTF-8: {e}"))?;
                         Box::new(CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?)
                     } else {
-                        Box::new(CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?)
+                        Box::new(
+                            CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?,
+                        )
                     }
                 }
                 #[cfg(feature = "dogtag-sync")]
@@ -441,7 +457,10 @@ fn run_signer_pass_with_sources(
         std::fs::create_dir_all(&config.storage.bundle_dir)
             .map_err(|e| format!("create bundle_dir: {e}"))?;
 
-        let bundle_path = config.storage.bundle_dir.join(format!("{}.ahu", ca_config.label));
+        let bundle_path = config
+            .storage
+            .bundle_dir
+            .join(format!("{}.ahu", ca_config.label));
 
         let bundle_bytes = if ca_config.is_ml_dsa() {
             match &ca_config.signing_key {
@@ -557,8 +576,7 @@ fn run_signer_pass_with_sources(
         }
         .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
 
-        std::fs::write(&bundle_path, &bundle_bytes)
-            .map_err(|e| format!("write bundle: {e}"))?;
+        std::fs::write(&bundle_path, &bundle_bytes).map_err(|e| format!("write bundle: {e}"))?;
         info!(
             ca = ca_config.label,
             size = bundle_bytes.len(),
@@ -992,8 +1010,8 @@ fn load_seal_materials(
     ca_config: &hoike_core::config::CaConfig,
 ) -> std::result::Result<(hoike_sign::SealKey, Vec<u8>), String> {
     let seal_key = if let Some(path) = &ca_config.seal_key {
-        let ecdsa_key = hoike_sign::load_ecdsa_p256_key(path)
-            .map_err(|e| format!("load seal key: {e}"))?;
+        let ecdsa_key =
+            hoike_sign::load_ecdsa_p256_key(path).map_err(|e| format!("load seal key: {e}"))?;
         hoike_sign::SealKey::EcdsaP256(ecdsa_key)
     } else if !ca_config.is_ml_dsa() {
         if let Some(hoike_core::config::SigningKeyConfig::File { path }) = &ca_config.signing_key {
@@ -1093,7 +1111,6 @@ fn run_query(
     use der::{Decode, Encode, asn1::OctetString};
     use sha2::{Digest, Sha256};
 
-
     let issuer_name_der = base64::engine::general_purpose::STANDARD
         .decode(&issuer_name_b64)
         .unwrap_or_else(|e| {
@@ -1122,11 +1139,12 @@ fn run_query(
         },
         issuer_name_hash: OctetString::new(name_hash.to_vec()).unwrap(),
         issuer_key_hash: OctetString::new(key_hash.to_vec()).unwrap(),
-        serial_number: x509_cert::serial_number::SerialNumber::new(&serial_bytes)
-            .unwrap_or_else(|e| {
+        serial_number: x509_cert::serial_number::SerialNumber::new(&serial_bytes).unwrap_or_else(
+            |e| {
                 eprintln!("Invalid serial: {e}");
                 std::process::exit(1);
-            }),
+            },
+        ),
     };
 
     let request_item = x509_ocsp::Request {
@@ -1191,14 +1209,10 @@ fn run_query(
 
             match x509_ocsp::OcspResponse::from_der(&body) {
                 Ok(ocsp_resp) => {
-                    println!(
-                        "  OCSP status: {:?}",
-                        ocsp_resp.response_status
-                    );
+                    println!("  OCSP status: {:?}", ocsp_resp.response_status);
                     if let Some(resp_bytes) = &ocsp_resp.response_bytes {
-                        match x509_ocsp::BasicOcspResponse::from_der(
-                            resp_bytes.response.as_bytes(),
-                        ) {
+                        match x509_ocsp::BasicOcspResponse::from_der(resp_bytes.response.as_bytes())
+                        {
                             Ok(basic) => {
                                 let alg_oid = basic.signature_algorithm.oid.to_string();
                                 let sig_len = basic.signature.raw_bytes().len();
@@ -1620,9 +1634,7 @@ fn run_sign(
         hoike_sign::SealKey::EcdsaP256(ecdsa_key)
     } else if !is_ml_dsa {
         if let Some(key_path) = &signing_key_path {
-            warn!(
-                "using OCSP signing key as seal key — provide --seal-key for production"
-            );
+            warn!("using OCSP signing key as seal key — provide --seal-key for production");
             let ecdsa_key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load seal key: {e}");
                 std::process::exit(1);

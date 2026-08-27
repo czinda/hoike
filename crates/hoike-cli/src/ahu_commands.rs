@@ -222,18 +222,12 @@ pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
                         skipped += 1;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "  FAIL: {} — {e}",
-                            hex::encode(&record.entry_key[..8])
-                        );
+                        eprintln!("  FAIL: {} — {e}", hex::encode(&record.entry_key[..8]));
                         failed += 1;
                     }
                 }
             } else {
-                eprintln!(
-                    "  MISSING DATA: {}",
-                    hex::encode(&record.entry_key[..8])
-                );
+                eprintln!("  MISSING DATA: {}", hex::encode(&record.entry_key[..8]));
                 missing += 1;
             }
         }
@@ -319,8 +313,16 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
 
     // Use (entry_key, discriminator) pairs to correctly handle dual-algorithm bundles
     // where the same entry_key appears with different discriminators.
-    let a_keys: HashSet<([u8; 32], u16)> = a.index.iter().map(|r| (r.entry_key, r.discriminator)).collect();
-    let b_keys: HashSet<([u8; 32], u16)> = b.index.iter().map(|r| (r.entry_key, r.discriminator)).collect();
+    let a_keys: HashSet<([u8; 32], u16)> = a
+        .index
+        .iter()
+        .map(|r| (r.entry_key, r.discriminator))
+        .collect();
+    let b_keys: HashSet<([u8; 32], u16)> = b
+        .index
+        .iter()
+        .map(|r| (r.entry_key, r.discriminator))
+        .collect();
 
     let added: Vec<_> = b_keys.difference(&a_keys).collect();
     let removed: Vec<_> = a_keys.difference(&b_keys).collect();
@@ -406,7 +408,10 @@ pub fn apply(
     let mut working_set: BTreeMap<([u8; 32], u16), (Vec<u8>, IndexFlags)> = BTreeMap::new();
     for record in &base.index {
         if let Some(data) = base.entry_bytes(record) {
-            working_set.insert((record.entry_key, record.discriminator), (data.to_vec(), record.flags));
+            working_set.insert(
+                (record.entry_key, record.discriminator),
+                (data.to_vec(), record.flags),
+            );
         }
     }
 

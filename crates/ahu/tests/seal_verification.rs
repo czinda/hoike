@@ -49,11 +49,11 @@ mod tests {
     fn seal_created_by_hoike_sign_verifies_in_ahu() {
         // Create a seal using hoike-sign
         let secret = [7u8; 32];
-        let signing_key =
-            p256_v013::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
+        let signing_key = p256_v013::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
         let seal_cert_der = hoike_sign::generate_seal_cert_for_key(
             &hoike_sign::SealKey::EcdsaP256(signing_key.clone()),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Build a bundle with a real CMS seal
         let manifest = build_test_manifest();
@@ -83,11 +83,11 @@ mod tests {
     #[test]
     fn tampered_manifest_fails_seal_verification() {
         let secret = [7u8; 32];
-        let signing_key =
-            p256_v013::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
+        let signing_key = p256_v013::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
         let seal_cert_der = hoike_sign::generate_seal_cert_for_key(
             &hoike_sign::SealKey::EcdsaP256(signing_key.clone()),
-        ).unwrap();
+        )
+        .unwrap();
 
         let manifest = build_test_manifest();
         let mut builder = BundleBuilder::new(manifest);

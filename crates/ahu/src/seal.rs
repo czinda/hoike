@@ -32,10 +32,7 @@ mod verify_impl {
     /// 1. Parses as valid CMS SignedData
     /// 2. The message-digest signed attribute matches SHA-256(manifest_bytes)
     /// 3. The signature over the signed attributes is valid (ECDSA P-256)
-    pub fn verify_seal(
-        manifest_bytes: &[u8],
-        seal_bytes: &[u8],
-    ) -> Result<SealVerification> {
+    pub fn verify_seal(manifest_bytes: &[u8], seal_bytes: &[u8]) -> Result<SealVerification> {
         if seal_bytes.is_empty() {
             return Err(AhuError::SealInvalid("seal section is empty".into()));
         }
@@ -192,7 +189,11 @@ mod verify_impl {
         }
     }
 
-    fn verify_ml_dsa_seal<P>(attrs_der: &[u8], sig_bytes: &[u8], pub_key_bytes: &[u8]) -> Result<bool>
+    fn verify_ml_dsa_seal<P>(
+        attrs_der: &[u8],
+        sig_bytes: &[u8],
+        pub_key_bytes: &[u8],
+    ) -> Result<bool>
     where
         P: ml_dsa::MlDsaParams,
     {

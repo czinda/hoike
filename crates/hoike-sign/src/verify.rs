@@ -19,8 +19,8 @@ const ECDSA_WITH_SHA256_OID: &str = "1.2.840.10045.4.3.2";
 /// and verifies the signature using the public key from the first embedded
 /// certificate. Returns `Ok(())` if the signature is valid.
 pub fn verify_ocsp_response_signature(response_der: &[u8]) -> Result<()> {
-    let ocsp_resp =
-        OcspResponse::from_der(response_der).map_err(|e| SignError::Verify(format!("parse OcspResponse: {e}")))?;
+    let ocsp_resp = OcspResponse::from_der(response_der)
+        .map_err(|e| SignError::Verify(format!("parse OcspResponse: {e}")))?;
 
     if ocsp_resp.response_status != OcspResponseStatus::Successful {
         return Ok(());
@@ -49,7 +49,9 @@ pub fn verify_ocsp_response_signature(response_der: &[u8]) -> Result<()> {
         ML_DSA_44_OID => verify_ml_dsa::<ml_dsa::MlDsa44>(&tbs_der, sig_bytes, &pub_key_bytes),
         ML_DSA_65_OID => verify_ml_dsa::<ml_dsa::MlDsa65>(&tbs_der, sig_bytes, &pub_key_bytes),
         ML_DSA_87_OID => verify_ml_dsa::<ml_dsa::MlDsa87>(&tbs_der, sig_bytes, &pub_key_bytes),
-        other => Err(SignError::Verify(format!("unsupported signature algorithm: {other}"))),
+        other => Err(SignError::Verify(format!(
+            "unsupported signature algorithm: {other}"
+        ))),
     }
 }
 
@@ -89,8 +91,12 @@ where
 {
     use ml_dsa::Verifier;
 
-    let encoded = ml_dsa::EncodedVerifyingKey::<P>::try_from(pub_key_bytes)
-        .map_err(|_| SignError::Verify(format!("invalid ML-DSA public key (expected {} bytes)", std::mem::size_of::<ml_dsa::EncodedVerifyingKey<P>>())))?;
+    let encoded = ml_dsa::EncodedVerifyingKey::<P>::try_from(pub_key_bytes).map_err(|_| {
+        SignError::Verify(format!(
+            "invalid ML-DSA public key (expected {} bytes)",
+            std::mem::size_of::<ml_dsa::EncodedVerifyingKey<P>>()
+        ))
+    })?;
 
     let vk = ml_dsa::VerifyingKey::<P>::decode(&encoded);
 
@@ -108,7 +114,9 @@ mod tests {
     #[test]
     fn verify_ecdsa_bundle_entries() {
         use crate::{
-            demo_ecdsa_p256_key, generate::GenerationConfig, produce_bundle,
+            demo_ecdsa_p256_key,
+            generate::GenerationConfig,
+            produce_bundle,
             source::{CaIdentity, CertificateStatus, StatusSnapshot},
         };
         use std::collections::BTreeMap;
@@ -140,7 +148,10 @@ mod tests {
         };
 
         let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
-            &ca, &snapshot, &config, &mut signer,
+            &ca,
+            &snapshot,
+            &config,
+            &mut signer,
             |m| crate::create_cms_seal(m, &seal_key, &seal_cert),
             Some(&responder_cert),
         )
@@ -159,8 +170,7 @@ mod tests {
 
     #[test]
     fn verify_ml_dsa_signature_direct() {
-        use ml_dsa::{MlDsa87, SigningKey, Signer as Signer3, Keypair};
-
+        use ml_dsa::{Keypair, MlDsa87, Signer as Signer3, SigningKey};
 
         let sk = SigningKey::<MlDsa87>::from_seed((&[42u8; 32]).into());
         let vk = sk.verifying_key();
@@ -175,8 +185,7 @@ mod tests {
 
     #[test]
     fn verify_ml_dsa_44_signature_direct() {
-        use ml_dsa::{MlDsa44, SigningKey, Signer as Signer3, Keypair};
-
+        use ml_dsa::{Keypair, MlDsa44, Signer as Signer3, SigningKey};
 
         let sk = SigningKey::<MlDsa44>::from_seed((&[1u8; 32]).into());
         let vk = sk.verifying_key();
@@ -191,8 +200,7 @@ mod tests {
 
     #[test]
     fn verify_wrong_message_fails() {
-        use ml_dsa::{MlDsa65, SigningKey, Signer as Signer3, Keypair};
-
+        use ml_dsa::{Keypair, MlDsa65, Signer as Signer3, SigningKey};
 
         let sk = SigningKey::<MlDsa65>::from_seed((&[5u8; 32]).into());
         let vk = sk.verifying_key();
@@ -201,14 +209,17 @@ mod tests {
         let sig_bytes = sig.encode();
         let vk_encoded = vk.encode();
 
-        let result = verify_ml_dsa::<MlDsa65>(b"wrong message", sig_bytes.as_ref(), vk_encoded.as_ref());
+        let result =
+            verify_ml_dsa::<MlDsa65>(b"wrong message", sig_bytes.as_ref(), vk_encoded.as_ref());
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_no_embedded_cert_errors() {
         use crate::{
-            demo_ecdsa_p256_key, generate::GenerationConfig, produce_bundle,
+            demo_ecdsa_p256_key,
+            generate::GenerationConfig,
+            produce_bundle,
             source::{CaIdentity, CertificateStatus, StatusSnapshot},
         };
         use std::collections::BTreeMap;
@@ -225,21 +236,36 @@ mod tests {
 
         let mut entries = BTreeMap::new();
         entries.insert(vec![0x01], CertificateStatus::Good);
-        let snapshot = StatusSnapshot { entries, this_update: 1700000000, next_update: None };
-        let config = GenerationConfig { producer_id: "test".into(), epoch: 1, ..Default::default() };
+        let snapshot = StatusSnapshot {
+            entries,
+            this_update: 1700000000,
+            next_update: None,
+        };
+        let config = GenerationConfig {
+            producer_id: "test".into(),
+            epoch: 1,
+            ..Default::default()
+        };
 
         let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
-            &ca, &snapshot, &config, &mut signer,
+            &ca,
+            &snapshot,
+            &config,
+            &mut signer,
             |m| crate::create_cms_seal(m, &seal_key, &seal_cert),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
         for record in &bundle.index {
             if let Some(entry_bytes) = bundle.entry_bytes(record) {
                 let result = verify_ocsp_response_signature(entry_bytes);
                 assert!(result.is_err());
-                assert!(matches!(result.unwrap_err(), crate::error::SignError::NoCert));
+                assert!(matches!(
+                    result.unwrap_err(),
+                    crate::error::SignError::NoCert
+                ));
             }
         }
     }

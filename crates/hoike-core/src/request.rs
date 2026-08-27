@@ -139,13 +139,10 @@ fn sig_oid_to_discriminator(oid: &const_oid::ObjectIdentifier) -> Option<u16> {
     }
 }
 
-fn parse_preferred_sig_algs(
-    extensions: Option<&x509_cert::ext::Extensions>,
-) -> Vec<u16> {
+fn parse_preferred_sig_algs(extensions: Option<&x509_cert::ext::Extensions>) -> Vec<u16> {
     use der::Decode;
 
-    let pref_sig_algs_oid =
-        const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.8");
+    let pref_sig_algs_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1.8");
 
     let ext = match extensions {
         Some(exts) => match exts.iter().find(|e| e.extn_id == pref_sig_algs_oid) {

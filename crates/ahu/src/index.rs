@@ -261,11 +261,7 @@ mod tests {
 
     #[test]
     fn binary_search_with_discriminator_finds_variant() {
-        let records = vec![
-            rec(0x01, 0),
-            rec(0x01, ALG_DISC_ML_DSA_87),
-            rec(0x02, 0),
-        ];
+        let records = vec![rec(0x01, 0), rec(0x01, ALG_DISC_ML_DSA_87), rec(0x02, 0)];
 
         let mut key = [0u8; 32];
         key[0] = 0x01;

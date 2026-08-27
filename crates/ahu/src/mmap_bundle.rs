@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::error::{AhuError, Result};
 use crate::header::{FileHeader, HEADER_SIZE};
-use crate::index::{IndexFlags, INDEX_RECORD_SIZE};
+use crate::index::{INDEX_RECORD_SIZE, IndexFlags};
 use crate::manifest::Manifest;
 
 /// A memory-mapped ahu bundle for zero-copy serving at scale.

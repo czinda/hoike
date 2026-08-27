@@ -157,15 +157,27 @@ where
     let this_update = ocsp_time(now)?;
 
     let prepared = prepare_entries(
-        snapshot, config, &sha256_oid, &sha1_oid,
-        &issuer_name_hash_sha256, &issuer_key_hash_sha256,
-        &issuer_name_hash_sha1, &issuer_key_hash_sha1,
-        this_update, next_update_base,
+        snapshot,
+        config,
+        &sha256_oid,
+        &sha1_oid,
+        &issuer_name_hash_sha256,
+        &issuer_key_hash_sha256,
+        &issuer_name_hash_sha1,
+        &issuer_key_hash_sha1,
+        this_update,
+        next_update_base,
     )?;
 
     sign_and_add_entries(
-        &mut builder, &prepared, config.bucket_size,
-        signer, &responder_id, responder_cert_der, produced_at, 0,
+        &mut builder,
+        &prepared,
+        config.bucket_size,
+        signer,
+        &responder_id,
+        responder_cert_der,
+        produced_at,
+        0,
     )?;
 
     builder
@@ -316,10 +328,16 @@ where
     let this_update = ocsp_time(now)?;
 
     let prepared = prepare_entries(
-        snapshot, config, &sha256_oid, &sha1_oid,
-        &issuer_name_hash_sha256, &issuer_key_hash_sha256,
-        &issuer_name_hash_sha1, &issuer_key_hash_sha1,
-        this_update, next_update_base,
+        snapshot,
+        config,
+        &sha256_oid,
+        &sha1_oid,
+        &issuer_name_hash_sha256,
+        &issuer_key_hash_sha256,
+        &issuer_name_hash_sha1,
+        &issuer_key_hash_sha1,
+        this_update,
+        next_update_base,
     )?;
 
     let responder_id_classical =
@@ -328,14 +346,24 @@ where
         ResponderId::ByKey(OctetString::new(responder_key_hash_pq).map_err(SignError::Der)?);
 
     sign_and_add_entries(
-        &mut builder, &prepared, config.bucket_size,
-        signer_classical, &responder_id_classical,
-        responder_cert_classical, produced_at, 0,
+        &mut builder,
+        &prepared,
+        config.bucket_size,
+        signer_classical,
+        &responder_id_classical,
+        responder_cert_classical,
+        produced_at,
+        0,
     )?;
     sign_and_add_entries(
-        &mut builder, &prepared, config.bucket_size,
-        signer_pq, &responder_id_pq,
-        responder_cert_pq, produced_at, disc_pq,
+        &mut builder,
+        &prepared,
+        config.bucket_size,
+        signer_pq,
+        &responder_id_pq,
+        responder_cert_pq,
+        produced_at,
+        disc_pq,
     )?;
 
     builder
@@ -378,13 +406,21 @@ fn add_shared_entries(
             builder.add_entry_with_discriminator(keys[0], discriminator, response_der);
         }
         2 => {
-            builder.add_dual_entry_with_discriminator(keys[0], keys[1], response_der, discriminator);
+            builder.add_dual_entry_with_discriminator(
+                keys[0],
+                keys[1],
+                response_der,
+                discriminator,
+            );
         }
         _ => {
             let mut i = 0;
             while i + 1 < keys.len() {
                 builder.add_dual_entry_with_discriminator(
-                    keys[i], keys[i + 1], response_der.clone(), discriminator,
+                    keys[i],
+                    keys[i + 1],
+                    response_der.clone(),
+                    discriminator,
                 );
                 i += 2;
             }
@@ -924,17 +960,19 @@ mod tests {
         let mut ecdsa_signer = test_signing_key();
         let mut ml_dsa_signer = crate::ml_dsa_87_signer(&[42u8; 32]);
 
-        let bundle_bytes = produce_dual_bundle::<
-            _, p256::ecdsa::DerSignature,
-            _, crate::MlDsaSignatureBytes,
-        >(
-            &ca, &snapshot, &config,
-            &mut ecdsa_signer, &mut ml_dsa_signer,
-            ahu::ALG_DISC_ML_DSA_87,
-            |m| Ok(Sha256::digest(m).to_vec()),
-            None, None,
-        )
-        .unwrap();
+        let bundle_bytes =
+            produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, crate::MlDsaSignatureBytes>(
+                &ca,
+                &snapshot,
+                &config,
+                &mut ecdsa_signer,
+                &mut ml_dsa_signer,
+                ahu::ALG_DISC_ML_DSA_87,
+                |m| Ok(Sha256::digest(m).to_vec()),
+                None,
+                None,
+            )
+            .unwrap();
 
         let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
         let result = ahu::verify_structure(&bundle).unwrap();
@@ -957,17 +995,19 @@ mod tests {
         let mut ecdsa_signer = test_signing_key();
         let mut ml_dsa_signer = crate::ml_dsa_87_signer(&[7u8; 32]);
 
-        let bundle_bytes = produce_dual_bundle::<
-            _, p256::ecdsa::DerSignature,
-            _, crate::MlDsaSignatureBytes,
-        >(
-            &ca, &snapshot, &config,
-            &mut ecdsa_signer, &mut ml_dsa_signer,
-            ahu::ALG_DISC_ML_DSA_87,
-            |m| Ok(Sha256::digest(m).to_vec()),
-            None, None,
-        )
-        .unwrap();
+        let bundle_bytes =
+            produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, crate::MlDsaSignatureBytes>(
+                &ca,
+                &snapshot,
+                &config,
+                &mut ecdsa_signer,
+                &mut ml_dsa_signer,
+                ahu::ALG_DISC_ML_DSA_87,
+                |m| Ok(Sha256::digest(m).to_vec()),
+                None,
+                None,
+            )
+            .unwrap();
 
         let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
 

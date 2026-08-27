@@ -161,13 +161,28 @@ impl MlDsaSignerVariant {
     ) -> crate::error::Result<Vec<u8>> {
         match self {
             Self::MlDsa44(s) => crate::generate::produce_bundle::<_, MlDsaSignatureBytes>(
-                ca, snapshot, config, s, seal_fn, responder_cert_der,
+                ca,
+                snapshot,
+                config,
+                s,
+                seal_fn,
+                responder_cert_der,
             ),
             Self::MlDsa65(s) => crate::generate::produce_bundle::<_, MlDsaSignatureBytes>(
-                ca, snapshot, config, s, seal_fn, responder_cert_der,
+                ca,
+                snapshot,
+                config,
+                s,
+                seal_fn,
+                responder_cert_der,
             ),
             Self::MlDsa87(s) => crate::generate::produce_bundle::<_, MlDsaSignatureBytes>(
-                ca, snapshot, config, s, seal_fn, responder_cert_der,
+                ca,
+                snapshot,
+                config,
+                s,
+                seal_fn,
+                responder_cert_der,
             ),
         }
     }
@@ -179,13 +194,22 @@ pub fn load_ml_dsa_signer_from_pkcs8_der(der_bytes: &[u8]) -> Result<MlDsaSigner
     use ml_dsa::pkcs8::DecodePrivateKey;
 
     if let Ok(sk) = mldsa::SigningKey::<mldsa::MlDsa44>::from_pkcs8_der(der_bytes) {
-        return Ok(MlDsaSignerVariant::MlDsa44(MlDsaSigner::new(sk, ML_DSA_44_OID)));
+        return Ok(MlDsaSignerVariant::MlDsa44(MlDsaSigner::new(
+            sk,
+            ML_DSA_44_OID,
+        )));
     }
     if let Ok(sk) = mldsa::SigningKey::<mldsa::MlDsa65>::from_pkcs8_der(der_bytes) {
-        return Ok(MlDsaSignerVariant::MlDsa65(MlDsaSigner::new(sk, ML_DSA_65_OID)));
+        return Ok(MlDsaSignerVariant::MlDsa65(MlDsaSigner::new(
+            sk,
+            ML_DSA_65_OID,
+        )));
     }
     if let Ok(sk) = mldsa::SigningKey::<mldsa::MlDsa87>::from_pkcs8_der(der_bytes) {
-        return Ok(MlDsaSignerVariant::MlDsa87(MlDsaSigner::new(sk, ML_DSA_87_OID)));
+        return Ok(MlDsaSignerVariant::MlDsa87(MlDsaSigner::new(
+            sk,
+            ML_DSA_87_OID,
+        )));
     }
 
     Err("key does not contain a valid ML-DSA-44, ML-DSA-65, or ML-DSA-87 PKCS#8 private key".into())
