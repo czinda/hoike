@@ -247,12 +247,10 @@ mod tests {
     #[test]
     fn rotation_check_renew_soon() {
         let not_before = der::DateTime::new(2026, 1, 1, 0, 0, 0).unwrap();
-        // Set notAfter to 3 days from a reference — but since we use real clock,
-        // use a date far in the future and a huge threshold to force RenewSoon.
-        let not_after = der::DateTime::new(2026, 8, 22, 0, 0, 0).unwrap();
+        let not_after = der::DateTime::new(2030, 1, 1, 0, 0, 0).unwrap();
         let cert_der = build_test_cert(not_before, not_after);
 
-        // Threshold of 10 years — anything within 10 years triggers RenewSoon
+        // Threshold of 10 years — cert expires within threshold so triggers RenewSoon
         let ten_years_secs = 365 * 24 * 3600 * 10;
         let status = check_rotation_needed(&cert_der, ten_years_secs).unwrap();
         assert!(
