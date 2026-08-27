@@ -14,6 +14,7 @@ struct Cli {
 }
 
 #[derive(clap::Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the OCSP responder
     Serve {
@@ -324,6 +325,7 @@ async fn run_server(config_path: PathBuf) {
 type PersistentSources = std::collections::HashMap<String, Box<dyn hoike_sign::RevocationSource>>;
 
 #[allow(unused_mut)]
+#[allow(unreachable_code)]
 fn create_persistent_sources(config: &hoike_core::Config) -> std::result::Result<PersistentSources, String> {
     let mut sources = PersistentSources::new();
     for ca_config in &config.ca {
@@ -569,6 +571,7 @@ fn run_signer_pass_with_sources(
 }
 
 // Keep old function for non-combined modes that don't need persistent sources
+#[allow(dead_code)]
 fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), String> {
     use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
     use sha2_v010::Digest as _;

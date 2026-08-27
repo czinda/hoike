@@ -89,7 +89,7 @@ pub fn load_ml_dsa_key(path: &Path) -> Result<MlDsaSignerVariant> {
         data
     };
 
-    load_ml_dsa_signer_from_pkcs8_der(&der_bytes).map_err(|e| SignError::KeyLoad(e))
+    load_ml_dsa_signer_from_pkcs8_der(&der_bytes).map_err(SignError::KeyLoad)
 }
 
 /// Generate an ephemeral ECDSA P-256 signing key for demo/testing use only.
