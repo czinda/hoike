@@ -2,14 +2,14 @@
 
 **A Rust OCSP responder for pre-signed, replayable, multi-CA, highly available status.**
 
-**Version:** 0.1 draft
+**Version:** 0.2
 **Author:** Chris Zinda
 **Companion:** `ahu-format-spec.md`
 
-> **Implementation status:** This document is the target architecture and
-> roadmap. For what is currently implemented vs planned, see
-> [README.md](README.md) — specifically the Known Limitations section.
-> Not every adapter, mode, or configuration described here has code behind it yet.
+> **Implementation status:** Most features described here are implemented in
+> v0.2.0. For remaining gaps, see [README.md](README.md) — specifically the
+> Known Limitations section. Gossip authentication, full PKIX seal chain
+> validation, and several revocation source adapters remain planned.
 
 ---
 
@@ -174,13 +174,13 @@ trait RevocationSource {
 
 Planned adapters:
 
-| Adapter | Notes |
-|---|---|
-| Red Hat Certificate System / Dogtag | REST; the primary target. Also the source of issued-but-not-revoked enumeration. |
-| Red Hat Directory Server / 389 | Direct LDAP against the CA's certificate repository; persistent search for change streaming. |
-| CRL ingest | Lowest common denominator. Works against any CA, including ones you do not operate. Cannot distinguish "unknown" from "not issued". |
-| akamu | Native event feed from the ACME CA. |
-| SQL | Generic table contract for bespoke PKIs. |
+| Adapter | Status | Notes |
+|---|---|---|
+| CRL ingest | **Implemented** | Lowest common denominator. Works against any CA. Cannot distinguish "unknown" from "not issued". |
+| Red Hat Directory Server / 389 DS syncrepl | **Implemented** | RFC 4533 Content Synchronization against the CA's certificate repository. Provides positive issuance for `authoritative-complete` bundles. |
+| Red Hat Certificate System / Dogtag REST | Planned | REST; the primary target. Also the source of issued-but-not-revoked enumeration. |
+| akamu | Planned | Native event feed from the ACME CA. |
+| SQL | Planned | Generic table contract for bespoke PKIs. |
 
 Note the CRL-ingest asymmetry: from a CRL you learn who is revoked but not who
 was ever issued, so a CRL-sourced scope cannot be `authoritative-complete` and
@@ -525,8 +525,7 @@ hoike/
 │   ├── hoike-server/         # HTTP, request path
 │   ├── hoike-gossip/         # SWIM membership + announcements
 │   └── hoike-cli/            # hoike + ahu binaries
-├── spec/
-│   └── ahu-format.md         # versioned independently of the daemon
+├── ahu-format-spec.md        # versioned independently of the daemon
 └── testdata/                 # vectors from spec §8
 ```
 
@@ -614,6 +613,7 @@ classical one to demonstrate both.
    construction and that is a much stronger story to sell. If any target
    customer contractually requires nonce binding, they cannot be. This decision
    shapes the trust boundary and should be settled before M1.
+   **Resolved:** `live` and `forward` are implemented as per-CA configuration options.
 2. **CA-direct signing as a supported mode**, given how much it saves under
    post-quantum signatures, against the operational cost of the CA key living in
    the signing tier.
@@ -623,4 +623,4 @@ classical one to demonstrate both.
    creep now, but designing the source adapters so it stays possible costs
    nothing today.
 5. **Seal encoding** — CMS as specified, or COSE. Carried over from the format
-   spec.
+   spec. **Resolved:** CMS `SignedData` is the implemented seal format, supporting both ECDSA P-256 and ML-DSA.

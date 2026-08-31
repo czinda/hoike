@@ -222,7 +222,7 @@ async fn run_server(config_path: PathBuf) {
         std::process::exit(1);
     });
 
-    let mut app_state = hoike_server::AppState::new(state);
+    let mut app_state = hoike_server::AppState::new(state, config.clone());
 
     // If any CA has nonce_policy=live, load a signing key for live responses
     let has_live_nonce = config.ca.iter().any(|ca| ca.nonce_policy == "live");

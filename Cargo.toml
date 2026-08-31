@@ -55,4 +55,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arc-swap = "1"
 percent-encoding = "2"
+bcrypt = "0.17"
+rand = "0.9"
+include_dir = "0.7"
 ml-dsa = { version = "0.1", features = ["pkcs8"] }

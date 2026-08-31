@@ -11,7 +11,7 @@ ahu = { path = "../ahu" }
 hoike-core = { path = "../hoike-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { version = "0.6", features = ["trace", "fs", "cors"] }
 hyper = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -24,6 +24,16 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hoike-sign = { path = "../hoike-sign" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 signature = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+bcrypt = { workspace = true }
+rand = { workspace = true }
+include_dir = { workspace = true, optional = true }
+toml = { workspace = true }
+
+[features]
+default = []
+embed-webui = ["dep:include_dir"]
 
 [dev-dependencies]
 tempfile = "3"

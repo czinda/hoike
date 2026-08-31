@@ -194,8 +194,8 @@ bundle_file = "{bundle}"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config).unwrap();
-    let app_state = hoike_server::AppState::new(state);
+    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    let app_state = hoike_server::AppState::new(state, config);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -345,8 +345,8 @@ state_db = "{dir}/state"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config).unwrap();
-    let app_state = hoike_server::AppState::new(state);
+    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    let app_state = hoike_server::AppState::new(state, config);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -848,7 +848,7 @@ type = "demo"
     std::fs::write(dir.path().join("dummy.crl"), b"").unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config).unwrap();
+    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
 
     let demo_key = hoike_sign::demo_ecdsa_p256_key();
     let live = hoike_server::LiveSignerState {
@@ -857,7 +857,7 @@ type = "demo"
         validity_secs: 86400,
         responder_cert_der: None,
     };
-    let app_state = hoike_server::AppState::new(state).with_live_signer(live);
+    let app_state = hoike_server::AppState::new(state, config).with_live_signer(live);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

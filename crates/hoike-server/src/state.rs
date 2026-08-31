@@ -1,15 +1,17 @@
+use hoike_core::config::Config;
 use hoike_core::ResponderState;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
-/// Shared application state, cheaply cloneable via Arc.
 #[derive(Clone)]
 pub struct AppState {
     pub responder: Arc<ResponderState>,
     pub live_signer: Option<Arc<LiveSignerState>>,
+    pub admin: Arc<AdminState>,
 }
 
-/// Holds the signing key and responder identity for live nonce signing.
 pub struct LiveSignerState {
     pub signer: Mutex<p256::ecdsa::SigningKey>,
     pub responder_key_bytes: Vec<u8>,
@@ -17,11 +19,73 @@ pub struct LiveSignerState {
     pub responder_cert_der: Option<Vec<u8>>,
 }
 
+pub struct AdminState {
+    pub config: Config,
+    pub started_at: Instant,
+    pub sessions: Mutex<HashMap<String, Session>>,
+}
+
+#[derive(Clone)]
+pub struct Session {
+    pub operator_name: String,
+    pub role: OperatorRole,
+    pub expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OperatorRole {
+    Administrator,
+    Operator,
+    Viewer,
+}
+
+impl OperatorRole {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Viewer => 1,
+            Self::Operator => 2,
+            Self::Administrator => 3,
+        }
+    }
+
+    pub fn has_at_least(self, min: Self) -> bool {
+        self.rank() >= min.rank()
+    }
+}
+
+impl std::str::FromStr for OperatorRole {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "administrator" => Ok(Self::Administrator),
+            "operator" => Ok(Self::Operator),
+            "viewer" => Ok(Self::Viewer),
+            other => Err(format!("unknown role: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for OperatorRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Administrator => write!(f, "administrator"),
+            Self::Operator => write!(f, "operator"),
+            Self::Viewer => write!(f, "viewer"),
+        }
+    }
+}
+
 impl AppState {
-    pub fn new(responder: ResponderState) -> Self {
+    pub fn new(responder: ResponderState, config: Config) -> Self {
         AppState {
             responder: Arc::new(responder),
             live_signer: None,
+            admin: Arc::new(AdminState {
+                config,
+                started_at: Instant::now(),
+                sessions: Mutex::new(HashMap::new()),
+            }),
         }
     }
 

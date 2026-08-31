@@ -12,10 +12,11 @@ and `ahu-format-spec.md` for the bundle format specification.
 ```bash
 cargo build                          # build all crates
 cargo build --features pkcs11        # with PKCS#11 HSM support
-cargo test --workspace               # 103 tests: unit, integration, e2e, conformance
+cargo test --workspace               # 131 tests: unit, integration, e2e, conformance
 cargo run --bin ahu -- inspect test.ahu
 cargo run --bin hoike -- serve --config testdata/hoike-test.toml
 cargo run --bin hoike -- sign --ca test --crl test.crl --demo-key -o test.ahu
+cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-name-b64 ... --issuer-key-b64 ...
 ```
 
 ## Workspace structure
@@ -64,6 +65,19 @@ cargo run --bin hoike -- sign --ca test --crl test.crl --demo-key -o test.ahu
   feature). Syncrepl provides positive issuance for `authoritative-complete` bundles.
 - **Key rotation**: Monitors responder cert expiry, logs warnings, executes
   `rotation_command` when configured.
+- **ML-DSA post-quantum signing**: ML-DSA-44/65/87 via PKCS#8 key loading with
+  auto-detection (`MlDsaSignerVariant`). Dual-algorithm bundles with RFC 6960
+  §4.4.7.1 PreferredSignatureAlgorithms negotiation. PKCS#11 ML-DSA via
+  CKM_ML_DSA. ML-DSA CMS seals. Bridged via `hoike-sign/src/ml_dsa_bridge.rs`.
+- **MmapBundle**: Zero-copy `MAP_PRIVATE` bundle reader in `ahu/src/mmap_bundle.rs`
+  for large-scale serving. Binary search directly on mmap'd index region.
+- **Bundle signature verification**: `hoike-sign/src/verify.rs` verifies OCSP
+  response signatures (ECDSA and ML-DSA).
+- **OCSP query client**: `hoike query` CLI diagnostic tool with `--prefer` for
+  algorithm negotiation.
+- **389 DS syncrepl adapter**: RFC 4533 Content Synchronization source for Dogtag
+  certificate databases in `hoike-sign/src/dogtag_sync.rs`. Persistent cookie,
+  positive issuance for `authoritative-complete` bundles.
 
 ## What is NOT implemented
 
@@ -71,8 +85,6 @@ cargo run --bin hoike -- sign --ca test --crl test.crl --demo-key -o test.ahu
 - **Seal trust anchor chain validation**: Verifies CMS signature integrity, but doesn't
   build a full PKIX path against trust anchors. Self-referential verification only.
 - **SCVP**: Server-based Certificate Validation Protocol — separate protocol, not planned.
-- **Issuer identity from cert**: `--issuer-name-b64` / `--issuer-key-b64` flags provide
-  issuer DER and key bytes. No automatic extraction from an issuer certificate file.
 
 ## Current state
 
@@ -81,4 +93,4 @@ delegated cert, live nonce, key rotation, syncrepl) are implemented. The design
 doc (`hoike-design.md`) is the roadmap — it describes the target architecture
 including features not yet built. The README describes what runs today.
 
-103 tests. 12,000+ lines of Rust. 37+ commits.
+131 tests. ~15,000 lines of Rust. 52 commits.

@@ -74,7 +74,7 @@ Binaries:
 - `target/release/hoike` — the OCSP responder (~8 MB)
 - `target/release/ahu` — bundle inspection and management tool (~1 MB)
 
-Running tests (103 tests across 6 crates):
+Running tests (131 tests across 6 crates):
 
 ```bash
 cargo test --workspace
@@ -100,6 +100,12 @@ hoike serve --config hoike.toml
 
 # Validate configuration before deploying
 hoike check --config hoike.toml
+
+# Query a running responder
+hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --issuer-key-b64 ...
+
+# Query with post-quantum algorithm preference
+hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --issuer-key-b64 ... --prefer ml-dsa-87
 ```
 
 ## CLI reference
@@ -112,6 +118,7 @@ hoike check --config hoike.toml
 | `hoike check --config PATH` | Validate config, bundle, cert expiry |
 | `hoike sign --ca LABEL --crl FILE [OPTIONS]` | Produce a signed ahu bundle from a CRL |
 | `hoike import --bundle PATH [--config PATH] [--force]` | Import a bundle for enclave/air-gap deployments |
+| `hoike query --url URL --serial HEX [OPTIONS]` | Query a running OCSP responder |
 
 **`hoike sign` options:**
 - `--signing-key PATH`: PKCS#8 PEM or DER signing key file (mutually exclusive with `--demo-key`)
@@ -122,13 +129,17 @@ hoike check --config hoike.toml
 - `--good-serials FILE`: hex serial numbers to mark as good (one per line)
 - `--issuer-name-b64`: base64-encoded DER issuer name (for correct CertID hashes)
 - `--issuer-key-b64`: base64-encoded issuer public key bytes
+- `--issuer PATH`: issuer certificate (DER) for CertID computation
+- `--seal-key PATH`: PKCS#8 PEM or DER P-256 seal key file (separate from signing key)
+- `--dual-alg ALG`: produce a dual-algorithm bundle (e.g. `ml-dsa-87`) alongside the classical `--sig-alg`
+- `--pq-signing-key PATH`: PKCS#8 PEM or DER PQ signing key file (for `--dual-alg`)
 
 ### ahu
 
 | Command | Description |
 |---------|-------------|
 | `ahu inspect FILE` | Display manifest, scopes, epochs, counts |
-| `ahu verify FILE [--entries]` | Verify CMS seal, digests, sort order |
+| `ahu verify FILE [--entries]` | Verify CMS seal, digests, sort order; optionally verify each OCSP response signature |
 | `ahu extract FILE --certid HEX` | Extract a single response by entry key |
 | `ahu diff A B` | Show differences between two generations |
 | `ahu apply BASE DELTAS... -o OUT` | Apply delta bundles to a base, producing a materialized full bundle |
@@ -164,7 +175,10 @@ path = "/var/lib/hoike/crls/enterprise.crl"
 # type = "dogtag-sync"
 # ldap_url = "ldap://ds-iot.cert-lab.local:3389"
 # base_dn = "ou=certificateRepository,ou=ca,o=pki-iot-ca-CA"
+# bind_dn = "cn=Directory Manager"
 # bind_password_env = "HOIKE_LDAP_PASSWORD"
+# filter = "(objectClass=certificateRecord)"
+# cookie_path = "/var/lib/hoike/syncrepl-cookie"
 
 # Signing key (required for combined/signer mode)
 [ca.signing_key]
@@ -180,14 +194,14 @@ pin_env     = "HOIKE_HSM_PIN"   # or omit for interactive prompt
 # path = "/etc/hoike/responder-01.p8"
 
 # CMS seal key (separate from OCSP signing key)
-# seal_key  = "/etc/hoike/seal-key.p8"
-# seal_cert = "/etc/hoike/seal-cert.pem"
+seal_key  = "/etc/hoike/seal-key.p8"
+seal_cert = "/etc/hoike/seal-cert.pem"
 
 # Key rotation monitoring
-# [ca.key_rotation]
-# renew_before_days = 7
-# check_interval_hours = 1
-# rotation_command = "/usr/local/bin/renew-ocsp-cert.sh"
+[ca.key_rotation]
+renew_before_days = 7
+check_interval_hours = 1
+rotation_command = "/usr/local/bin/renew-ocsp-cert.sh"
 
 # Gossip for edge fleet coordination
 [gossip]
@@ -202,7 +216,7 @@ node_name = "edge-01"
 ```
 hoike/
 ├── crates/
-│   ├── ahu/            # Bundle format: read, write, verify, CMS seal (Apache-2.0 OR MIT)
+│   ├── ahu/            # Bundle format: read, write, verify, CMS seal, mmap zero-copy (Apache-2.0 OR MIT)
 │   ├── hoike-core/     # CertID routing, request parsing, config, anti-rollback state store
 │   ├── hoike-sign/     # CRL + syncrepl adapters, OCSP response generation, CMS seal creation,
 │   │                   # live nonce signing, PKCS#11 bridge, ML-DSA bridge, key rotation

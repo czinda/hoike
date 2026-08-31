@@ -1,0 +1,46 @@
+:root {
+  --hoike-teal: #0A4D68;
+  --hoike-teal-dark: #073B50;
+  --hoike-green: #00A86B;
+  --hoike-green-light: #33C08A;
+  --hoike-green-dark: #008755;
+
+  --pf-t--global--color--brand--100: #e6f7ef;
+  --pf-t--global--color--brand--200: #99e0bc;
+  --pf-t--global--color--brand--300: #33c08a;
+  --pf-t--global--color--brand--default: var(--hoike-green);
+  --pf-t--global--color--brand--400: var(--hoike-green);
+  --pf-t--global--color--brand--500: var(--hoike-green-dark);
+
+  --pf-t--global--text--color--on-brand--default: #ffffff;
+  --pf-t--global--text--color--on-brand--clicked: #e6f7ef;
+}
+
+.pf-v6-c-masthead {
+  --pf-v6-c-masthead--BackgroundColor: var(--hoike-teal);
+  --pf-v6-c-masthead--m-display-inline--FlexBasis: auto;
+  color: #ffffff;
+}
+
+.pf-v6-c-page__sidebar {
+  --pf-v6-c-page__sidebar--BackgroundColor: var(--hoike-teal);
+}
+
+.pf-v6-c-page__sidebar .pf-v6-c-nav {
+  --pf-v6-c-nav--BackgroundColor: var(--hoike-teal);
+}
+
+.pf-v6-c-page__sidebar .pf-v6-c-nav__link {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.pf-v6-c-page__sidebar .pf-v6-c-nav__link:hover {
+  color: #ffffff;
+  background-color: var(--hoike-teal-dark);
+}
+
+.pf-v6-c-page__sidebar .pf-v6-c-nav__link.pf-m-current {
+  color: #ffffff;
+  background-color: var(--hoike-green);
+  border-radius: 4px;
+}

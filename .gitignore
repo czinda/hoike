@@ -25,3 +25,5 @@ Thumbs.db
 
 # Claude Code
 .claude/settings.local.json
+webui/dist/
+webui/node_modules/

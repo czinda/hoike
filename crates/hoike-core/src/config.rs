@@ -37,6 +37,36 @@ pub struct ServerConfig {
     pub listen: String,
     #[serde(default = "default_max_request")]
     pub max_request: usize,
+    pub admin: Option<AdminConfig>,
+    pub webui: Option<WebUiConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebUiConfig {
+    pub static_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdminConfig {
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+    #[serde(default)]
+    pub operators: Vec<OperatorConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OperatorConfig {
+    pub name: String,
+    pub password_hash: String,
+    #[serde(default = "default_operator_role")]
+    pub role: String,
+}
+
+fn default_session_ttl() -> u64 {
+    3600
+}
+fn default_operator_role() -> String {
+    "viewer".into()
 }
 
 #[derive(Debug, Deserialize, Clone)]
