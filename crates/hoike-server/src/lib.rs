@@ -54,7 +54,7 @@ mod embedded_ui {
     use axum::routing::get;
     use include_dir::{Dir, include_dir};
 
-    static WEBUI_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/webui/dist");
+    static WEBUI_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../webui/dist");
 
     pub fn webui_router() -> Router {
         Router::new()
@@ -62,22 +62,22 @@ mod embedded_ui {
             .route("/{*path}", get(serve_file))
     }
 
-    async fn serve_index() -> impl IntoResponse {
+    async fn serve_index() -> axum::response::Response {
         serve_path("index.html")
     }
 
-    async fn serve_file(Path(path): Path<String>) -> impl IntoResponse {
+    async fn serve_file(Path(path): Path<String>) -> axum::response::Response {
         serve_path(&path)
     }
 
-    fn serve_path(path: &str) -> impl IntoResponse {
+    fn serve_path(path: &str) -> axum::response::Response {
         match WEBUI_DIR.get_file(path) {
             Some(file) => {
                 let mime = mime_from_path(path);
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, mime)],
-                    file.contents(),
+                    file.contents().to_vec(),
                 )
                     .into_response()
             }
@@ -86,7 +86,7 @@ mod embedded_ui {
                     (
                         StatusCode::OK,
                         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                        index.contents(),
+                        index.contents().to_vec(),
                     )
                         .into_response()
                 } else {
