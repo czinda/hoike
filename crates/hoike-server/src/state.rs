@@ -1,5 +1,5 @@
-use hoike_core::config::Config;
 use hoike_core::ResponderState;
+use hoike_core::config::Config;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;

@@ -1,9 +1,9 @@
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
 
-use crate::state::{AppState, OperatorRole};
 use super::rbac::Authenticated;
+use crate::state::{AppState, OperatorRole};
 
 pub async fn reload_bundles(
     State(state): State<AppState>,
@@ -27,10 +27,7 @@ pub async fn reload_bundles(
     }
 }
 
-pub async fn inspect_bundle(
-    auth: Authenticated,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
+pub async fn inspect_bundle(auth: Authenticated, body: axum::body::Bytes) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Operator) {
         return e;
     }
@@ -73,10 +70,7 @@ pub async fn inspect_bundle(
     }
 }
 
-pub async fn verify_bundle(
-    auth: Authenticated,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
+pub async fn verify_bundle(auth: Authenticated, body: axum::body::Bytes) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Operator) {
         return e;
     }

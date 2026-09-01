@@ -1,10 +1,10 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Serialize;
 
-use crate::state::{AppState, OperatorRole};
 use super::rbac::Authenticated;
+use crate::state::{AppState, OperatorRole};
 
 #[derive(Serialize)]
 struct ServerStatus {
@@ -17,10 +17,7 @@ struct ServerStatus {
     scope_count: usize,
 }
 
-pub async fn get_status(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_status(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
@@ -53,10 +50,7 @@ struct WindowInfo {
     next_update_max: u64,
 }
 
-pub async fn get_bundles(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_bundles(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
@@ -82,7 +76,8 @@ pub async fn get_bundles(
     Json(serde_json::json!({
         "bundles": bundles,
         "total_entries": state.responder.total_entries(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 pub async fn get_bundle_detail(
@@ -96,28 +91,21 @@ pub async fn get_bundle_detail(
     let scopes = state.responder.scope_info();
     let scope = scopes.iter().find(|(l, _, _)| l == &label);
     match scope {
-        Some((ca_label, epoch, completeness)) => {
-            Json(serde_json::json!({
-                "ca_label": ca_label,
-                "epoch": epoch,
-                "completeness": completeness,
-            }))
-            .into_response()
-        }
-        None => {
-            (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"detail": format!("CA '{label}' not found")})),
-            )
-                .into_response()
-        }
+        Some((ca_label, epoch, completeness)) => Json(serde_json::json!({
+            "ca_label": ca_label,
+            "epoch": epoch,
+            "completeness": completeness,
+        }))
+        .into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"detail": format!("CA '{label}' not found")})),
+        )
+            .into_response(),
     }
 }
 
-pub async fn get_certs(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_certs(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
@@ -143,10 +131,7 @@ pub async fn get_certs(
     Json(serde_json::json!({ "certs": certs })).into_response()
 }
 
-pub async fn get_rotation(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_rotation(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
@@ -165,9 +150,9 @@ pub async fn get_rotation(
                             hoike_sign::rotation::RotationStatus::Ok { expires_in_secs } => {
                                 ("ok", Some(expires_in_secs))
                             }
-                            hoike_sign::rotation::RotationStatus::RenewSoon {
-                                expires_in_secs,
-                            } => ("renew_soon", Some(expires_in_secs)),
+                            hoike_sign::rotation::RotationStatus::RenewSoon { expires_in_secs } => {
+                                ("renew_soon", Some(expires_in_secs))
+                            }
                             hoike_sign::rotation::RotationStatus::Expired => ("expired", None),
                         };
                         statuses.push(serde_json::json!({
@@ -190,10 +175,7 @@ pub async fn get_rotation(
     Json(serde_json::json!({ "rotation": statuses })).into_response()
 }
 
-pub async fn get_gossip(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_gossip(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
@@ -210,10 +192,7 @@ pub async fn get_gossip(
     .into_response()
 }
 
-pub async fn get_config(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_config(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
@@ -255,19 +234,11 @@ pub async fn get_config(
     .into_response()
 }
 
-pub async fn get_state(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn get_state(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
-    let state_path = state
-        .admin
-        .config
-        .storage
-        .state_db
-        .join("state.json");
+    let state_path = state.admin.config.storage.state_db.join("state.json");
     match std::fs::read_to_string(&state_path) {
         Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
             Ok(val) => Json(val).into_response(),

@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -52,17 +52,15 @@ pub async fn login(
     let password = req.password.clone();
     let hash = operator.password_hash.clone();
     let op_name = operator.name.clone();
-    let password_ok = tokio::task::spawn_blocking(move || {
-        match bcrypt::verify(&password, &hash) {
-            Ok(valid) => valid,
-            Err(e) => {
-                tracing::warn!(
-                    operator = %op_name,
-                    error = %e,
-                    "bcrypt verification error — check password_hash format in config"
-                );
-                false
-            }
+    let password_ok = tokio::task::spawn_blocking(move || match bcrypt::verify(&password, &hash) {
+        Ok(valid) => valid,
+        Err(e) => {
+            tracing::warn!(
+                operator = %op_name,
+                error = %e,
+                "bcrypt verification error — check password_hash format in config"
+            );
+            false
         }
     })
     .await
@@ -75,10 +73,7 @@ pub async fn login(
             .into_response();
     }
 
-    let role: OperatorRole = operator
-        .role
-        .parse()
-        .unwrap_or(OperatorRole::Viewer);
+    let role: OperatorRole = operator.role.parse().unwrap_or(OperatorRole::Viewer);
 
     let ttl = admin_config.session_ttl_secs;
     let token = generate_token();
@@ -88,7 +83,12 @@ pub async fn login(
         expires_at: Instant::now() + Duration::from_secs(ttl),
     };
 
-    state.admin.sessions.lock().await.insert(token.clone(), session);
+    state
+        .admin
+        .sessions
+        .lock()
+        .await
+        .insert(token.clone(), session);
 
     Json(LoginResponse {
         session_token: token,
@@ -99,7 +99,10 @@ pub async fn login(
     .into_response()
 }
 
-pub async fn logout(State(state): State<AppState>, req: axum::http::Request<axum::body::Body>) -> impl IntoResponse {
+pub async fn logout(
+    State(state): State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
     if let Some(token) = extract_bearer_token(&req) {
         state.admin.sessions.lock().await.remove(token);
     }

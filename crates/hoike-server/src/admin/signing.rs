@@ -1,9 +1,9 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
-use axum::Json;
 
-use crate::state::{AppState, OperatorRole};
 use super::rbac::Authenticated;
+use crate::state::{AppState, OperatorRole};
 
 pub async fn sign_ca(
     State(state): State<AppState>,
@@ -39,10 +39,7 @@ pub async fn sign_ca(
         .into_response()
 }
 
-pub async fn sign_all(
-    State(state): State<AppState>,
-    auth: Authenticated,
-) -> impl IntoResponse {
+pub async fn sign_all(State(state): State<AppState>, auth: Authenticated) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Operator) {
         return e;
     }
@@ -53,7 +50,13 @@ pub async fn sign_all(
         )
             .into_response();
     }
-    let labels: Vec<&str> = state.admin.config.ca.iter().map(|ca| ca.label.as_str()).collect();
+    let labels: Vec<&str> = state
+        .admin
+        .config
+        .ca
+        .iter()
+        .map(|ca| ca.label.as_str())
+        .collect();
     (
         axum::http::StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({

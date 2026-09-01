@@ -7,7 +7,7 @@ mod status;
 
 use crate::state::AppState;
 use axum::Router;
-use axum::routing::{get, post, delete};
+use axum::routing::{delete, get, post};
 
 pub fn build_admin_router(state: AppState) -> Router {
     Router::new()

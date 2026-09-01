@@ -1,10 +1,10 @@
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
 
-use crate::state::{AppState, OperatorRole};
 use super::rbac::Authenticated;
+use crate::state::{AppState, OperatorRole};
 
 #[derive(Deserialize)]
 pub struct QueryRequest {

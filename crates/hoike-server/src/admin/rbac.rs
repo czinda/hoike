@@ -1,8 +1,8 @@
+use axum::Json;
 use axum::extract::FromRequestParts;
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use crate::state::{AppState, OperatorRole};
 
