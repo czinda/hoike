@@ -13,6 +13,9 @@
 //! This module is gated behind the `pkcs11` feature flag because it links
 //! against the PKCS#11 C library at build time.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::Mechanism;
 use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
@@ -21,6 +24,49 @@ use cryptoki::types::AuthPin;
 use tracing::info;
 
 use crate::error::{Result, SignError};
+
+/// Return a process-wide shared PKCS#11 context for `module_path`, initializing
+/// it exactly once.
+///
+/// PKCS#11 requires `C_Initialize` to be called exactly once per module per
+/// process; a second call returns `CKR_CRYPTOKI_ALREADY_INITIALIZED`. A single
+/// signer pass constructs a fresh signer for every CA and — for dual-algorithm
+/// bundles — both a classical and a PQ signer, so constructing each with its own
+/// `Pkcs11::new()` + `initialize()` made every signer after the first fail,
+/// halting bundle production. cryptoki never calls `C_Finalize` on drop (only via
+/// the explicit consuming `Pkcs11::finalize`), so the module stays initialized for
+/// the life of the process and re-initialization never becomes valid again.
+///
+/// We therefore initialize each module once and hand out cheap `Pkcs11` clones
+/// (the context is an `Arc` internally; a `Session` keeps its own clone alive).
+/// The cached context is intentionally held for the life of the process — this
+/// matches cryptoki's existing no-finalize-on-drop behavior.
+fn shared_context(module_path: &str) -> Result<Pkcs11> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Pkcs11>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry
+        .lock()
+        .map_err(|_| SignError::Pkcs11("PKCS#11 context registry lock poisoned".into()))?;
+
+    if let Some(ctx) = map.get(module_path) {
+        return Ok(ctx.clone());
+    }
+
+    let ctx = Pkcs11::new(module_path)
+        .map_err(|e| SignError::Pkcs11(format!("load module '{module_path}': {e}")))?;
+    match ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+        Ok(()) => {}
+        // Already initialized in this process (e.g. by another handle) — reuse it.
+        Err(cryptoki::error::Error::Pkcs11(
+            cryptoki::error::RvError::CryptokiAlreadyInitialized,
+            _,
+        )) => {}
+        Err(e) => return Err(SignError::Pkcs11(format!("initialize: {e}"))),
+    }
+
+    map.insert(module_path.to_string(), ctx.clone());
+    Ok(ctx)
+}
 
 /// Configuration for a PKCS#11 signing key.
 #[derive(Clone)]
@@ -58,11 +104,7 @@ pub struct Pkcs11Signer {
 
 impl Pkcs11Signer {
     pub fn new(config: &Pkcs11Config) -> Result<Self> {
-        let ctx = Pkcs11::new(&config.module_path)
-            .map_err(|e| SignError::Pkcs11(format!("load module '{}': {e}", config.module_path)))?;
-
-        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .map_err(|e| SignError::Pkcs11(format!("initialize: {e}")))?;
+        let ctx = shared_context(&config.module_path)?;
 
         let slot = find_slot(&ctx, config)?;
 
@@ -200,11 +242,7 @@ impl Pkcs11MlDsaSigner {
         parameter_set: cryptoki::object::MlDsaParameterSetType,
         sig_alg_oid: &'static str,
     ) -> Result<Self> {
-        let ctx = Pkcs11::new(&config.module_path)
-            .map_err(|e| SignError::Pkcs11(format!("load module '{}': {e}", config.module_path)))?;
-
-        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .map_err(|e| SignError::Pkcs11(format!("initialize: {e}")))?;
+        let ctx = shared_context(&config.module_path)?;
 
         let slot = find_slot(&ctx, config)?;
 

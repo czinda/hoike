@@ -104,10 +104,25 @@ impl StateStore {
 
     pub fn check_rollback(&self, bundle: &Bundle) -> Result<()> {
         let producer_id = &bundle.manifest.producer_id;
+        let manifest_digest: [u8; 32] = Sha256::digest(&bundle.manifest_bytes).into();
         for scope in &bundle.manifest.ca_scopes {
             let ikh = hex::encode(&scope.issuer_key_hash);
             if let Some(hw) = self.get_high_water(producer_id, &ikh) {
-                if scope.epoch <= hw {
+                // A strictly older epoch is always a rollback.
+                if scope.epoch < hw {
+                    return Err(CoreError::EpochRollback {
+                        scope: format!("{}:{}", producer_id, &ikh[..16.min(ikh.len())]),
+                        epoch: scope.epoch,
+                        high_water: hw,
+                    });
+                }
+                // Re-loading at the current high-water epoch is legitimate only
+                // when it is the *same* bundle (identical manifest digest) — e.g.
+                // a process restart reloading its own state. A *different* bundle
+                // at the same epoch is a fork/rollback attack and is rejected.
+                if scope.epoch == hw
+                    && self.get_manifest_digest(producer_id, &ikh) != Some(manifest_digest)
+                {
                     return Err(CoreError::EpochRollback {
                         scope: format!("{}:{}", producer_id, &ikh[..16.min(ikh.len())]),
                         epoch: scope.epoch,

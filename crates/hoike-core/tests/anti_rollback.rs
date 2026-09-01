@@ -96,15 +96,60 @@ fn rollback_rejected() {
         "expected rollback error, got: {err}"
     );
 
-    let (bundle_5_again, _) = make_bundle("test-producer", 5, None);
-    let err = store.check_rollback(&bundle_5_again).unwrap_err();
+    // Reloading the *identical* bundle at the current high-water epoch is a
+    // legitimate restart, not a rollback. (Previously rejected by a `<=` check,
+    // which crashed the signer on any same-epoch reload.)
+    let (bundle_5_reload, _) = make_bundle("test-producer", 5, None);
+    store
+        .check_rollback(&bundle_5_reload)
+        .expect("reloading the identical bundle at the high-water epoch must be allowed");
+
+    // A *different* bundle at the same epoch (different manifest digest) is a
+    // fork/rollback attack and must still be rejected.
+    let (bundle_5_fork, _) = make_bundle("test-producer", 5, Some([0x99; 32]));
+    let err = store.check_rollback(&bundle_5_fork).unwrap_err();
     assert!(
         format!("{err}").contains("rollback"),
-        "equal epoch should also be rejected, got: {err}"
+        "a different bundle at the same epoch must be rejected, got: {err}"
     );
 
     let (bundle_6, _) = make_bundle("test-producer", 6, None);
     store.check_rollback(&bundle_6).unwrap();
+}
+
+#[test]
+fn same_epoch_identical_bundle_reload_allowed() {
+    // Regression test for the anti-rollback same-epoch restart bug: a signer
+    // (or edge) that restarts and reloads its own most-recent bundle must not be
+    // rejected as a rollback, but a forged different bundle at that epoch must be.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+
+    // First boot: accept and record epoch 7.
+    {
+        let mut store = StateStore::open(&path).unwrap();
+        let (bundle_7, _) = make_bundle("test-producer", 7, None);
+        store.check_rollback(&bundle_7).unwrap();
+        store.advance_from_bundle(&bundle_7).unwrap();
+    }
+
+    // Restart: a fresh StateStore loads persisted high-water + digest, then
+    // reloads the identical epoch-7 bundle from disk. Must be allowed.
+    {
+        let store = StateStore::open(&path).unwrap();
+        let (bundle_7_reload, _) = make_bundle("test-producer", 7, None);
+        store
+            .check_rollback(&bundle_7_reload)
+            .expect("restart reloading the identical bundle must be allowed");
+
+        // But a different bundle at the same epoch must still be rejected.
+        let (bundle_7_fork, _) = make_bundle("test-producer", 7, Some([0xEE; 32]));
+        let err = store.check_rollback(&bundle_7_fork).unwrap_err();
+        assert!(
+            format!("{err}").contains("rollback"),
+            "a forged bundle at the same epoch must be rejected, got: {err}"
+        );
+    }
 }
 
 #[test]
