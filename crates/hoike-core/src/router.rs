@@ -48,6 +48,7 @@ pub struct LookupResult {
 /// deployments report accurate per-bundle data instead of the first bundle's.
 pub struct ScopeDetail {
     pub ca_label: String,
+    pub producer_id: String,
     pub epoch: u64,
     pub completeness: String,
     pub entry_count: u64,
@@ -194,6 +195,7 @@ impl ResponderState {
                 let bundle = &map.bundles[entry.bundle_idx];
                 out.push(ScopeDetail {
                     ca_label: entry.ca_label.clone(),
+                    producer_id: bundle.manifest.producer_id.clone(),
                     epoch: bundle
                         .manifest
                         .ca_scopes

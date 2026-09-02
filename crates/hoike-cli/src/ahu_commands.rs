@@ -1,6 +1,4 @@
-use ahu::{Bundle, BundleBuilder, BundleType, Completeness, IndexFlags, ResponderIdType};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use ahu::{Bundle, BundleType, Completeness, ResponderIdType};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -311,81 +309,37 @@ pub fn diff(a_path: &Path, b_path: &Path) -> Result<()> {
     let a = Bundle::from_file(a_path)?;
     let b = Bundle::from_file(b_path)?;
 
-    // Use (entry_key, discriminator) pairs to correctly handle dual-algorithm bundles
-    // where the same entry_key appears with different discriminators.
-    let a_keys: HashSet<([u8; 32], u16)> = a
-        .index
-        .iter()
-        .map(|r| (r.entry_key, r.discriminator))
-        .collect();
-    let b_keys: HashSet<([u8; 32], u16)> = b
-        .index
-        .iter()
-        .map(|r| (r.entry_key, r.discriminator))
-        .collect();
-
-    let added: Vec<_> = b_keys.difference(&a_keys).collect();
-    let removed: Vec<_> = a_keys.difference(&b_keys).collect();
-    let common: Vec<_> = a_keys.intersection(&b_keys).collect();
-
-    let mut changed = 0usize;
-    for (key, disc) in &common {
-        let a_data = ahu::index::binary_search_with_discriminator(&a.index, key, *disc)
-            .and_then(|idx| a.entry_at(idx));
-        let b_data = ahu::index::binary_search_with_discriminator(&b.index, key, *disc)
-            .and_then(|idx| b.entry_at(idx));
-        if a_data != b_data {
-            changed += 1;
-        }
-    }
+    let d = ahu::diff(&a, &b);
 
     println!("═══ ahu diff ═══");
-    println!(
-        "  A: {} (epoch {:?})",
-        a_path.display(),
-        a.manifest
-            .ca_scopes
-            .iter()
-            .map(|s| s.epoch)
-            .collect::<Vec<_>>()
-    );
-    println!(
-        "  B: {} (epoch {:?})",
-        b_path.display(),
-        b.manifest
-            .ca_scopes
-            .iter()
-            .map(|s| s.epoch)
-            .collect::<Vec<_>>()
-    );
+    println!("  A: {} (epoch {:?})", a_path.display(), d.a_epochs);
+    println!("  B: {} (epoch {:?})", b_path.display(), d.b_epochs);
     println!();
-    println!("  Entries in A:    {}", a.index.len());
-    println!("  Entries in B:    {}", b.index.len());
-    println!("  Added:           {}", added.len());
-    println!("  Removed:         {}", removed.len());
-    println!("  Changed:         {changed}");
-    println!("  Unchanged:       {}", common.len() - changed);
+    println!("  Entries in A:    {}", d.a_entry_count);
+    println!("  Entries in B:    {}", d.b_entry_count);
+    println!("  Added:           {}", d.added.len());
+    println!("  Removed:         {}", d.removed.len());
+    println!("  Changed:         {}", d.changed.len());
+    println!("  Unchanged:       {}", d.unchanged);
 
-    if !added.is_empty() && added.len() <= 20 {
-        println!("\n── Added ──");
-        for (key, disc) in &added {
-            if *disc == 0 {
-                println!("  + {}", hex::encode(key));
-            } else {
-                println!("  + {} (disc={})", hex::encode(key), disc);
+    let print_refs = |label: &str, sign: char, refs: &[ahu::EntryRef]| {
+        if !refs.is_empty() && refs.len() <= 20 {
+            println!("\n── {label} ──");
+            for r in refs {
+                if r.discriminator == 0 {
+                    println!("  {sign} {}", hex::encode(r.entry_key));
+                } else {
+                    println!(
+                        "  {sign} {} (disc={})",
+                        hex::encode(r.entry_key),
+                        r.discriminator
+                    );
+                }
             }
         }
-    }
-    if !removed.is_empty() && removed.len() <= 20 {
-        println!("\n── Removed ──");
-        for (key, disc) in &removed {
-            if *disc == 0 {
-                println!("  - {}", hex::encode(key));
-            } else {
-                println!("  - {} (disc={})", hex::encode(key), disc);
-            }
-        }
-    }
+    };
+    print_refs("Added", '+', &d.added);
+    print_refs("Removed", '-', &d.removed);
 
     Ok(())
 }
@@ -399,142 +353,40 @@ pub fn apply(
     let base = Bundle::from_file(base_path)?;
     ahu::verify_structure(&base)?;
 
-    if base.manifest.bundle_type != BundleType::Full {
-        return Err("base bundle must be a full bundle, not a delta".into());
-    }
-
-    // Build the working set from the base: (entry_key, discriminator) -> response bytes.
-    // Using the (key, disc) pair ensures dual-algorithm entries are tracked separately.
-    let mut working_set: BTreeMap<([u8; 32], u16), (Vec<u8>, IndexFlags)> = BTreeMap::new();
-    for record in &base.index {
-        if let Some(data) = base.entry_bytes(record) {
-            working_set.insert(
-                (record.entry_key, record.discriminator),
-                (data.to_vec(), record.flags),
-            );
-        }
-    }
-
-    println!("  Base entries: {}", working_set.len());
-
-    let base_manifest_digest = ahu::manifest_digest(&base.manifest_bytes);
-    let mut prev_manifest_digest = base_manifest_digest;
-    let mut max_epoch = base
-        .manifest
-        .ca_scopes
-        .iter()
-        .map(|s| s.epoch)
-        .max()
-        .unwrap_or(0);
-
-    // Apply each delta in order
+    let mut deltas = Vec::with_capacity(delta_paths.len());
     for (i, delta_path) in delta_paths.iter().enumerate() {
-        println!("Applying delta {}: {}", i + 1, delta_path.display());
+        println!("Loading delta {}: {}", i + 1, delta_path.display());
         let delta = Bundle::from_file(delta_path)?;
         ahu::verify_structure(&delta)?;
+        deltas.push(delta);
+    }
 
-        if delta.manifest.bundle_type != BundleType::Delta {
-            return Err(format!(
-                "expected delta bundle, got full bundle: {}",
-                delta_path.display()
-            )
-            .into());
-        }
+    let result = ahu::apply(&base, &deltas)?;
 
-        // Verify continuity chain
-        if i == 0 {
-            if let Some(ref base_digest) = delta.manifest.continuity.base_manifest_digest {
-                if *base_digest != base_manifest_digest {
-                    return Err(format!(
-                        "delta {} base_manifest_digest does not match base bundle",
-                        delta_path.display()
-                    )
-                    .into());
-                }
-            }
-        }
-
-        if let Some(ref prev_digest) = delta.manifest.continuity.prev_manifest_digest {
-            if *prev_digest != prev_manifest_digest {
-                return Err(format!(
-                    "delta {} prev_manifest_digest chain broken (expected {}, got {})",
-                    delta_path.display(),
-                    hex::encode(prev_manifest_digest),
-                    hex::encode(prev_digest),
-                )
-                .into());
-            }
-        }
-
-        let chain_len = delta.manifest.continuity.chain_length;
-        if chain_len > 24 {
+    for (i, stat) in result.deltas.iter().enumerate() {
+        if stat.chain_length_warning {
             eprintln!(
-                "  WARNING: chain_length {} exceeds recommended max (24)",
-                chain_len
+                "  WARNING: delta {} chain_length exceeds recommended max ({})",
+                i + 1,
+                ahu::ops::MAX_CHAIN_LENGTH
             );
         }
-
-        let mut added = 0usize;
-        let mut replaced = 0usize;
-        let mut removed = 0usize;
-
-        for record in &delta.index {
-            let key = (record.entry_key, record.discriminator);
-            if record.flags.contains(IndexFlags::TOMBSTONE) {
-                if working_set.remove(&key).is_some() {
-                    removed += 1;
-                }
-            } else if let Some(data) = delta.entry_bytes(record) {
-                if working_set
-                    .insert(key, (data.to_vec(), record.flags))
-                    .is_some()
-                {
-                    replaced += 1;
-                } else {
-                    added += 1;
-                }
-            }
-        }
-
         println!(
-            "  Applied: +{added} ~{replaced} -{removed} → {} entries",
-            working_set.len()
+            "  Delta {}: +{} ~{} -{}",
+            i + 1,
+            stat.added,
+            stat.replaced,
+            stat.removed
         );
-
-        // Advance epoch tracking
-        for scope in &delta.manifest.ca_scopes {
-            max_epoch = max_epoch.max(scope.epoch);
-        }
-
-        prev_manifest_digest = ahu::manifest_digest(&delta.manifest_bytes);
     }
 
-    // Build the materialized full bundle
-    let mut manifest = base.manifest.clone();
-    manifest.bundle_type = BundleType::Full;
-    manifest.continuity.chain_length = 0;
-    manifest.continuity.prev_manifest_digest = Some(prev_manifest_digest);
-    manifest.continuity.base_manifest_digest = None;
-
-    // Advance epochs to the max seen
-    for scope in &mut manifest.ca_scopes {
-        scope.epoch = max_epoch + 1;
-    }
-
-    let mut builder = BundleBuilder::new(manifest);
-
-    for ((entry_key, disc), (data, _flags)) in &working_set {
-        builder.add_entry_with_discriminator(*entry_key, *disc, data.clone());
-    }
-
-    let output_bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec()))?;
-
-    std::fs::write(output_path, &output_bytes)?;
+    std::fs::write(output_path, &result.bytes)?;
     println!(
-        "\nWrote materialized bundle: {} ({} bytes, {} entries)",
+        "\nWrote materialized bundle: {} ({} bytes, {} entries, epoch {})",
         output_path.display(),
-        output_bytes.len(),
-        working_set.len()
+        result.bytes.len(),
+        result.entry_count,
+        result.final_epoch,
     );
 
     Ok(())

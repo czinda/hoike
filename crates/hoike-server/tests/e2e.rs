@@ -936,3 +936,217 @@ type = "demo"
         "nonce should match request nonce"
     );
 }
+
+/// Build a minimal CRL revoking serials 42 and 100. Replicates
+/// `hoike_sign::crl::tests::build_test_crl_der` (that helper is `#[cfg(test)]`
+/// and thus not visible across the crate boundary). The signature is a dummy —
+/// the CRL source only parses the revocation list, it does not verify the CRL
+/// signature, and it ignores issuer identity, so both serials become entries.
+fn build_round_trip_crl_der() -> Vec<u8> {
+    use der::asn1::{BitString, UtcTime};
+    use spki::AlgorithmIdentifierOwned;
+    use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};
+    use x509_cert::name::RdnSequence;
+    use x509_cert::time::Time;
+
+    let now_dt = der::DateTime::new(2025, 1, 15, 12, 0, 0).unwrap();
+    let next_dt = der::DateTime::new(2025, 1, 16, 12, 0, 0).unwrap();
+    let revoke_dt = der::DateTime::new(2025, 1, 10, 8, 0, 0).unwrap();
+
+    let this_update = Time::UtcTime(UtcTime::from_date_time(now_dt).unwrap());
+    let next_update = Time::UtcTime(UtcTime::from_date_time(next_dt).unwrap());
+    let revoke_time = Time::UtcTime(UtcTime::from_date_time(revoke_dt).unwrap());
+
+    let revoked_certs = vec![
+        RevokedCert {
+            serial_number: x509_cert::serial_number::SerialNumber::new(&[42u8]).unwrap(),
+            revocation_date: revoke_time,
+            crl_entry_extensions: None,
+        },
+        RevokedCert {
+            serial_number: x509_cert::serial_number::SerialNumber::new(&[100u8]).unwrap(),
+            revocation_date: revoke_time,
+            crl_entry_extensions: None,
+        },
+    ];
+
+    let sha256_with_ecdsa = const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    let alg = AlgorithmIdentifierOwned {
+        oid: sha256_with_ecdsa,
+        parameters: None,
+    };
+
+    let tbs = TbsCertList {
+        version: x509_cert::Version::V2,
+        signature: alg.clone(),
+        issuer: RdnSequence::default(),
+        this_update,
+        next_update: Some(next_update),
+        revoked_certificates: Some(revoked_certs),
+        crl_extensions: None,
+    };
+
+    let crl = CertificateList {
+        tbs_cert_list: tbs,
+        signature_algorithm: alg,
+        signature: BitString::from_bytes(&[0u8; 64]).unwrap(),
+    };
+
+    crl.to_der().expect("CRL encoding failed")
+}
+
+/// Full Phase 2 round-trip for the on-demand signing endpoint:
+/// sign an initial bundle (epoch 1) → load it (records the high-water mark) →
+/// POST `/api/admin/sign/{label}` → assert the endpoint signs at epoch 2, hot-
+/// reloads, and the freshly written `.ahu` on disk parses at the new epoch.
+///
+/// The epoch progression (1 → 2) is the correctness signal: `sign_ca_scope`
+/// derives the epoch from the persisted high-water mark, so a second signing
+/// pass must observe the first pass's advance rather than repeat epoch 1.
+#[tokio::test]
+async fn sign_endpoint_round_trip_signs_reloads_and_advances_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let crl_path = dir.path().join("test.crl");
+    std::fs::write(&crl_path, build_round_trip_crl_der()).unwrap();
+    let bundle_path = dir.path().join("round-trip-test.ahu");
+
+    // `password_hash` below is a bcrypt hash of "test-password" (cost 4) — a
+    // synthetic, test-only credential, never a real secret.
+    let config_toml = format!(
+        r#"
+[server]
+mode = "combined"
+listen = "127.0.0.1:0"
+
+[server.admin]
+session_ttl_secs = 3600
+
+[[server.admin.operators]]
+name = "op"
+password_hash = "$2y$04$DM3Fnh2MyUkSAP1Q5Rk4/eyX2w.VlF4vWTGcTvhex.StxDFv7HzWq"
+role = "operator"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+
+[[ca]]
+label = "round-trip-test"
+bundle_file = "{bundle}"
+
+[ca.source]
+type = "crl"
+path = "{crl}"
+
+[ca.signing_key]
+type = "demo"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+        crl = crl_path.display(),
+    );
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+
+    // Persistent sources are empty here (CRL is stateless), but they still flow
+    // through the same `SignerContext` mutex the endpoint locks — mirroring how
+    // `run_server` wires the background loop and the admin API together.
+    let sources = hoike_sign::create_persistent_sources(&config).unwrap();
+
+    // Initial signer pass — epoch 1.
+    let initial = hoike_sign::sign_and_write_all(&config, &sources).unwrap();
+    assert_eq!(initial.len(), 1, "one CA has a source");
+    assert_eq!(
+        initial[0].epoch, 1,
+        "first pass derives epoch 1 (high-water 0 + 1)"
+    );
+    assert_eq!(initial[0].entry_count, 2, "CRL revokes serials 42 and 100");
+
+    // Loading the bundle records the high-water mark (epoch 1) in the state store,
+    // so the next signing pass must advance to epoch 2.
+    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+
+    let ctx = hoike_server::SignerContext {
+        sources: tokio::sync::Mutex::new(sources),
+    };
+    let app_state = hoike_server::AppState::new(state, config).with_signer_context(ctx);
+    let app = hoike_server::build_router(app_state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Authenticate via the real login endpoint — the `state` module is private,
+    // so a `Session` cannot be fabricated in the test.
+    let login_resp = client
+        .post(format!("http://127.0.0.1:{port}/api/admin/session"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"name":"op","password":"test-password"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), 200, "login should succeed");
+    let login_json: serde_json::Value =
+        serde_json::from_str(&login_resp.text().await.unwrap()).unwrap();
+    let token = login_json["session_token"]
+        .as_str()
+        .expect("login response should carry a session_token")
+        .to_string();
+
+    // On-demand sign of the single scope.
+    let sign_resp = client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/admin/sign/round-trip-test"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sign_resp.status(), 200, "sign endpoint should succeed");
+    let sign_json: serde_json::Value =
+        serde_json::from_str(&sign_resp.text().await.unwrap()).unwrap();
+    assert_eq!(sign_json["status"], "ok");
+    assert_eq!(sign_json["ca_label"], "round-trip-test");
+    assert_eq!(
+        sign_json["epoch"].as_u64().unwrap(),
+        2,
+        "endpoint sign must advance the epoch to 2"
+    );
+    assert_eq!(
+        sign_json["entry_count"].as_u64().unwrap(),
+        2,
+        "re-sign sees the same two revoked serials"
+    );
+
+    // The freshly written `.ahu` on disk must reflect the advanced epoch. Epoch
+    // is per-scope in the manifest; this single-CA bundle carries one scope.
+    let bundle_after = ahu::Bundle::from_file(&bundle_path).unwrap();
+    let scope = bundle_after
+        .manifest
+        .ca_scopes
+        .first()
+        .expect("bundle should carry one CA scope");
+    assert_eq!(scope.epoch, 2, "written bundle scope should be at epoch 2");
+
+    // A Viewer-authenticated request through the same endpoint is rejected — but
+    // more importantly, an unauthenticated sign attempt must not succeed.
+    let unauth = client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/admin/sign/round-trip-test"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        unauth.status(),
+        200,
+        "unauthenticated sign must be rejected"
+    );
+}

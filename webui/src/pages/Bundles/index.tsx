@@ -13,8 +13,12 @@ import { Table, Thead, Tbody, Tr, Th, Td } from '@patternfly/react-table';
 import { listBundles, reloadBundles, type BundleInfo } from '../../api/bundles';
 import { fmtTs } from '../../utils';
 import { errorMessage } from '../../api/client';
+import { useAuth } from '../../auth/AuthContext';
+import { hasRole } from '../../nav';
 
 export default function Bundles() {
+  const { role } = useAuth();
+  const isOperator = hasRole(role, 'operator');
   const [bundles, setBundles] = useState<BundleInfo[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -55,7 +59,15 @@ export default function Bundles() {
         <Flex>
           <FlexItem><Title headingLevel="h1">Bundles</Title></FlexItem>
           <FlexItem align={{ default: 'alignRight' }}>
-            <Button variant="secondary" onClick={handleReload}>Reload Bundles</Button>
+            <Flex spaceItems={{ default: 'spaceItemsLg' }} alignItems={{ default: 'alignItemsCenter' }}>
+              <FlexItem><Link to="/bundles/inspect">Inspect</Link></FlexItem>
+              <FlexItem><Link to="/bundles/extract">Extract</Link></FlexItem>
+              {isOperator && <FlexItem><Link to="/bundles/diff">Diff</Link></FlexItem>}
+              {isOperator && <FlexItem><Link to="/bundles/apply">Apply</Link></FlexItem>}
+              <FlexItem>
+                <Button variant="secondary" onClick={handleReload}>Reload Bundles</Button>
+              </FlexItem>
+            </Flex>
           </FlexItem>
         </Flex>
       </PageSection>

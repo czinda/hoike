@@ -26,6 +26,10 @@ pub struct ParsedCertId {
     pub issuer_name_hash: Vec<u8>,
     pub issuer_key_hash: Vec<u8>,
     pub serial_number: Vec<u8>,
+    /// The CertID `hashAlgorithm` OID in dotted-decimal form, retained for
+    /// observability (the `hoike_certid_hash_alg_total` metric). Clients that
+    /// still use SHA-1 CertIDs are visible here.
+    pub hash_alg_oid: String,
 }
 
 /// Parse a DER-encoded OCSPRequest into the fields we need for lookup.
@@ -69,6 +73,7 @@ pub fn parse_ocsp_request(der_bytes: &[u8]) -> Result<ParsedRequest> {
             issuer_name_hash: cert_id.issuer_name_hash.as_bytes().to_vec(),
             issuer_key_hash: cert_id.issuer_key_hash.as_bytes().to_vec(),
             serial_number: cert_id.serial_number.as_bytes().to_vec(),
+            hash_alg_oid: cert_id.hash_algorithm.oid.to_string(),
         });
     }
 

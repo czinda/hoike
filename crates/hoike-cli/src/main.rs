@@ -192,37 +192,69 @@ async fn run_server(config_path: PathBuf) {
     }
 
     let listen = config.server.listen.clone();
-    let is_combined = config.is_combined();
+    let needs_signing = config.needs_signing();
 
     // Create persistent revocation sources — stateful sources like DogtagSync
     // must survive across signer loop iterations to retain their in-memory
-    // snapshot and sync cookie.
-    let persistent_sources = if is_combined {
-        Some(create_persistent_sources(&config).unwrap_or_else(|e| {
-            eprintln!("Failed to create revocation sources: {e}");
-            std::process::exit(1);
-        }))
+    // snapshot and sync cookie. Needed for both combined and signer modes.
+    let persistent_sources = if needs_signing {
+        Some(
+            hoike_sign::create_persistent_sources(&config).unwrap_or_else(|e| {
+                eprintln!("Failed to create revocation sources: {e}");
+                std::process::exit(1);
+            }),
+        )
     } else {
         None
     };
 
-    // In combined mode, run an initial signing pass before loading bundles
-    // so there's something to serve immediately.
-    if is_combined {
-        info!("combined mode: running initial bundle production");
-        if let Err(e) = run_signer_pass_with_sources(&config, persistent_sources.as_ref().unwrap())
-        {
+    // In signing modes, run an initial signing pass before loading bundles so
+    // there's something to serve immediately (combined) or a fresh generation
+    // on disk (signer).
+    if let Some(sources) = persistent_sources.as_ref() {
+        info!(
+            mode = config.server.mode,
+            "running initial bundle production"
+        );
+        if let Err(e) = hoike_sign::sign_and_write_all(&config, sources) {
             eprintln!("Initial signer pass failed: {e}");
             std::process::exit(1);
         }
     }
 
+    // Install the Prometheus recorder (no-op unless built with --features
+    // metrics) before the first bundle load so an initial-load failure is
+    // captured in `hoike_bundle_load_failures_total` too, not just later reloads.
+    if hoike_server::install_metrics() {
+        info!("Prometheus metrics recorder installed");
+    }
+
     let state = hoike_core::ResponderState::load(config.clone()).unwrap_or_else(|e| {
+        hoike_server::obs::record_bundle_load_failure(
+            "all",
+            hoike_server::obs::load_failure_reason(&e),
+        );
+        hoike_server::obs::audit!(
+            event = "bundle_load_failed",
+            trigger = "initial_load",
+            reason = hoike_server::obs::load_failure_reason(&e),
+            error = %e,
+            "initial bundle load failed"
+        );
         eprintln!("Failed to initialize responder: {e}");
         std::process::exit(1);
     });
 
     let mut app_state = hoike_server::AppState::new(state, config.clone());
+
+    // Attach the shared signing context (holds the persistent sources behind a
+    // mutex) so the admin API and the background loop serialize on one lock.
+    if let Some(sources) = persistent_sources {
+        let ctx = hoike_server::SignerContext {
+            sources: tokio::sync::Mutex::new(sources),
+        };
+        app_state = app_state.with_signer_context(ctx);
+    }
 
     // If any CA has nonce_policy=live, load a signing key for live responses
     let has_live_nonce = config.ca.iter().any(|ca| ca.nonce_policy == "live");
@@ -241,17 +273,10 @@ async fn run_server(config_path: PathBuf) {
         }
     }
 
-    // In combined mode, start the background signer loop
-    if is_combined {
-        let signer_state = app_state.responder.clone();
-        let signer_config = config.clone();
-        let sources = persistent_sources.unwrap();
-        tokio::spawn(async move {
-            run_signer_loop(signer_state, signer_config, sources).await;
-        });
-    }
-
-    // Start gossip if enabled
+    // Start gossip BEFORE the signer loop so the loop can announce generations
+    // through the live node. The handle is kept (wrapped in `Arc`, attached to
+    // `AppState`) rather than dropped, so admin fleet endpoints and the signer
+    // path can reach membership, the generation table, and `announce_generation`.
     if let Some(gossip_cfg) = &config.gossip {
         if gossip_cfg.enabled {
             let (msg_tx, mut msg_rx) =
@@ -265,33 +290,45 @@ async fn run_server(config_path: PathBuf) {
             };
 
             match hoike_gossip::GossipNode::start(gc, msg_tx).await {
-                Ok(_gossip_node) => {
+                Ok(gossip_node) => {
                     info!("gossip node started");
-                    let _responder = app_state.responder.clone();
+                    let gossip_node = std::sync::Arc::new(gossip_node);
+                    app_state = app_state.with_gossip(gossip_node.clone());
+
+                    // Consumer: fold received announcements into the generation
+                    // table so the fleet view can attribute epochs to nodes and
+                    // compute per-node staleness.
+                    let consumer_node = gossip_node.clone();
                     tokio::spawn(async move {
                         while let Some(msg) = msg_rx.recv().await {
                             match &msg {
                                 hoike_gossip::GossipMessage::GenerationAnnouncement {
                                     producer_id,
                                     epoch,
+                                    origin_node,
                                     bundle_url,
                                     ..
                                 } => {
                                     info!(
+                                        origin = %origin_node,
                                         producer = %producer_id,
                                         epoch,
                                         url = bundle_url.as_deref().unwrap_or("none"),
-                                        "received generation announcement — would pull bundle from peer"
+                                        "received generation announcement"
                                     );
-                                    // In a full implementation: fetch bundle from bundle_url,
-                                    // verify anti-rollback, swap into router via responder.reload()
+                                    consumer_node.record_generation(&msg).await;
+                                    // Bundle pull-on-announce is future work: fetch
+                                    // from bundle_url, verify anti-rollback, then
+                                    // swap into the router via responder.reload().
                                 }
                                 hoike_gossip::GossipMessage::UrgentRevocation {
                                     producer_id,
                                     epoch,
+                                    origin_node,
                                     ..
                                 } => {
                                     info!(
+                                        origin = %origin_node,
                                         producer = %producer_id,
                                         epoch,
                                         "received urgent revocation notice — would pull delta"
@@ -308,6 +345,42 @@ async fn run_server(config_path: PathBuf) {
         }
     }
 
+    // In signing modes, start the background signer loop. It shares the same
+    // `SignerContext` mutex as the admin API so on-demand and periodic signing
+    // never race on epoch/cookie/write. It also gets the gossip handle so each
+    // successful pass announces the new generation to the mesh.
+    if needs_signing {
+        if let Some(ctx) = app_state.signer.clone() {
+            let signer_state = app_state.responder.clone();
+            let signer_config = config.clone();
+            let signer_gossip = app_state.gossip.clone();
+            tokio::spawn(async move {
+                run_signer_loop(signer_state, signer_config, ctx, signer_gossip).await;
+            });
+        }
+    }
+
+    // The recorder was installed earlier (before the initial load). If
+    // configured, expose it on a dedicated private listener — never the public
+    // OCSP port.
+    if let Some(metrics_listen) = config.server.metrics_listen.clone() {
+        let metrics_state = app_state.clone();
+        tokio::spawn(async move {
+            let router = hoike_server::build_metrics_router(metrics_state);
+            match tokio::net::TcpListener::bind(&metrics_listen).await {
+                Ok(l) => {
+                    info!(listen = %metrics_listen, "metrics listener starting");
+                    if let Err(e) = axum::serve(l, router).await {
+                        warn!(error = %e, "metrics listener exited");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, listen = %metrics_listen, "failed to bind metrics listener")
+                }
+            }
+        });
+    }
+
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -321,523 +394,11 @@ async fn run_server(config_path: PathBuf) {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Map of CA label → persistent revocation source. Stateful sources (DogtagSync)
-/// retain their in-memory snapshot and sync cookie across signer loop iterations.
-type PersistentSources = std::collections::HashMap<String, Box<dyn hoike_sign::RevocationSource>>;
-
-#[allow(unused_mut)]
-#[allow(unreachable_code)]
-fn create_persistent_sources(
-    config: &hoike_core::Config,
-) -> std::result::Result<PersistentSources, String> {
-    let mut sources = PersistentSources::new();
-    for ca_config in &config.ca {
-        let source_config = match &ca_config.source {
-            Some(s) => s,
-            None => continue,
-        };
-        #[allow(unused_variables)]
-        let source: Box<dyn hoike_sign::RevocationSource> = match source_config {
-            #[cfg(feature = "dogtag-sync")]
-            hoike_core::config::SourceConfig::DogtagSync {
-                ldap_url,
-                base_dn,
-                bind_dn,
-                bind_password,
-                bind_password_env,
-                cookie_path,
-                filter,
-            } => {
-                let password =
-                    resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
-                let cookie = cookie_path
-                    .clone()
-                    .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
-                let sync_config = hoike_sign::DogtagSyncConfig {
-                    ldap_url: ldap_url.clone(),
-                    base_dn: base_dn.clone(),
-                    bind_dn: bind_dn.clone(),
-                    bind_password: password,
-                    cookie_path: cookie,
-                    filter: filter
-                        .clone()
-                        .unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
-                };
-                Box::new(hoike_sign::DogtagSyncSource::new(sync_config))
-            }
-            // CRL and other stateless sources are created fresh each pass
-            _ => continue,
-        };
-        sources.insert(ca_config.label.clone(), source);
-    }
-    Ok(sources)
-}
-
-fn run_signer_pass_with_sources(
-    config: &hoike_core::Config,
-    persistent_sources: &PersistentSources,
-) -> std::result::Result<(), String> {
-    use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
-    use sha2_v010::Digest;
-
-    for ca_config in &config.ca {
-        let source_config = match &ca_config.source {
-            Some(s) => s,
-            None => continue,
-        };
-
-        // Use persistent source if available, otherwise create a fresh one
-        let fresh_source: Option<Box<dyn RevocationSource>>;
-        let source: &dyn RevocationSource = if let Some(ps) =
-            persistent_sources.get(&ca_config.label)
-        {
-            ps.as_ref()
-        } else {
-            fresh_source = Some(match source_config {
-                hoike_core::config::SourceConfig::Crl { path } => {
-                    let crl_data = std::fs::read(path)
-                        .map_err(|e| format!("failed to read CRL {}: {e}", path.display()))?;
-                    if crl_data.starts_with(b"-----BEGIN") {
-                        let pem = String::from_utf8(crl_data)
-                            .map_err(|e| format!("CRL not valid UTF-8: {e}"))?;
-                        Box::new(CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?)
-                    } else {
-                        Box::new(
-                            CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?,
-                        )
-                    }
-                }
-                #[cfg(feature = "dogtag-sync")]
-                hoike_core::config::SourceConfig::DogtagSync { .. } => {
-                    // Should never hit this — DogtagSync sources are always persistent
-                    return Err("DogtagSync source not found in persistent sources".into());
-                }
-                #[cfg(not(feature = "dogtag-sync"))]
-                hoike_core::config::SourceConfig::DogtagSync { .. } => {
-                    return Err("dogtag-sync requires the 'dogtag-sync' feature flag".into());
-                }
-            });
-            fresh_source.as_ref().unwrap().as_ref()
-        };
-
-        let ca = CaIdentity {
-            label: ca_config.label.clone(),
-            issuer_name_der: decode_issuer_name(ca_config)?,
-            issuer_key_bytes: decode_issuer_key(ca_config)?,
-        };
-
-        let snapshot = source
-            .snapshot(&ca)
-            .map_err(|e| format!("snapshot failed for {}: {e}", ca_config.label))?;
-
-        let epoch = {
-            let state_db_path = config.storage.state_db.join("state.json");
-            let store = hoike_core::StateStore::open(&state_db_path)
-                .map_err(|e| format!("state store: {e}"))?;
-            let issuer_key_hash_hex = hex::encode(sha2_v010::Sha256::digest(&ca.issuer_key_bytes));
-            store
-                .get_high_water("hoike-combined", &issuer_key_hash_hex)
-                .unwrap_or(0)
-                .saturating_add(1)
-        };
-
-        let gen_config = GenerationConfig {
-            producer_id: "hoike-combined".into(),
-            epoch,
-            validity_secs: ca_config.validity_secs,
-            certid_compat: hoike_sign::CertIdCompat::Dual,
-            ..Default::default()
-        };
-
-        // Load responder cert and seal materials (same path as run_sign)
-        let responder_cert_der = load_responder_cert(ca_config)?;
-        let (seal_key, seal_cert_der) = load_seal_materials(ca_config)?;
-
-        // Ensure bundle_dir exists
-        std::fs::create_dir_all(&config.storage.bundle_dir)
-            .map_err(|e| format!("create bundle_dir: {e}"))?;
-
-        let bundle_path = config
-            .storage
-            .bundle_dir
-            .join(format!("{}.ahu", ca_config.label));
-
-        let bundle_bytes = if ca_config.is_ml_dsa() {
-            match &ca_config.signing_key {
-                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                    let mut v = hoike_sign::load_ml_dsa_key(path)
-                        .map_err(|e| format!("signing key: {e}"))?;
-                    if v.algorithm_name() != ca_config.sig_alg {
-                        return Err(format!(
-                            "CA '{}': key is {} but sig_alg is {}",
-                            ca_config.label, v.algorithm_name(), ca_config.sig_alg
-                        ));
-                    }
-                    info!(ca = ca_config.label, key = %path.display(), alg = v.algorithm_name(), "using file-based ML-DSA signing key");
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    v.sign_bundle(
-                        &ca, &snapshot, &gen_config,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                    warn!(ca = ca_config.label, "using demo ML-DSA key — NOT FOR PRODUCTION");
-                    let mut v = hoike_sign::MlDsaSignerVariant::demo(&ca_config.sig_alg)
-                        .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    v.sign_bundle(
-                        &ca, &snapshot, &gen_config,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                #[cfg(feature = "pkcs11")]
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
-                    let (param_set, oid) = ml_dsa_pkcs11_params(&ca_config.sig_alg)?;
-                    let inner = hoike_sign::Pkcs11MlDsaSigner::new(&pkcs11_config, param_set, oid)
-                        .map_err(|e| format!("PKCS#11 ML-DSA init: {e}"))?;
-                    let mut bridge = hoike_sign::Pkcs11MlDsaSignerBridge::new(inner);
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11MlDsaSignature>(
-                        &ca, &snapshot, &gen_config, &mut bridge,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc)
-                            .map_err(|e| hoike_sign::SignError::Seal(e.to_string())),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                #[cfg(not(feature = "pkcs11"))]
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    return Err(format!(
-                        "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
-                        ca_config.label
-                    ));
-                }
-                None => {
-                    return Err(format!("CA '{}': no signing_key configured", ca_config.label));
-                }
-            }
-        } else {
-            match &ca_config.signing_key {
-                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                    let mut signing_key = hoike_sign::load_ecdsa_p256_key(path)
-                        .map_err(|e| format!("signing key: {e}"))?;
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                        &ca, &snapshot, &gen_config, &mut signing_key,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                #[cfg(feature = "pkcs11")]
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
-                    let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
-                        .map_err(|e| format!("PKCS#11 init: {e}"))?;
-                    let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
-                        &ca, &snapshot, &gen_config, &mut bridge,
-                        move |m| {
-                            hoike_sign::create_cms_seal(m, &sk, &sc)
-                                .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
-                        },
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                #[cfg(not(feature = "pkcs11"))]
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    return Err(format!(
-                        "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
-                        ca_config.label
-                    ));
-                }
-                Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                    warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
-                    let mut signing_key = hoike_sign::demo_ecdsa_p256_key();
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                        &ca, &snapshot, &gen_config, &mut signing_key,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                None => {
-                    return Err(format!("CA '{}': no signing_key configured", ca_config.label));
-                }
-            }
-        }
-        .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
-
-        std::fs::write(&bundle_path, &bundle_bytes).map_err(|e| format!("write bundle: {e}"))?;
-        info!(
-            ca = ca_config.label,
-            size = bundle_bytes.len(),
-            path = %bundle_path.display(),
-            entries = snapshot.entries.len(),
-            "bundle produced (CMS sealed)"
-        );
-    }
-    Ok(())
-}
-
-// Keep old function for non-combined modes that don't need persistent sources
-#[allow(dead_code)]
-fn run_signer_pass(config: &hoike_core::Config) -> std::result::Result<(), String> {
-    use hoike_sign::{CaIdentity, CrlSource, GenerationConfig, RevocationSource};
-    use sha2_v010::Digest as _;
-
-    for ca_config in &config.ca {
-        let source_config = match &ca_config.source {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let source: Box<dyn RevocationSource> = match source_config {
-            hoike_core::config::SourceConfig::Crl { path } => {
-                let crl_data = std::fs::read(path)
-                    .map_err(|e| format!("failed to read CRL {}: {e}", path.display()))?;
-                if crl_data.starts_with(b"-----BEGIN") {
-                    let pem = String::from_utf8(crl_data)
-                        .map_err(|e| format!("CRL not valid UTF-8: {e}"))?;
-                    Box::new(CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?)
-                } else {
-                    Box::new(CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?)
-                }
-            }
-
-            #[cfg(feature = "dogtag-sync")]
-            hoike_core::config::SourceConfig::DogtagSync {
-                ldap_url,
-                base_dn,
-                bind_dn,
-                bind_password,
-                bind_password_env,
-                cookie_path,
-                filter,
-            } => {
-                let password =
-                    resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
-                let cookie = cookie_path
-                    .clone()
-                    .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
-                let sync_config = hoike_sign::DogtagSyncConfig {
-                    ldap_url: ldap_url.clone(),
-                    base_dn: base_dn.clone(),
-                    bind_dn: bind_dn.clone(),
-                    bind_password: password,
-                    cookie_path: cookie,
-                    filter: filter
-                        .clone()
-                        .unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
-                };
-                Box::new(hoike_sign::DogtagSyncSource::new(sync_config))
-            }
-
-            #[cfg(not(feature = "dogtag-sync"))]
-            hoike_core::config::SourceConfig::DogtagSync { .. } => {
-                return Err("dogtag-sync source requires the 'dogtag-sync' feature flag".into());
-            }
-        };
-
-        let ca = CaIdentity {
-            label: ca_config.label.clone(),
-            issuer_name_der: decode_issuer_name(ca_config)?,
-            issuer_key_bytes: decode_issuer_key(ca_config)?,
-        };
-
-        let responder_cert_der = ca_config
-            .responder_cert
-            .as_ref()
-            .map(std::fs::read)
-            .transpose()
-            .map_err(|e| format!("read responder cert: {e}"))?;
-
-        let snapshot = source
-            .snapshot(&ca)
-            .map_err(|e| format!("snapshot failed for {}: {e}", ca_config.label))?;
-
-        // Derive epoch from persisted high-water mark — never from wall-clock
-        // time, which can step backward (NTP correction, VM restore) and
-        // permanently lock out mirrors.
-        let epoch = {
-            let state_db_path = config.storage.state_db.join("state.json");
-            let store = hoike_core::StateStore::open(&state_db_path)
-                .map_err(|e| format!("state store: {e}"))?;
-            let issuer_key_hash_hex = hex::encode(sha2_v010::Sha256::digest(&ca.issuer_key_bytes));
-            store
-                .get_high_water("hoike-combined", &issuer_key_hash_hex)
-                .unwrap_or(0)
-                .saturating_add(1)
-        };
-
-        let gen_config = GenerationConfig {
-            producer_id: "hoike-combined".into(),
-            epoch,
-            validity_secs: ca_config.validity_secs,
-            certid_compat: hoike_sign::CertIdCompat::Dual,
-            ..Default::default()
-        };
-
-        // Load seal key and cert for CMS sealing
-        let (seal_key, seal_cert_der) = load_seal_materials(ca_config)?;
-
-        let bundle_bytes = if ca_config.is_ml_dsa() {
-            match &ca_config.signing_key {
-                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                    let mut v = hoike_sign::load_ml_dsa_key(path)
-                        .map_err(|e| format!("load signing key: {e}"))?;
-                    if v.algorithm_name() != ca_config.sig_alg {
-                        return Err(format!(
-                            "CA '{}': key is {} but sig_alg is {}",
-                            ca_config.label, v.algorithm_name(), ca_config.sig_alg
-                        ));
-                    }
-                    info!(ca = ca_config.label, key = %path.display(), alg = v.algorithm_name(), "using file-based ML-DSA signing key");
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    v.sign_bundle(
-                        &ca, &snapshot, &gen_config,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                    warn!(ca = ca_config.label, "using demo ML-DSA key — NOT FOR PRODUCTION");
-                    let mut v = hoike_sign::MlDsaSignerVariant::demo(&ca_config.sig_alg)
-                        .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    v.sign_bundle(
-                        &ca, &snapshot, &gen_config,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                #[cfg(feature = "pkcs11")]
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    let pkcs11_config = resolve_pkcs11_config(ca_config)?;
-                    let (param_set, oid) = ml_dsa_pkcs11_params(&ca_config.sig_alg)?;
-                    let inner = hoike_sign::Pkcs11MlDsaSigner::new(&pkcs11_config, param_set, oid)
-                        .map_err(|e| format!("PKCS#11 ML-DSA init: {e}"))?;
-                    let mut bridge = hoike_sign::Pkcs11MlDsaSignerBridge::new(inner);
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11MlDsaSignature>(
-                        &ca, &snapshot, &gen_config, &mut bridge,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc)
-                            .map_err(|e| hoike_sign::SignError::Seal(e.to_string())),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                #[cfg(not(feature = "pkcs11"))]
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    return Err(format!(
-                        "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
-                        ca_config.label
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "CA '{}' has no signing_key configured.",
-                        ca_config.label
-                    ));
-                }
-            }
-        } else {
-            match &ca_config.signing_key {
-                Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                    let mut signer = hoike_sign::load_ecdsa_p256_key(path)
-                        .map_err(|e| format!("load signing key: {e}"))?;
-                    info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                        &ca, &snapshot, &gen_config, &mut signer,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-                    #[cfg(feature = "pkcs11")]
-                    {
-                        let pkcs11_config = resolve_pkcs11_config(ca_config)?;
-                        let inner = hoike_sign::Pkcs11Signer::new(&pkcs11_config)
-                            .map_err(|e| format!("PKCS#11 init: {e}"))?;
-                        let mut bridge = hoike_sign::Pkcs11SignerBridge::new(inner);
-                        let sk = seal_key.clone();
-                        let sc = seal_cert_der.clone();
-                        hoike_sign::produce_bundle::<_, hoike_sign::Pkcs11EcdsaSignature>(
-                            &ca, &snapshot, &gen_config, &mut bridge,
-                            move |m| {
-                                hoike_sign::create_cms_seal(m, &sk, &sc)
-                                    .map_err(|e| hoike_sign::SignError::Seal(e.to_string()))
-                            },
-                            responder_cert_der.as_deref(),
-                        )
-                    }
-                    #[cfg(not(feature = "pkcs11"))]
-                    {
-                        return Err(format!(
-                            "CA '{}' requires PKCS#11 but hoike was built without 'pkcs11' feature",
-                            ca_config.label
-                        ));
-                    }
-                }
-                Some(hoike_core::config::SigningKeyConfig::Demo) => {
-                    warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
-                    let mut signer = hoike_sign::demo_ecdsa_p256_key();
-                    let sk = seal_key.clone();
-                    let sc = seal_cert_der.clone();
-                    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
-                        &ca, &snapshot, &gen_config, &mut signer,
-                        move |m| hoike_sign::create_cms_seal(m, &sk, &sc),
-                        responder_cert_der.as_deref(),
-                    )
-                }
-                None => {
-                    return Err(format!(
-                        "CA '{}' has no signing_key configured.",
-                        ca_config.label
-                    ));
-                }
-            }
-        }
-        .map_err(|e| format!("bundle production failed for {}: {e}", ca_config.label))?;
-
-        let bundle_path = config
-            .storage
-            .bundle_dir
-            .join(format!("{}.ahu", ca_config.label));
-
-        std::fs::create_dir_all(&config.storage.bundle_dir)
-            .map_err(|e| format!("create bundle_dir: {e}"))?;
-
-        std::fs::write(&bundle_path, &bundle_bytes).map_err(|e| format!("write bundle: {e}"))?;
-
-        info!(
-            ca = ca_config.label,
-            size = bundle_bytes.len(),
-            path = %bundle_path.display(),
-            entries = snapshot.entries.len(),
-            "bundle produced"
-        );
-    }
-
-    Ok(())
-}
-
 async fn run_signer_loop(
     state: Arc<hoike_core::ResponderState>,
     config: hoike_core::Config,
-    sources: PersistentSources,
+    ctx: Arc<hoike_server::SignerContext>,
+    gossip: Option<Arc<hoike_gossip::GossipNode>>,
 ) {
     let min_interval = config
         .ca
@@ -848,7 +409,8 @@ async fn run_signer_loop(
 
     info!(
         interval_secs = min_interval,
-        "combined mode: signer loop starting"
+        mode = config.server.mode,
+        "signer loop starting"
     );
 
     loop {
@@ -893,15 +455,56 @@ async fn run_signer_loop(
         }
 
         info!("signer loop: starting production cycle");
-        match run_signer_pass_with_sources(&config, &sources) {
-            Ok(()) => {
+        // Serialize against on-demand admin signing via the shared mutex.
+        let sources = ctx.sources.lock().await;
+        let gen_start = std::time::Instant::now();
+        match hoike_sign::sign_and_write_all(&config, &sources) {
+            Ok(signed) => {
+                let gen_secs = gen_start.elapsed().as_secs_f64();
+                for s in &signed {
+                    hoike_server::obs::record_signer_generation(&s.label, gen_secs);
+                    hoike_server::obs::audit!(
+                        event = "signer_generation",
+                        ca = %s.label,
+                        trigger = "scheduled",
+                        epoch = s.epoch,
+                        entry_count = s.entry_count,
+                        "produced bundle on schedule"
+                    );
+                }
                 if let Err(e) = state.reload() {
+                    hoike_server::obs::record_bundle_load_failure(
+                        "all",
+                        hoike_server::obs::load_failure_reason(&e),
+                    );
+                    hoike_server::obs::audit!(
+                        event = "bundle_load_failed",
+                        trigger = "scheduled_reload",
+                        reason = hoike_server::obs::load_failure_reason(&e),
+                        error = %e,
+                        "reload failed after scheduled production"
+                    );
                     error!(error = %e, "signer loop: reload failed after production");
                 } else {
-                    info!("signer loop: bundles produced and reloaded");
+                    info!(
+                        scopes = signed.len(),
+                        "signer loop: bundles produced and reloaded"
+                    );
+                    // Announce each new generation to the mesh (best-effort).
+                    if let Some(g) = gossip.as_ref() {
+                        for s in &signed {
+                            hoike_server::announce_bundle_scopes(g, &s.bytes).await;
+                        }
+                    }
                 }
             }
             Err(e) => {
+                hoike_server::obs::audit!(
+                    event = "signer_generation_failed",
+                    trigger = "scheduled",
+                    error = %e,
+                    "scheduled production failed"
+                );
                 error!(error = %e, "signer loop: production failed");
             }
         }
@@ -923,129 +526,6 @@ fn decode_b64_field(
         }
         None => Ok(fallback.as_bytes().to_vec()),
     }
-}
-
-fn decode_issuer_name(ca: &hoike_core::config::CaConfig) -> std::result::Result<Vec<u8>, String> {
-    decode_b64_field(
-        &ca.issuer_name_der_b64,
-        "issuer_name_der_b64",
-        &ca.label,
-        &format!("CN={}", ca.label),
-    )
-}
-
-fn decode_issuer_key(ca: &hoike_core::config::CaConfig) -> std::result::Result<Vec<u8>, String> {
-    decode_b64_field(
-        &ca.issuer_key_bytes_b64,
-        "issuer_key_bytes_b64",
-        &ca.label,
-        &format!("{}-key", ca.label),
-    )
-}
-
-/// Resolve LDAP bind password from config value or environment variable.
-#[cfg(feature = "dogtag-sync")]
-fn resolve_ldap_password(
-    password: Option<&str>,
-    env_var: Option<&str>,
-) -> std::result::Result<String, String> {
-    if let Some(pw) = password {
-        return Ok(pw.to_string());
-    }
-    if let Some(var) = env_var {
-        return std::env::var(var).map_err(|_| {
-            format!(
-                "LDAP bind password env var '{var}' not set. \
-                 Set it or use bind_password in config."
-            )
-        });
-    }
-    Err("no LDAP bind password: set bind_password or bind_password_env in config".into())
-}
-
-fn load_responder_cert(
-    ca: &hoike_core::config::CaConfig,
-) -> std::result::Result<Option<Vec<u8>>, String> {
-    match &ca.responder_cert {
-        Some(path) => {
-            let data = std::fs::read(path)
-                .map_err(|e| format!("failed to read responder cert '{}': {e}", path.display()))?;
-            if data.starts_with(b"-----BEGIN") {
-                let pem_str = String::from_utf8(data)
-                    .map_err(|e| format!("responder cert PEM is not valid UTF-8: {e}"))?;
-                // Validate the PEM label — reject non-certificate files
-                let first_line = pem_str.lines().next().unwrap_or("");
-                if !first_line.contains("CERTIFICATE") {
-                    return Err(format!(
-                        "responder cert '{}' has unexpected PEM label: {} — expected CERTIFICATE",
-                        path.display(),
-                        first_line.trim()
-                    ));
-                }
-                use base64::Engine;
-                let mut b64 = String::new();
-                for line in pem_str.lines() {
-                    if line.starts_with("-----") {
-                        continue;
-                    }
-                    b64.push_str(line.trim());
-                }
-                let der = base64::engine::general_purpose::STANDARD
-                    .decode(&b64)
-                    .map_err(|e| format!("responder cert PEM base64 decode: {e}"))?;
-                Ok(Some(der))
-            } else {
-                Ok(Some(data))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Load seal key and certificate for CMS bundle sealing.
-/// Falls back to the OCSP signing key if no seal_key is configured and the
-/// signing key is ECDSA P-256. For ML-DSA signing keys (which are not P-256),
-/// falls back to a demo seal key with a warning.
-fn load_seal_materials(
-    ca_config: &hoike_core::config::CaConfig,
-) -> std::result::Result<(hoike_sign::SealKey, Vec<u8>), String> {
-    let seal_key = if let Some(path) = &ca_config.seal_key {
-        let ecdsa_key =
-            hoike_sign::load_ecdsa_p256_key(path).map_err(|e| format!("load seal key: {e}"))?;
-        hoike_sign::SealKey::EcdsaP256(ecdsa_key)
-    } else if !ca_config.is_ml_dsa() {
-        if let Some(hoike_core::config::SigningKeyConfig::File { path }) = &ca_config.signing_key {
-            warn!(
-                ca = ca_config.label,
-                "using OCSP signing key as seal key — configure seal_key for production"
-            );
-            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(path)
-                .map_err(|e| format!("load signing key for seal: {e}"))?;
-            hoike_sign::SealKey::EcdsaP256(ecdsa_key)
-        } else {
-            warn!(
-                ca = ca_config.label,
-                "no seal_key configured — generating ephemeral seal key"
-            );
-            hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
-        }
-    } else {
-        warn!(
-            ca = ca_config.label,
-            "ML-DSA signing key cannot be used as P-256 seal key — \
-             configure seal_key for production; using ephemeral seal key"
-        );
-        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
-    };
-
-    let seal_cert_der = if let Some(path) = &ca_config.seal_cert {
-        std::fs::read(path).map_err(|e| format!("read seal cert: {e}"))?
-    } else {
-        hoike_sign::generate_seal_cert_for_key(&seal_key)
-            .map_err(|e| format!("generate seal cert: {e}"))?
-    };
-
-    Ok((seal_key, seal_cert_der))
 }
 
 fn load_live_signer(
@@ -1073,7 +553,7 @@ fn load_live_signer(
         }
     };
 
-    let responder_cert_der = load_responder_cert(ca)?;
+    let responder_cert_der = hoike_sign::orchestrate::load_responder_cert(ca)?;
 
     // RFC 6960: KeyHash = SHA-1(responder's subjectPublicKey).
     // When delegated (cert provided), hash the cert's SPKI.
@@ -1089,7 +569,7 @@ fn load_live_signer(
             .raw_bytes();
         sha1::Sha1::digest(key_bytes).to_vec()
     } else {
-        decode_issuer_key(ca)?
+        hoike_sign::orchestrate::decode_issuer_key(ca)?
     };
 
     Ok(hoike_server::LiveSignerState {
@@ -1290,27 +770,6 @@ fn build_preferred_sig_algs_extension(prefer_str: &str) -> Vec<u8> {
         eprintln!("Failed to encode PreferredSignatureAlgorithms: {e}");
         std::process::exit(1);
     })
-}
-
-#[cfg(feature = "pkcs11")]
-fn ml_dsa_pkcs11_params(
-    sig_alg: &str,
-) -> std::result::Result<(cryptoki::object::MlDsaParameterSetType, &'static str), String> {
-    match sig_alg {
-        "ml-dsa-44" => Ok((
-            cryptoki::object::MlDsaParameterSetType::ML_DSA_44,
-            hoike_sign::ML_DSA_44_OID,
-        )),
-        "ml-dsa-65" => Ok((
-            cryptoki::object::MlDsaParameterSetType::ML_DSA_65,
-            hoike_sign::ML_DSA_65_OID,
-        )),
-        "ml-dsa-87" => Ok((
-            cryptoki::object::MlDsaParameterSetType::ML_DSA_87,
-            hoike_sign::ML_DSA_87_OID,
-        )),
-        other => Err(format!("unknown ML-DSA variant for PKCS#11: {other}")),
-    }
 }
 
 fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
@@ -1815,98 +1274,4 @@ fn run_sign(
         println!("  Signature overhead: ~{sig_overhead} bytes ({sig_alg})");
     }
     println!("  Output:            {}", output.display());
-}
-
-#[cfg(feature = "pkcs11")]
-/// Resolve a PKCS#11 PIN through the precedence chain:
-///   1. `pin` in config (least secure — plaintext on disk)
-///   2. `pin_env` — read from the named environment variable
-///   3. Interactive terminal prompt (most secure — never stored)
-///
-/// For production deployments, omit both `pin` and `pin_env` from the
-/// config file. hoike will prompt at startup:
-///
-/// ```text
-/// Enter PKCS#11 PIN for CA 'enterprise-issuing-01' (Luna: hoike-partition):
-/// ```
-///
-/// For automated/headless environments (containers, systemd), use `pin_env`
-/// and inject the PIN via a secrets manager (Vault, Kubernetes secrets, etc.).
-fn resolve_pkcs11_pin(
-    ca_label: &str,
-    token_label: Option<&str>,
-    pin: &Option<String>,
-    pin_env: &Option<String>,
-) -> std::result::Result<String, String> {
-    if let Some(p) = pin {
-        warn!(
-            ca = ca_label,
-            "PKCS#11 PIN is in config file — use pin_env or interactive prompt for production"
-        );
-        return Ok(p.clone());
-    }
-
-    if let Some(env_var) = pin_env {
-        return std::env::var(env_var).map_err(|_| {
-            format!(
-                "CA '{}': PKCS#11 pin_env '{}' is not set in environment",
-                ca_label, env_var
-            )
-        });
-    }
-
-    // Interactive prompt — the production path
-    let prompt = if let Some(tl) = token_label {
-        format!("Enter PKCS#11 PIN for CA '{}' (token: {}): ", ca_label, tl)
-    } else {
-        format!("Enter PKCS#11 PIN for CA '{}': ", ca_label)
-    };
-
-    eprint!("{}", prompt);
-    rpassword::read_password()
-        .map_err(|e| format!("CA '{}': failed to read PIN from terminal: {e}", ca_label))
-}
-
-/// Resolve PKCS#11 config from CaConfig.
-#[cfg(feature = "pkcs11")]
-fn resolve_pkcs11_config(
-    ca_config: &hoike_core::config::CaConfig,
-) -> std::result::Result<hoike_sign::Pkcs11Config, String> {
-    match &ca_config.signing_key {
-        Some(hoike_core::config::SigningKeyConfig::Pkcs11 {
-            module,
-            token_label,
-            slot_id,
-            pin,
-            pin_env,
-            key_label,
-            key_id,
-        }) => {
-            let resolved_pin =
-                resolve_pkcs11_pin(&ca_config.label, token_label.as_deref(), pin, pin_env)?;
-
-            Ok(hoike_sign::Pkcs11Config {
-                module_path: module.clone(),
-                slot_id: *slot_id,
-                token_label: token_label.clone(),
-                pin: resolved_pin,
-                key_label: key_label.clone(),
-                key_id: key_id
-                    .as_ref()
-                    .map(|h| {
-                        hex::decode(h).map_err(|e| {
-                            format!(
-                                "CA '{}': invalid hex in key_id '{}': {e}",
-                                ca_config.label, h
-                            )
-                        })
-                    })
-                    .transpose()?,
-            })
-        }
-        _ => Err(format!(
-            "CA '{}': not a PKCS#11 signing key config",
-            ca_config.label
-        )),
-    }
 }

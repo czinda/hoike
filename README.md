@@ -74,7 +74,7 @@ Binaries:
 - `target/release/hoike` — the OCSP responder (~8 MB)
 - `target/release/ahu` — bundle inspection and management tool (~1 MB)
 
-Running tests (131 tests across 6 crates):
+Running tests (147 tests across 6 crates):
 
 ```bash
 cargo test --workspace
@@ -148,9 +148,11 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 
 ```toml
 [server]
-mode        = "edge"            # "signer" | "edge" | "combined"
-listen      = "0.0.0.0:2560"
-max_request = 8192              # bytes
+mode           = "edge"         # "signer" | "edge" | "combined"
+listen         = "0.0.0.0:2560"
+max_request    = 8192           # bytes
+metrics_listen = "127.0.0.1:9184"  # optional; Prometheus /metrics on a private port
+                                    # (requires building with --features metrics)
 
 [storage]
 bundle_dir         = "/var/lib/hoike/bundles"
@@ -239,6 +241,7 @@ hoike/
 | **M4** | Gossip (SWIM/foca), enclave import, anti-rollback persistence | Done |
 | **M5** | ML-DSA-44/65/87, batching benchmarks, RFC 9919/9654 conformance suite | Done |
 | **Post** | CMS seal, PKCS#11 HSM, delegated cert, key rotation, 389 DS syncrepl | Done |
+| **Ops** | On-demand signing API, Prometheus `/metrics` + audit log, gossip fleet view (members + generation propagation), ahu diff/extract/apply over admin API + web UI | Done |
 
 ## Known limitations
 

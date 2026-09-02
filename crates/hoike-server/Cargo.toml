@@ -22,6 +22,7 @@ arc-swap = { workspace = true }
 base64 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 hoike-sign = { path = "../hoike-sign" }
+hoike-gossip = { path = "../hoike-gossip" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 signature = "2"
 serde = { workspace = true }
@@ -30,10 +31,13 @@ bcrypt = { workspace = true }
 rand = { workspace = true }
 include_dir = { workspace = true, optional = true }
 toml = { workspace = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, optional = true }
 
 [features]
 default = []
 embed-webui = ["dep:include_dir"]
+metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -23,6 +23,7 @@ pub async fn handle_get(State(state): State<AppState>, Path(path): Path<String>)
         Ok(b) => b,
         Err(e) => {
             debug!(error = %e, "GET path decode failed");
+            crate::obs::record_request("unknown", "get", "malformed");
             return ocsp_error_response(MALFORMED_REQUEST);
         }
     };
@@ -30,10 +31,11 @@ pub async fn handle_get(State(state): State<AppState>, Path(path): Path<String>)
     let max = state.responder.config.server.max_request;
     if der_bytes.len() > max {
         debug!(size = der_bytes.len(), max, "GET decoded request too large");
+        crate::obs::record_request("unknown", "get", "malformed");
         return ocsp_error_response(MALFORMED_REQUEST);
     }
 
-    process_request(&state, &der_bytes).await
+    process_request(&state, &der_bytes, "get").await
 }
 
 pub async fn handle_post(
@@ -56,18 +58,40 @@ pub async fn handle_post(
     let max = state.responder.config.server.max_request;
     if body.len() > max {
         debug!(size = body.len(), max, "POST body too large");
+        crate::obs::record_request("unknown", "post", "malformed");
         return ocsp_error_response(MALFORMED_REQUEST);
     }
 
-    process_request(&state, &body).await
+    process_request(&state, &body, "post").await
 }
 
-async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
+/// Time and record every processed request. The inner function returns the
+/// resolved CA label and a `&'static str` status so the counter/histogram get
+/// accurate `{ca,method,status}` labels without threading metrics through every
+/// early-return branch.
+async fn process_request(state: &AppState, der_bytes: &[u8], method: &'static str) -> Response {
+    let start = std::time::Instant::now();
+    let (resp, ca, status) = process_request_inner(state, der_bytes).await;
+    crate::obs::record_request(&ca, method, status);
+    crate::obs::record_request_duration(&ca, start.elapsed().as_secs_f64());
+    resp
+}
+
+async fn process_request_inner(
+    state: &AppState,
+    der_bytes: &[u8],
+) -> (Response, String, &'static str) {
+    let unknown = || "unknown".to_string();
+
     let parsed = match parse_ocsp_request(der_bytes) {
         Ok(p) => p,
         Err(e) => {
             debug!(error = %e, "OCSP request parse failed");
-            return ocsp_error_response(MALFORMED_REQUEST);
+            return (
+                ocsp_error_response(MALFORMED_REQUEST),
+                unknown(),
+                "malformed",
+            );
         }
     };
 
@@ -78,12 +102,23 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
             nonce_len = parsed.nonce.as_ref().map(|n| n.len()),
             "nonce length rejected"
         );
-        return ocsp_error_response(MALFORMED_REQUEST);
+        crate::obs::record_nonce("unknown", "unknown", "rejected");
+        return (
+            ocsp_error_response(MALFORMED_REQUEST),
+            unknown(),
+            "malformed",
+        );
     }
 
     let cert_id = match parsed.cert_ids.first() {
         Some(cid) => cid,
-        None => return ocsp_error_response(MALFORMED_REQUEST),
+        None => {
+            return (
+                ocsp_error_response(MALFORMED_REQUEST),
+                unknown(),
+                "malformed",
+            );
+        }
     };
 
     // Reject requests if the loaded bundle has expired.
@@ -99,7 +134,13 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                 next_update_min = window.next_update_min,
                 "bundle expired — returning tryLater"
             );
-            return ocsp_error_response(TRY_LATER);
+            crate::obs::audit!(
+                event = "request_rejected",
+                reason = "bundle_expired",
+                next_update_min = window.next_update_min,
+                "serving refused: loaded bundle past nextUpdate"
+            );
+            return (ocsp_error_response(TRY_LATER), unknown(), "tryLater");
         }
     }
 
@@ -107,10 +148,14 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
 
     match state.responder.lookup(cert_id, &parsed.preferred_sig_algs) {
         Some(result) => {
+            let ca = result.ca_label.clone();
+            crate::obs::record_certid_alg(&ca, &cert_id.hash_alg_oid);
+
             // Nonce policy only matters when the request carries a nonce.
             if has_nonce {
                 match result.nonce_policy.as_str() {
                     "live" => {
+                        crate::obs::record_nonce(&ca, "live", "live");
                         if let Some(live) = &state.live_signer {
                             let nonce_bytes = parsed.nonce.as_ref().unwrap();
                             let status = match hoike_sign::extract_status_from_response(
@@ -119,7 +164,11 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(error = %e, "failed to extract status for live signing");
-                                    return ocsp_error_response(INTERNAL_ERROR);
+                                    return (
+                                        ocsp_error_response(INTERNAL_ERROR),
+                                        ca,
+                                        "internalError",
+                                    );
                                 }
                             };
                             let now = std::time::SystemTime::now()
@@ -143,11 +192,15 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                                         nonce_len = nonce_bytes.len(),
                                         "signed live response with nonce"
                                     );
-                                    return live_response(&response_der);
+                                    return (live_response(&response_der), ca, "live");
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "live signing failed");
-                                    return ocsp_error_response(INTERNAL_ERROR);
+                                    return (
+                                        ocsp_error_response(INTERNAL_ERROR),
+                                        ca,
+                                        "internalError",
+                                    );
                                 }
                             }
                         }
@@ -155,25 +208,27 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                             ca = result.ca_label,
                             "live nonce policy but no signer configured"
                         );
-                        return ocsp_error_response(INTERNAL_ERROR);
+                        return (ocsp_error_response(INTERNAL_ERROR), ca, "internalError");
                     }
                     "forward" => {
+                        crate::obs::record_nonce(&ca, "forward", "forwarded");
                         if let Some(url) = &result.forward_to {
                             debug!(
                                 ca = result.ca_label,
                                 url = url,
                                 "forwarding nonce-bearing request upstream"
                             );
-                            return forward_request(url, der_bytes).await;
+                            return (forward_request(url, der_bytes).await, ca, "forwarded");
                         }
                         // forward_to missing should be caught at config validation,
                         // but handle gracefully at runtime.
                         warn!(ca = result.ca_label, "forward policy but no forward_to URL");
-                        return ocsp_error_response(INTERNAL_ERROR);
+                        return (ocsp_error_response(INTERNAL_ERROR), ca, "internalError");
                     }
                     _ => {
                         // "ignore" — serve pre-signed response without nonce.
                         // RFC 9919 §3.2.1 blesses this.
+                        crate::obs::record_nonce(&ca, &result.nonce_policy, "ignored");
                     }
                 }
             }
@@ -184,7 +239,8 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                 size = result.response_bytes.len(),
                 "serving pre-signed response"
             );
-            ocsp_success_response(&result)
+            let status = presigned_status_label(&result.response_bytes);
+            (ocsp_success_response(&result), ca, status)
         }
         None => {
             debug!(
@@ -192,9 +248,34 @@ async fn process_request(state: &AppState, der_bytes: &[u8]) -> Response {
                 serial = hex::encode(&cert_id.serial_number),
                 "no entry — returning unauthorized"
             );
-            ocsp_error_response(UNAUTHORIZED)
+            crate::obs::record_certid_alg("unknown", &cert_id.hash_alg_oid);
+            crate::obs::audit!(
+                event = "request_rejected",
+                reason = "unauthorized",
+                serial = %hex::encode(&cert_id.serial_number),
+                "no bundle entry for requested serial"
+            );
+            (ocsp_error_response(UNAUTHORIZED), unknown(), "unauthorized")
         }
     }
+}
+
+/// Classify a pre-signed OCSP response into a `{good,revoked}` status label for
+/// the request counter. Decoding is skipped entirely (returns `"served"`) when
+/// the `metrics` feature is off, keeping the serving hot path allocation-free.
+#[cfg(feature = "metrics")]
+fn presigned_status_label(response_bytes: &[u8]) -> &'static str {
+    match hoike_sign::extract_status_from_response(response_bytes) {
+        Ok(hoike_sign::LiveCertStatus::Good) => "good",
+        Ok(hoike_sign::LiveCertStatus::Revoked { .. }) => "revoked",
+        Err(_) => "served",
+    }
+}
+
+#[cfg(not(feature = "metrics"))]
+#[inline]
+fn presigned_status_label(_response_bytes: &[u8]) -> &'static str {
+    "served"
 }
 
 async fn forward_request(url: &str, der_bytes: &[u8]) -> Response {

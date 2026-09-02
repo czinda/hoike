@@ -78,10 +78,33 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 - **389 DS syncrepl adapter**: RFC 4533 Content Synchronization source for Dogtag
   certificate databases in `hoike-sign/src/dogtag_sync.rs`. Persistent cookie,
   positive issuance for `authoritative-complete` bundles.
+- **On-demand signing endpoint**: `POST /api/admin/sign/{label}` and `/api/admin/sign`
+  produce a bundle and hot-reload it, sharing the background loop's `SignerContext`
+  mutex so epoch derivation and `.ahu` writes never race. Orchestration lives in
+  `hoike-sign/src/orchestrate.rs`.
+- **ahu bundle tooling over admin API**: `diff`, `extract`, and `apply` exposed as
+  admin routes (`hoike-server/src/admin/bundles.rs`) and UI pages, backed by the pure
+  computation in `ahu/src/ops.rs`.
+- **Observability**: Prometheus `/metrics` on a dedicated listener (`server.metrics_listen`,
+  `--features metrics`) covering requests, latency, CertID algs, nonce outcomes, bundle
+  freshness/epoch/load-failures, signer-generation latency, and gossip membership. Facade
+  in `hoike-server/src/obs.rs` compiles to no-ops without the feature. Structured audit
+  log on the `audit` tracing target (always on).
+- **Gossip fleet view (M4)**: SWIM membership (`GossipNode::members`) plus generation
+  propagation. Signer passes and on-demand signing broadcast `GenerationAnnouncement`s
+  (stamped with the announcing node via a `#[serde(default)]` `origin_node` field —
+  backward-compatible across a mixed fleet); receivers fold them into a per-(node, scope)
+  generation table. Admin `/api/admin/gossip` returns members + per-node epoch and
+  staleness (`epochs_behind`, last-heard age); the Gossip UI page renders both with
+  color-coding.
 
 ## What is NOT implemented
 
-- **Gossip authentication**: Messages are unauthenticated; design doc requires signing.
+- **Gossip message authentication**: Membership and generation propagation work, but
+  messages are still unauthenticated (`identity_key` sign/verify per design §6.3 is the
+  remaining M4 sub-task).
+- **Gossip bundle pull-on-announce**: Receiving a `GenerationAnnouncement` records it in
+  the generation table but does not yet fetch/verify/swap the peer's bundle.
 - **Seal trust anchor chain validation**: Verifies CMS signature integrity, but doesn't
   build a full PKIX path against trust anchors. Self-referential verification only.
 - **SCVP**: Server-based Certificate Validation Protocol — separate protocol, not planned.
@@ -89,8 +112,10 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 ## Current state
 
 All five milestones (M0–M5) plus post-milestone features (CMS seal, PKCS#11,
-delegated cert, live nonce, key rotation, syncrepl) are implemented. The design
-doc (`hoike-design.md`) is the roadmap — it describes the target architecture
-including features not yet built. The README describes what runs today.
+delegated cert, live nonce, key rotation, syncrepl, on-demand signing, Prometheus
+metrics + audit log, ahu admin tooling, and the M4 gossip fleet view) are
+implemented. The design doc (`hoike-design.md`) is the roadmap — it describes the
+target architecture including features not yet built (gossip message signing,
+bundle pull-on-announce). The README describes what runs today.
 
-131 tests. ~15,000 lines of Rust. 52 commits.
+147 tests. ~15,000 lines of Rust.

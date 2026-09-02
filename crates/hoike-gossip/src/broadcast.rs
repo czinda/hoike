@@ -14,11 +14,21 @@ pub enum GossipMessage {
         epoch: u64,
         manifest_digest: [u8; 32],
         bundle_url: Option<String>,
+        /// Name of the node that produced this announcement, so receivers can
+        /// attribute the epoch to a specific fleet member and compute
+        /// per-node staleness. Added after the initial wire format; `#[serde(default)]`
+        /// keeps it backward-compatible — messages from older nodes decode with an
+        /// empty origin (the JSON payload simply omits the field).
+        #[serde(default)]
+        origin_node: String,
     },
     UrgentRevocation {
         producer_id: String,
         issuer_key_hash: Vec<u8>,
         epoch: u64,
+        /// See `GenerationAnnouncement::origin_node`.
+        #[serde(default)]
+        origin_node: String,
     },
 }
 
@@ -44,6 +54,15 @@ impl GossipMessage {
             GossipMessage::UrgentRevocation { epoch, .. } => *epoch,
         }
     }
+
+    /// The announcing node's name, or `""` if the message came from an older
+    /// node that predates the `origin_node` field.
+    pub fn origin_node(&self) -> &str {
+        match self {
+            GossipMessage::GenerationAnnouncement { origin_node, .. } => origin_node,
+            GossipMessage::UrgentRevocation { origin_node, .. } => origin_node,
+        }
+    }
 }
 
 impl fmt::Display for GossipMessage {
@@ -65,6 +84,7 @@ impl fmt::Display for GossipMessage {
                 producer_id,
                 issuer_key_hash,
                 epoch,
+                ..
             } => write!(
                 f,
                 "UrgentRevocation(producer={}, ikh={}, epoch={})",
@@ -154,20 +174,43 @@ mod tests {
             epoch: 42,
             manifest_digest: [0xBB; 32],
             bundle_url: Some("https://signer-a.example/ahu/latest.ahu".into()),
+            origin_node: "edge-1".into(),
         };
 
         let json = serde_json::to_vec(&msg).unwrap();
         let decoded: GossipMessage = serde_json::from_slice(&json).unwrap();
         assert_eq!(msg, decoded);
+        assert_eq!(decoded.origin_node(), "edge-1");
 
         let msg2 = GossipMessage::UrgentRevocation {
             producer_id: "signer-b".into(),
             issuer_key_hash: vec![0xCC; 32],
             epoch: 100,
+            origin_node: "signer-b".into(),
         };
         let json2 = serde_json::to_vec(&msg2).unwrap();
         let decoded2: GossipMessage = serde_json::from_slice(&json2).unwrap();
         assert_eq!(msg2, decoded2);
+    }
+
+    // A node running the pre-`origin_node` wire format emits JSON without that
+    // field. `#[serde(default)]` must let a new node decode it (empty origin)
+    // rather than rejecting the message — otherwise a mixed fleet partitions
+    // during a rolling upgrade.
+    #[test]
+    fn legacy_announcement_without_origin_node_decodes() {
+        let legacy = serde_json::json!({
+            "GenerationAnnouncement": {
+                "producer_id": "signer-a",
+                "issuer_key_hash": [1, 2, 3],
+                "epoch": 7,
+                "manifest_digest": vec![0u8; 32],
+                "bundle_url": null
+            }
+        });
+        let decoded: GossipMessage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.epoch(), 7);
+        assert_eq!(decoded.origin_node(), "", "missing origin decodes to empty");
     }
 
     #[test]

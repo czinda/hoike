@@ -39,6 +39,10 @@ pub struct ServerConfig {
     pub max_request: usize,
     pub admin: Option<AdminConfig>,
     pub webui: Option<WebUiConfig>,
+    /// Optional dedicated listener for the Prometheus `/metrics` endpoint, e.g.
+    /// "127.0.0.1:9184". Kept off the public OCSP port. Requires a build with
+    /// the `metrics` feature to expose data; otherwise `/metrics` returns 503.
+    pub metrics_listen: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

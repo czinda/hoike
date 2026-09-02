@@ -385,6 +385,17 @@ conservative.
 
 ### 6.3 Gossip
 
+> **Status (v0.2.0): partially implemented.** SWIM membership/failure detection
+> (use 1) and generation announcements (use 2) are live over `foca`: every signer
+> pass and reload broadcasts a `GenerationAnnouncement` per CA scope, and each node
+> maintains a generation table (origin node, epoch, manifest digest, last-seen)
+> surfaced with per-scope staleness in the admin API, `hoike_gossip_members{state}`,
+> and the web UI fleet view. **Not yet implemented:** anti-entropy *pull* on
+> announcement (nodes learn peer epochs but do not auto-fetch/verify/swap peer
+> bundles), message signing (`identity_key`), and the signed urgent-revocation
+> object (use 3). Until signing lands, gossip runs unauthenticated — see the
+> README Known Limitations.
+
 SWIM via `foca`, or Scuttlebutt via `chitchat`. Three uses, and nothing else:
 
 1. **Membership and failure detection.** Who is up, who left, who to route to.
@@ -486,6 +497,13 @@ the far side of an air gap confirm what they received before importing it.
 ---
 
 ## 9. Observability
+
+> **Status (v0.2.0): implemented.** All series below are registered in
+> `hoike-server/src/obs.rs` and exposed on `GET /metrics` (Prometheus text
+> format) via the `server.metrics_listen` private listener when built with
+> `--features metrics`. A structured audit log (`tracing` target `audit`) records
+> bundle loads, epoch transitions, signer generations, and load failures. Without
+> the feature flag the instrumentation compiles to no-ops.
 
 Metrics (Prometheus):
 
@@ -602,8 +620,9 @@ classical one to demonstrate both.
 | **M1** | Single-CA edge: load a bundle, serve GET and POST, correct headers, `unauthorized` on miss. Interop against OpenSSL and Go. |
 | **M2** | Signer tier: Dogtag adapter, batch production, PKCS#11 delegated signing, full and delta generations. |
 | **M3** | Multi-CA routing with the issuerKeyHash multimap; nonce policy all three modes; combined mode. |
-| **M4** | Gossip membership and generation propagation; enclave import path; anti-rollback persistence hardening. |
+| **M4** | Gossip membership and generation propagation; enclave import path; anti-rollback persistence hardening. **Done** — membership + generation table + fleet view landed in v0.2.0 (anti-entropy pull and message signing still open). |
 | **M5** | ML-DSA scopes end to end; publish the batching-vs-size curve; Infrared conformance module. |
+| **Ops** | On-demand signing API + web UI; Prometheus `/metrics` + audit log (§9); ahu diff/extract/apply over the admin API. **Done** in v0.2.0. |
 
 ---
 
