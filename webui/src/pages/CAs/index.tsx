@@ -19,16 +19,16 @@ interface CaRow {
   rotation: RotationStatus | null;
 }
 
-function expiryColor(days: number): 'red' | 'gold' | 'green' {
+function expiryColor(days: number): 'red' | 'yellow' | 'green' {
   if (days < 7) return 'red';
-  if (days < 30) return 'gold';
+  if (days < 30) return 'yellow';
   return 'green';
 }
 
-function rotationColor(status: string): 'green' | 'gold' | 'red' | 'grey' {
+function rotationColor(status: string): 'green' | 'yellow' | 'red' | 'grey' {
   switch (status) {
     case 'ok': return 'green';
-    case 'renew_soon': return 'gold';
+    case 'renew_soon': return 'yellow';
     case 'expired': return 'red';
     default: return 'grey';
   }

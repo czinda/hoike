@@ -18,6 +18,8 @@ import { listCerts, type CertInfo } from '../../api/certs';
 import { getRotation, signCa, rotateCa, type RotationStatus } from '../../api/signing';
 import { fmtDuration } from '../../utils';
 import { errorMessage } from '../../api/client';
+import { useAuth } from '../../auth/AuthContext';
+import { hasRole } from '../../nav';
 
 interface CaDetailData {
   config: CaConfigInfo;
@@ -31,6 +33,7 @@ export default function CADetail() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [actionMsg, setActionMsg] = useState<{ type: 'success' | 'danger'; text: string } | null>(null);
+  const { role } = useAuth();
 
   useEffect(() => {
     if (!label) return;
@@ -144,7 +147,7 @@ export default function CADetail() {
               <DescriptionListGroup>
                 <DescriptionListTerm>Days Remaining</DescriptionListTerm>
                 <DescriptionListDescription>
-                  <Label color={cert.is_expired ? 'red' : cert.days_remaining < 30 ? 'gold' : 'green'}>
+                  <Label color={cert.is_expired ? 'red' : cert.days_remaining < 30 ? 'yellow' : 'green'}>
                     {cert.is_expired ? 'Expired' : `${cert.days_remaining} days`}
                   </Label>
                 </DescriptionListDescription>
@@ -168,7 +171,7 @@ export default function CADetail() {
               <DescriptionListGroup>
                 <DescriptionListTerm>Status</DescriptionListTerm>
                 <DescriptionListDescription>
-                  <Label color={rotation.status === 'ok' ? 'green' : rotation.status === 'renew_soon' ? 'gold' : 'red'}>
+                  <Label color={rotation.status === 'ok' ? 'green' : rotation.status === 'renew_soon' ? 'yellow' : 'red'}>
                     {rotation.status}
                   </Label>
                 </DescriptionListDescription>
@@ -183,10 +186,14 @@ export default function CADetail() {
           </>
         )}
 
-        <ActionGroup style={{ marginTop: '1rem' }}>
-          <Button variant="primary" onClick={handleSign}>Trigger Sign</Button>
-          <Button variant="secondary" onClick={handleRotate}>Run Rotation</Button>
-        </ActionGroup>
+        {hasRole(role, 'operator') && (
+          <ActionGroup style={{ marginTop: '1rem' }}>
+            <Button variant="primary" onClick={handleSign}>Trigger Sign</Button>
+            {hasRole(role, 'administrator') && (
+              <Button variant="secondary" onClick={handleRotate}>Run Rotation</Button>
+            )}
+          </ActionGroup>
+        )}
       </PageSection>
     </>
   );

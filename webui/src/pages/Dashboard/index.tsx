@@ -28,10 +28,10 @@ interface DashboardData {
   rotation: RotationStatus[];
 }
 
-function rotationColor(status: string): 'green' | 'gold' | 'red' | 'grey' {
+function rotationColor(status: string): 'green' | 'yellow' | 'red' | 'grey' {
   switch (status) {
     case 'ok': return 'green';
-    case 'renew_soon': return 'gold';
+    case 'renew_soon': return 'yellow';
     case 'expired': return 'red';
     default: return 'grey';
   }

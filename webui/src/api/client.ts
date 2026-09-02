@@ -32,7 +32,10 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
     headers['Content-Type'] = 'application/json';
   }
   const resp = await fetch(`${BASE}${path}`, { ...init, headers });
-  if (resp.status === 401) {
+  // Only treat a 401 as an expired session when we actually sent a token.
+  // A 401 with no token is a failed login attempt (invalid credentials), which
+  // must propagate to the caller instead of hard-redirecting to the login page.
+  if (resp.status === 401 && token) {
     sessionStorage.removeItem('hoike_auth');
     window.location.href = '/ui/login';
     throw new ApiError(401, 'session expired');
@@ -44,13 +47,19 @@ function extractErrorMessage(status: number, text: string, statusText: string): 
   if (text) {
     try {
       const body = JSON.parse(text) as Record<string, unknown>;
-      if (typeof body.detail === 'string' && body.detail) {
+      // Handlers return errors under `detail`; some (e.g. 501 signing) use
+      // `message`. Accept either so the UI never shows raw JSON.
+      const detail =
+        typeof body.detail === 'string' && body.detail ? body.detail :
+        typeof body.message === 'string' && body.message ? body.message :
+        null;
+      if (detail) {
         const prefix =
           status === 403 ? 'Access denied' :
           status === 404 ? 'Not found' :
           status === 400 ? 'Bad request' :
           status >= 500 ? 'Server error' : null;
-        return prefix ? `${prefix}: ${body.detail}` : body.detail;
+        return prefix ? `${prefix}: ${detail}` : detail;
       }
     } catch {
       // not JSON

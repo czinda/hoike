@@ -15,7 +15,7 @@ import {
 } from '@patternfly/react-core';
 import { getStatus, type ServerStatus } from '../../api/status';
 import { getConfig, type CaConfigInfo } from '../../api/config';
-import { signCa, signAll, type SignResult } from '../../api/signing';
+import { signCa, signAll } from '../../api/signing';
 import { errorMessage } from '../../api/client';
 
 export default function Signing() {

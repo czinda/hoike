@@ -11,5 +11,5 @@ pub use request::{
     NonceAction, ParsedCertId, ParsedRequest, decode_get_path, parse_ocsp_request, validate_nonce,
 };
 pub use response::*;
-pub use router::{LookupResult, ResponderState};
+pub use router::{LookupResult, ResponderState, ScopeDetail};
 pub use state::StateStore;

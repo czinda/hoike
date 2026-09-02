@@ -39,6 +39,7 @@ struct BundleInfo {
     ca_label: String,
     epoch: u64,
     completeness: String,
+    entry_count: u64,
     window: Option<WindowInfo>,
 }
 
@@ -54,22 +55,21 @@ pub async fn get_bundles(State(state): State<AppState>, auth: Authenticated) -> 
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
-    let scopes = state.responder.scope_info();
-    let window = state.responder.default_window();
-    let window_info = window.map(|w| WindowInfo {
-        produced_at: w.produced_at,
-        this_update_min: w.this_update_min,
-        next_update_min: w.next_update_min,
-        next_update_max: w.next_update_max,
-    });
-
-    let bundles: Vec<BundleInfo> = scopes
-        .iter()
-        .map(|(label, epoch, completeness)| BundleInfo {
-            ca_label: label.clone(),
-            epoch: *epoch,
-            completeness: completeness.clone(),
-            window: window_info.clone(),
+    let bundles: Vec<BundleInfo> = state
+        .responder
+        .bundle_scopes()
+        .into_iter()
+        .map(|s| BundleInfo {
+            ca_label: s.ca_label,
+            epoch: s.epoch,
+            completeness: s.completeness,
+            entry_count: s.entry_count,
+            window: Some(WindowInfo {
+                produced_at: s.window.produced_at,
+                this_update_min: s.window.this_update_min,
+                next_update_min: s.window.next_update_min,
+                next_update_max: s.window.next_update_max,
+            }),
         })
         .collect();
 

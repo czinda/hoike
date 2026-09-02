@@ -1,4 +1,5 @@
 import { apiJson, apiVoid } from './client';
+import type { Role } from '../nav';
 
 export interface LoginRequest {
   name: string;
@@ -7,7 +8,7 @@ export interface LoginRequest {
 
 export interface LoginResponse {
   session_token: string;
-  role: string;
+  role: Role;
   operator: string;
   expires_in_secs: number;
 }

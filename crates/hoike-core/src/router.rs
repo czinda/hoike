@@ -43,6 +43,17 @@ pub struct LookupResult {
     pub forward_to: Option<String>,
 }
 
+/// Per-bundle scope detail for diagnostic/admin views. Unlike `scope_info`,
+/// this carries each bundle's own window and entry count, so multi-CA
+/// deployments report accurate per-bundle data instead of the first bundle's.
+pub struct ScopeDetail {
+    pub ca_label: String,
+    pub epoch: u64,
+    pub completeness: String,
+    pub entry_count: u64,
+    pub window: ahu::Window,
+}
+
 /// The responder's loaded state: bundles indexed by CA scope,
 /// with persistent anti-rollback state.
 pub struct ResponderState {
@@ -170,6 +181,32 @@ impl ResponderState {
             }
         }
         info
+    }
+
+    /// Per-bundle scope details (label, epoch, completeness, entry count, and
+    /// the bundle's own validity window). Prefer this over `scope_info` +
+    /// `default_window` when reporting per-bundle data for multi-CA setups.
+    pub fn bundle_scopes(&self) -> Vec<ScopeDetail> {
+        let map = self.scope_map.load();
+        let mut out = Vec::new();
+        for entries in map.entries.values() {
+            for entry in entries {
+                let bundle = &map.bundles[entry.bundle_idx];
+                out.push(ScopeDetail {
+                    ca_label: entry.ca_label.clone(),
+                    epoch: bundle
+                        .manifest
+                        .ca_scopes
+                        .first()
+                        .map(|s| s.epoch)
+                        .unwrap_or(0),
+                    completeness: entry.completeness.clone(),
+                    entry_count: bundle.manifest.entry_count,
+                    window: bundle.manifest.window.clone(),
+                });
+            }
+        }
+        out
     }
 
     /// Hot-reload all bundles from disk with anti-rollback checks.
