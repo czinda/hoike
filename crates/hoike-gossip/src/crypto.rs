@@ -188,6 +188,28 @@ impl GossipVerifier {
     }
 }
 
+/// Strip a signed frame's tag + signature *without verifying it*, returning the
+/// inner JSON payload; pass any unsigned/raw payload through unchanged.
+///
+/// This is the decode path for a node that has opted out of verification
+/// entirely (`verifier: None` — neither an `identity_key` nor `peer_keys`
+/// configured). Such a node must still understand the signed wire format enough
+/// to reach the inner payload, or it would fail to decode *every* framed
+/// broadcast a signing peer emits during a rolling upgrade — exactly the
+/// "mixed fleet stays interoperable" property the [`SIGNED_TAG`] framing is
+/// meant to provide. Accepting the unverified payload is no weaker than the
+/// unsigned messages this node already accepts (an attacker could send the same
+/// bytes unsigned), so it opens no new attack surface. A node that wants
+/// authentication configures `peer_keys` and gets a real [`GossipVerifier`]
+/// instead of this pass-through.
+pub fn unwrap_frame(data: &[u8]) -> &[u8] {
+    if data.first() == Some(&SIGNED_TAG) && data.len() > SIG_LEN {
+        &data[1 + SIG_LEN..]
+    } else {
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

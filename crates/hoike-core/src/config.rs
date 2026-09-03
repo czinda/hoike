@@ -150,8 +150,13 @@ pub struct CaConfig {
     /// `hoike check` refuses a cleartext forward URL without this escape hatch.
     #[serde(default)]
     pub forward_insecure: bool,
-    /// Optional PEM CA bundle to validate the forward target's server cert
-    /// against (instead of the system roots).
+    /// Optional PEM CA bundle for the forward target's server certificate.
+    ///
+    /// NOTE: per-target custom roots are not yet wired into the forward path.
+    /// The shared outbound client validates the forward target against the
+    /// system trust store, so this CA must currently be installed system-wide to
+    /// take effect; setting it alone does not change validation. `hoike check`
+    /// emits the same caveat. Retained as forward-looking config.
     pub forward_ca: Option<PathBuf>,
     /// Revocation source (required for combined/signer mode)
     pub source: Option<SourceConfig>,

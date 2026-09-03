@@ -162,7 +162,13 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
                     return Ok(None);
                 }
             },
-            None => data,
+            // No verifier configured: this node has opted out of authentication.
+            // It must still strip a signing peer's frame to reach the inner JSON,
+            // or a signed broadcast would fail to decode and die at this hop —
+            // breaking mixed-fleet interop during a rolling upgrade. Accepting
+            // the unverified payload is no weaker than the unsigned messages this
+            // node already accepts.
+            None => crate::crypto::unwrap_frame(data),
         };
 
         let msg: GossipMessage =
@@ -289,6 +295,46 @@ mod tests {
             "unsigned message dropped under Required policy"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    // A node with no gossip keys (verifier: None) has opted out of auth, but a
+    // *signing* peer still frames its broadcasts. The keyless node must strip the
+    // frame and decode the inner payload — otherwise every signed announcement
+    // dies at this hop and a mid-upgrade mixed fleet partitions.
+    #[test]
+    fn none_verifier_decodes_signed_frame_from_peer() {
+        use crate::crypto::GossipSigner;
+        use ed25519_dalek::SigningKey;
+        use foca::BroadcastHandler;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<GossipMessage>(4);
+        let mut handler = HoikeBroadcastHandler::new(tx, None);
+
+        let msg = GossipMessage::GenerationAnnouncement {
+            producer_id: "signer-a".into(),
+            issuer_key_hash: vec![0xAA; 32],
+            epoch: 11,
+            manifest_digest: [0u8; 32],
+            bundle_url: None,
+            origin_node: "node-a".into(),
+        };
+        let payload = serde_json::to_vec(&msg).unwrap();
+
+        // Signed frame from a peer → keyless node strips the frame and decodes.
+        let signer = GossipSigner::new(SigningKey::from_bytes(&[7u8; 32]));
+        let framed = signer.frame(&payload);
+        let key = handler
+            .receive_item(&framed, None::<&()>)
+            .expect("keyless node must decode a signed frame, not error");
+        assert!(key.is_some(), "signed frame accepted by keyless node");
+        assert_eq!(rx.try_recv().unwrap().epoch(), 11);
+
+        // Plain unsigned payload still decodes on the same node.
+        let key = handler
+            .receive_item(&payload, None::<&()>)
+            .expect("keyless node decodes unsigned too");
+        assert!(key.is_some());
+        assert_eq!(rx.try_recv().unwrap().epoch(), 11);
     }
 
     #[test]
