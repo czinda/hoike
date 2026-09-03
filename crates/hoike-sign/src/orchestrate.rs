@@ -69,6 +69,8 @@ pub fn create_persistent_sources(
                 bind_password_env,
                 cookie_path,
                 filter,
+                tls,
+                ca_cert,
             } => {
                 let password =
                     resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
@@ -84,6 +86,8 @@ pub fn create_persistent_sources(
                     filter: filter
                         .clone()
                         .unwrap_or_else(|| "(objectClass=certificateRecord)".into()),
+                    tls: tls.clone(),
+                    ca_cert: ca_cert.clone(),
                 };
                 Box::new(crate::DogtagSyncSource::new(sync_config))
             }

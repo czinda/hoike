@@ -97,12 +97,20 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
   generation table. Admin `/api/admin/gossip` returns members + per-node epoch and
   staleness (`epochs_behind`, last-heard age); the Gossip UI page renders both with
   color-coding.
+- **Gossip message authentication (FPT_ITT.1)**: Generation/urgent-revocation broadcasts
+  are Ed25519-signed at the JSON payload boundary and verified on receive
+  (`hoike-gossip/src/crypto.rs`, `broadcast.rs::receive_item`); forged/unsigned messages
+  are dropped before re-propagation. `gossip.identity_key` signs; `gossip.peer_keys` is the
+  trusted set and flips enforcement (empty = permissive rollout, populated = drop-unsigned).
+  One-byte frame tag (`0x01`, unambiguous vs. legacy `{` JSON) keeps a mixed fleet
+  interoperable. `hoike check` reports the gossip auth posture.
 
 ## What is NOT implemented
 
-- **Gossip message authentication**: Membership and generation propagation work, but
-  messages are still unauthenticated (`identity_key` sign/verify per design §6.3 is the
-  remaining M4 sub-task).
+- **Gossip payload confidentiality / SWIM auth**: Broadcasts are now *signed* but not
+  *encrypted*, and foca's SWIM liveness traffic (pings/acks) is not authenticated. Signing
+  covers the trust-bearing broadcasts (design §6.3); channel encryption is the remaining
+  surface.
 - **Gossip bundle pull-on-announce**: Receiving a `GenerationAnnouncement` records it in
   the generation table but does not yet fetch/verify/swap the peer's bundle.
 - **Seal trust anchor chain validation**: Verifies CMS signature integrity, but doesn't

@@ -2,6 +2,8 @@ mod admin;
 mod handlers;
 pub mod obs;
 mod state;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use state::{AppState, LiveSignerState, SignerContext};
 
@@ -100,6 +102,15 @@ async fn metrics_handler(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Build the public OCSP router.
+///
+/// When no dedicated admin listener is configured (`server.admin_listen`
+/// unset), the admin API and web UI are nested onto this same router for
+/// backward compatibility — the legacy single-port layout. When `admin_listen`
+/// *is* set, the management surface moves to its own listener
+/// (`build_admin_router`) so it can be given a trusted path (TLS, FTP_TRP.1)
+/// without wrapping the plaintext OCSP data plane; this router then serves OCSP
+/// only.
 pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/", post(handlers::handle_post))
@@ -108,9 +119,32 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{*path}", post(handlers::handle_post))
         .with_state(state.clone());
 
-    let admin_router = admin::build_admin_router(state.clone());
-    app = app.nest("/api/admin", admin_router);
+    // Legacy layout: admin + UI ride the OCSP port only when no dedicated admin
+    // listener is configured.
+    if state.admin.config.server.admin_listen.is_none() {
+        let admin_router = admin::build_admin_router(state.clone());
+        app = app.nest("/api/admin", admin_router);
+        app = mount_webui(app, &state);
+    }
 
+    app
+}
+
+/// Build the standalone admin router (admin API + web UI) for a dedicated
+/// management listener. Contains no OCSP routes, so it can be TLS-terminated
+/// independently of the plaintext OCSP data plane.
+pub fn build_admin_router_standalone(state: AppState) -> Router {
+    // `admin::build_admin_router` already applies `.with_state`, yielding a
+    // fully-stated `Router<()>`; nesting it needs no further state.
+    let admin_router = admin::build_admin_router(state.clone());
+    let app = Router::new().nest("/api/admin", admin_router);
+    mount_webui(app, &state)
+}
+
+/// Mount the web UI (disk-served `static_dir`, or the embedded SPA) onto a
+/// router. Shared by the legacy single-port layout and the standalone admin
+/// router so both surface the UI identically.
+fn mount_webui(mut app: Router, state: &AppState) -> Router {
     if let Some(webui_config) = &state.admin.config.server.webui {
         if let Some(static_dir) = &webui_config.static_dir {
             let serve = tower_http::services::ServeDir::new(static_dir).fallback(

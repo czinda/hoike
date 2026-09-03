@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::broadcast::{GossipMessage, HoikeBroadcastHandler};
 use crate::config::GossipConfig;
+use crate::crypto::{self, GossipSigner, GossipVerifier, VerifyPolicy};
 
 /// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
 fn now_unix() -> u64 {
@@ -116,6 +117,9 @@ pub struct GossipNode {
     identity: NodeId,
     /// Per-(node, scope) generation records built from received announcements.
     generations: GenerationTable,
+    /// Ed25519 signer for outbound broadcasts (FPT_ITT.1). `None` when no
+    /// `identity_key` is configured — broadcasts go out unsigned, as before.
+    signer: Option<GossipSigner>,
 }
 
 impl GossipNode {
@@ -149,7 +153,51 @@ impl GossipNode {
                 .unwrap_or_default()
                 .as_nanos() as u64,
         );
-        let broadcast_handler = HoikeBroadcastHandler::new(msg_tx);
+        // Message authentication (FPT_ITT.1). Load this node's signing key (if
+        // any) and the trusted peer keys, then derive the rollout policy: an
+        // empty `peer_keys` list stays permissive (accept unsigned during a
+        // rolling upgrade), a populated one enforces (drop unsigned/forged).
+        let signer = match &config.identity_key {
+            Some(path) => {
+                let key = crypto::load_signing_key(path)
+                    .map_err(|e| format!("gossip identity_key {}: {e}", path.display()))?;
+                info!(key = %path.display(), "gossip message signing enabled");
+                Some(GossipSigner::new(key))
+            }
+            None => None,
+        };
+
+        let mut trusted = Vec::new();
+        for path in &config.peer_keys {
+            let vk = crypto::load_verifying_key(path)
+                .map_err(|e| format!("gossip peer_key {}: {e}", path.display()))?;
+            trusted.push(vk);
+        }
+        // Trust our own key so broadcasts echoed back through the mesh verify.
+        if let Some(s) = &signer {
+            trusted.push(s.verifying_key());
+        }
+
+        // A verifier exists whenever this node participates in the signed scheme
+        // at all (has its own key or names trusted peers). `peer_keys` populated
+        // ⇒ enforce; otherwise permissive.
+        let verifier = if signer.is_some() || !config.peer_keys.is_empty() {
+            let policy = if config.peer_keys.is_empty() {
+                VerifyPolicy::Permissive
+            } else {
+                VerifyPolicy::Required
+            };
+            info!(
+                ?policy,
+                trusted_keys = trusted.len(),
+                "gossip verification enabled"
+            );
+            Some(GossipVerifier::new(trusted, policy))
+        } else {
+            None
+        };
+
+        let broadcast_handler = HoikeBroadcastHandler::new(msg_tx, verifier);
 
         // Keep a copy of our identity: `with_custom_broadcast` consumes it, but
         // we need it to stamp outgoing announcements and to show the local node
@@ -174,6 +222,7 @@ impl GossipNode {
             config: config.clone(),
             identity: self_identity,
             generations: Arc::new(RwLock::new(HashMap::new())),
+            signer,
         };
 
         // Spawn the receive loop
@@ -222,6 +271,16 @@ impl GossipNode {
         Ok(node)
     }
 
+    /// Wrap a JSON broadcast payload in a signed frame when signing is enabled,
+    /// or pass it through unchanged otherwise. Isolated so both announce paths
+    /// share one code path for the wire format.
+    fn frame_broadcast(&self, payload: Vec<u8>) -> Vec<u8> {
+        match &self.signer {
+            Some(signer) => signer.frame(&payload),
+            None => payload,
+        }
+    }
+
     /// Broadcast a generation announcement to the gossip mesh.
     pub async fn announce_generation(
         &self,
@@ -240,7 +299,7 @@ impl GossipNode {
             origin_node: self.identity.name.clone(),
         };
 
-        let data = serde_json::to_vec(&msg)?;
+        let data = self.frame_broadcast(serde_json::to_vec(&msg)?);
         let mut foca = self.foca.lock().await;
         foca.add_broadcast(&data)?;
 
@@ -262,7 +321,7 @@ impl GossipNode {
             origin_node: self.identity.name.clone(),
         };
 
-        let data = serde_json::to_vec(&msg)?;
+        let data = self.frame_broadcast(serde_json::to_vec(&msg)?);
         let mut foca = self.foca.lock().await;
         foca.add_broadcast(&data)?;
 
@@ -552,6 +611,8 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             seeds: vec![],
             node_name: name.into(),
+            identity_key: None,
+            peer_keys: vec![],
         };
         GossipNode::start(config, tx).await.expect("node starts")
     }

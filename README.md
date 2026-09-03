@@ -52,6 +52,11 @@ requiring HSM access on every serving node. hoike separates signing from serving
 
 Validated by a 20-check conformance test suite in `crates/hoike-server/tests/conformance.rs`.
 
+For the Common Criteria view — how hoike maps to the **NIAP Protection Profile
+for Certification Authorities v2.1 (PP 420)** and the TLS Functional Package
+v1.1, including the transport-hardening trusted-path/trusted-channel SFRs — see
+[`docs/niap-ppca-gap-matrix.md`](docs/niap-ppca-gap-matrix.md).
+
 ## The ahu bundle format
 
 The **ahu** (Hawaiian: a cairn, a trail marker) format is a portable container of
@@ -211,6 +216,11 @@ enabled   = true
 bind      = "0.0.0.0:7946"
 seeds     = ["edge-a.pki.example:7946", "edge-b.pki.example:7946"]
 node_name = "edge-01"
+# Message authentication (FPT_ITT.1). identity_key signs outbound broadcasts;
+# peer_keys is the trusted set for inbound verification. Empty peer_keys = permissive
+# (accept unsigned during a rolling upgrade); populated = enforced (drop unsigned/forged).
+identity_key = "/etc/hoike/gossip/edge-01.ed25519.p8"   # Ed25519 PKCS#8 private key
+peer_keys    = ["/etc/hoike/gossip/edge-a.pub.pem", "/etc/hoike/gossip/edge-b.pub.pem"]
 ```
 
 ## Workspace layout
@@ -245,9 +255,11 @@ hoike/
 
 ## Known limitations
 
-- **Gossip messages are unsigned** — the design doc (§6.3) requires every gossip
-  message to be signed. The current implementation uses foca's postcard codec
-  with no authentication.
+- **Gossip: broadcasts signed, channel not encrypted** — generation/urgent-revocation
+  broadcasts are Ed25519-signed and verified on receive (`gossip.identity_key` +
+  `gossip.peer_keys`, design §6.3); forged or unsigned messages are dropped. Not yet
+  covered: payload *confidentiality* and authentication of foca's SWIM liveness traffic
+  (pings/acks).
 - **Seal trust anchor validation** — `verify_seal` checks the CMS signature
   against the certificate carried in the seal. Full chain validation against
   configured trust anchors verifies integrity but does not yet build a full

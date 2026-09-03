@@ -117,11 +117,18 @@ impl foca::Invalidates for BroadcastKey {
 /// BroadcastHandler that processes GossipMessage broadcasts.
 pub struct HoikeBroadcastHandler {
     tx: tokio::sync::mpsc::Sender<GossipMessage>,
+    /// Inbound message authentication (FPT_ITT.1). `None` disables verification
+    /// entirely — today's unauthenticated behavior — used when no gossip
+    /// `identity_key`/`peer_keys` are configured.
+    verifier: Option<crate::crypto::GossipVerifier>,
 }
 
 impl HoikeBroadcastHandler {
-    pub fn new(tx: tokio::sync::mpsc::Sender<GossipMessage>) -> Self {
-        Self { tx }
+    pub fn new(
+        tx: tokio::sync::mpsc::Sender<GossipMessage>,
+        verifier: Option<crate::crypto::GossipVerifier>,
+    ) -> Self {
+        Self { tx, verifier }
     }
 }
 
@@ -145,8 +152,21 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
         data: &[u8],
         _sender: Option<&T>,
     ) -> Result<Option<Self::Key>, Self::Error> {
+        // Authenticate before decoding. A dropped message returns `Ok(None)` so
+        // foca neither stores nor re-broadcasts it — the forgery dies at this hop.
+        let payload: &[u8] = match &self.verifier {
+            Some(v) => match v.check(data) {
+                crate::crypto::VerifyOutcome::Accept(p) => p,
+                crate::crypto::VerifyOutcome::Reject(reason) => {
+                    tracing::warn!(reason, "gossip message rejected (authentication)");
+                    return Ok(None);
+                }
+            },
+            None => data,
+        };
+
         let msg: GossipMessage =
-            serde_json::from_slice(data).map_err(|e| BroadcastError(format!("decode: {e}")))?;
+            serde_json::from_slice(payload).map_err(|e| BroadcastError(format!("decode: {e}")))?;
 
         let key = BroadcastKey {
             producer_id: msg.scope_key().0.to_string(),
@@ -211,6 +231,64 @@ mod tests {
         let decoded: GossipMessage = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.epoch(), 7);
         assert_eq!(decoded.origin_node(), "", "missing origin decodes to empty");
+    }
+
+    // The authentication integration point: a verifier-equipped handler must
+    // admit a validly signed broadcast (onto the channel + re-broadcast) and
+    // silently drop a forged one — foca sees `Ok(None)` so nothing propagates.
+    #[test]
+    fn handler_drops_forged_and_admits_signed() {
+        use crate::crypto::{GossipSigner, GossipVerifier, VerifyPolicy};
+        use ed25519_dalek::SigningKey;
+        use foca::BroadcastHandler;
+
+        let trusted_key = SigningKey::from_bytes(&[1u8; 32]);
+        let signer = GossipSigner::new(trusted_key.clone());
+        let verifier =
+            GossipVerifier::new(vec![trusted_key.verifying_key()], VerifyPolicy::Required);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<GossipMessage>(4);
+        let mut handler = HoikeBroadcastHandler::new(tx, Some(verifier));
+
+        let msg = GossipMessage::GenerationAnnouncement {
+            producer_id: "signer-a".into(),
+            issuer_key_hash: vec![0xAA; 32],
+            epoch: 9,
+            manifest_digest: [0u8; 32],
+            bundle_url: None,
+            origin_node: "node-a".into(),
+        };
+        let payload = serde_json::to_vec(&msg).unwrap();
+
+        // Valid signature → accepted (returns a broadcast key, lands on channel).
+        let good = signer.frame(&payload);
+        let key = handler
+            .receive_item(&good, None::<&()>)
+            .expect("no decode error");
+        assert!(key.is_some(), "valid signed message must be accepted");
+        assert_eq!(rx.try_recv().unwrap().epoch(), 9);
+
+        // Forged by an untrusted key → dropped (Ok(None), nothing on channel).
+        let attacker = GossipSigner::new(SigningKey::from_bytes(&[9u8; 32]));
+        let forged = attacker.frame(&payload);
+        let key = handler
+            .receive_item(&forged, None::<&()>)
+            .expect("drop is not a decode error");
+        assert!(key.is_none(), "forged message must be dropped");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing forwarded for forged message"
+        );
+
+        // Unsigned legacy under Required policy → dropped too.
+        let key = handler
+            .receive_item(&payload, None::<&()>)
+            .expect("drop is not a decode error");
+        assert!(
+            key.is_none(),
+            "unsigned message dropped under Required policy"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

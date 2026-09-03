@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ldap3::{LdapConn, Scope, SearchEntry};
+use ldap3::{LdapConn, LdapConnSettings, Scope, SearchEntry};
 use tracing::{debug, info, warn};
 use x509_cert::ext::pkix::CrlReason;
 
@@ -164,6 +164,10 @@ pub struct DogtagSyncConfig {
     pub cookie_path: PathBuf,
     /// LDAP filter for certificate records
     pub filter: String,
+    /// Transport security: `"ldaps"`, `"starttls"`, or `"none"` (FTP_ITC.1).
+    pub tls: String,
+    /// Optional PEM CA bundle to validate the directory server certificate.
+    pub ca_cert: Option<PathBuf>,
 }
 
 impl DogtagSyncConfig {
@@ -171,6 +175,79 @@ impl DogtagSyncConfig {
     fn attrs() -> Vec<&'static str> {
         vec!["cn", "serialno", "certStatus", "revokedOn", "revReason"]
     }
+}
+
+/// Open an `LdapConn` honoring the configured transport security (FTP_ITC.1).
+///
+/// - `"starttls"` sets `set_starttls(true)` so TLS is negotiated *before* the
+///   bind — the bind password never crosses in cleartext.
+/// - `"ldaps"` relies on an `ldaps://` URL scheme for implicit TLS.
+/// - `"none"` (default) is plaintext, retained for backward compatibility.
+///
+/// When `ca_cert` is set, the directory server certificate is validated against
+/// exactly that PEM anchor (via a rustls `ClientConfig` on the aws-lc-rs
+/// provider); otherwise the platform trust store is used.
+fn connect(ldap_url: &str, tls: &str, ca_cert: Option<&Path>) -> Result<LdapConn> {
+    let mut settings = LdapConnSettings::new();
+
+    match tls {
+        "starttls" => settings = settings.set_starttls(true),
+        "ldaps" => {
+            if !ldap_url.starts_with("ldaps://") {
+                return Err(SignError::Config(format!(
+                    "dogtag-sync tls=\"ldaps\" requires an ldaps:// URL, got {ldap_url}"
+                )));
+            }
+        }
+        "none" => {}
+        other => {
+            return Err(SignError::Config(format!(
+                "dogtag-sync: invalid tls mode {other:?} (expected ldaps|starttls|none)"
+            )));
+        }
+    }
+
+    if let Some(ca_path) = ca_cert {
+        settings = settings.set_config(Arc::new(client_config_with_ca(ca_path)?));
+    }
+
+    LdapConn::with_settings(settings, ldap_url)
+        .map_err(|e| SignError::Config(format!("LDAP connect {ldap_url}: {e}")))
+}
+
+/// Build a rustls `ClientConfig` that trusts only the certificates in `ca_path`.
+///
+/// Pinned to the aws-lc-rs provider explicitly so it is independent of whatever
+/// process-default provider other components installed.
+fn client_config_with_ca(ca_path: &Path) -> Result<rustls::ClientConfig> {
+    let file = std::fs::File::open(ca_path)
+        .map_err(|e| SignError::Config(format!("opening LDAP CA {}: {e}", ca_path.display())))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut roots = rustls::RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut reader) {
+        let cert = cert.map_err(|e| {
+            SignError::Config(format!("parsing LDAP CA {}: {e}", ca_path.display()))
+        })?;
+        roots
+            .add(cert)
+            .map_err(|e| SignError::Config(format!("adding LDAP CA anchor: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(SignError::Config(format!(
+            "no certificates found in LDAP CA {}",
+            ca_path.display()
+        )));
+    }
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| SignError::Config(format!("LDAP TLS protocol setup: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(config)
 }
 
 // ── Source adapter ───────────────────────────────────────────────────────
@@ -217,12 +294,9 @@ impl DogtagSyncSource {
     /// without a cookie for a full refresh.
     fn refresh(&self) -> Result<u64> {
         let cookie_for_request = self.cookie.lock().unwrap().clone();
-        let mut changed = 0u64;
 
-        match self.do_sync(cookie_for_request.as_deref()) {
-            Ok(n) => {
-                changed = n;
-            }
+        let changed = match self.do_sync(cookie_for_request.as_deref()) {
+            Ok(n) => n,
             Err(e) => {
                 if cookie_for_request.is_some() {
                     warn!(
@@ -230,12 +304,12 @@ impl DogtagSyncSource {
                         "syncrepl with cookie failed — retrying full refresh"
                     );
                     // Full refresh (no cookie)
-                    changed = self.do_sync(None)?;
+                    self.do_sync(None)?
                 } else {
                     return Err(e);
                 }
             }
-        }
+        };
 
         // Bump epoch
         let mut epoch = self.epoch.lock().unwrap();
@@ -257,6 +331,8 @@ impl DogtagSyncSource {
         let bind_password = self.config.bind_password.clone();
         let base_dn = self.config.base_dn.clone();
         let filter = self.config.filter.clone();
+        let tls = self.config.tls.clone();
+        let ca_cert = self.config.ca_cert.clone();
         let cookie_owned = cookie.map(|c| c.to_vec());
         let entries = self.entries.clone();
         let cookie_state = self.cookie.clone();
@@ -269,6 +345,8 @@ impl DogtagSyncSource {
                 &bind_password,
                 &base_dn,
                 &filter,
+                &tls,
+                ca_cert.as_deref(),
                 cookie_owned.as_deref(),
                 &entries,
                 &cookie_state,
@@ -281,19 +359,21 @@ impl DogtagSyncSource {
             .unwrap_or_else(|e| Err(SignError::Config(format!("LDAP thread panicked: {e:?}"))))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_sync_inner(
         ldap_url: &str,
         bind_dn: &str,
         bind_password: &str,
         base_dn: &str,
         filter: &str,
+        tls: &str,
+        ca_cert: Option<&Path>,
         cookie: Option<&[u8]>,
         entries: &Mutex<BTreeMap<SerialBytes, CertificateStatus>>,
         cookie_state: &Mutex<Option<Vec<u8>>>,
         cookie_path: &Path,
     ) -> Result<u64> {
-        let mut conn = LdapConn::new(ldap_url)
-            .map_err(|e| SignError::Config(format!("LDAP connect {ldap_url}: {e}")))?;
+        let mut conn = connect(ldap_url, tls, ca_cert)?;
 
         conn.simple_bind(bind_dn, bind_password)
             .map_err(|e| SignError::Config(format!("LDAP bind as {bind_dn}: {e}")))?
@@ -598,5 +678,36 @@ mod tests {
 
         let parsed = parse_sync_done_cookie(&ber);
         assert_eq!(parsed, Some(cookie.to_vec()));
+    }
+
+    #[test]
+    fn connect_rejects_invalid_tls_mode() {
+        let err = connect("ldap://ds.example:389", "bogus", None).unwrap_err();
+        assert!(
+            matches!(err, SignError::Config(m) if m.contains("invalid tls mode")),
+            "expected invalid-tls-mode config error"
+        );
+    }
+
+    #[test]
+    fn connect_ldaps_requires_ldaps_scheme() {
+        // tls="ldaps" over a plaintext ldap:// URL is a configuration error and
+        // must be caught before any bind is attempted.
+        let err = connect("ldap://ds.example:389", "ldaps", None).unwrap_err();
+        assert!(
+            matches!(err, SignError::Config(m) if m.contains("requires an ldaps:// URL")),
+            "expected ldaps-scheme config error"
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_empty_ca_pem() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, b"not a pem\n").unwrap();
+        let err = client_config_with_ca(f.path()).unwrap_err();
+        assert!(
+            matches!(err, SignError::Config(m) if m.contains("no certificates found")),
+            "expected empty-CA config error"
+        );
     }
 }

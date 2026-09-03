@@ -278,11 +278,36 @@ fn presigned_status_label(_response_bytes: &[u8]) -> &'static str {
     "served"
 }
 
+/// Shared outbound client for nonce forwarding.
+///
+/// Built once (not per request): `reqwest`'s rustls-tls stack validates the
+/// upstream certificate against the system trust store by default, giving the
+/// forward channel a real trusted channel (FTP_ITC.1). Constructed lazily so a
+/// responder that never forwards pays nothing.
+static FORWARD_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn forward_client() -> &'static reqwest::Client {
+    FORWARD_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client for forwarding")
+    })
+}
+
 async fn forward_request(url: &str, der_bytes: &[u8]) -> Response {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("failed to build HTTP client for forwarding");
+    // Defense in depth: `hoike check` refuses a cleartext `forward_to` unless
+    // `forward_insecure` is set, but warn at runtime too so an operator who
+    // bypassed validation still sees the trusted-channel violation.
+    if !url.starts_with("https://") {
+        warn!(
+            url = url,
+            "forwarding OCSP request over a non-TLS channel — bind password/nonce \
+             traffic is not confidentiality-protected (FTP_ITC.1)"
+        );
+    }
+
+    let client = forward_client();
 
     match client
         .post(url)

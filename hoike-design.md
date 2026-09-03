@@ -56,6 +56,7 @@ machine.** Everything else in this design follows from that.
 | RFC 9846 / RFC 6066 §8 | Stapling context. Note RFC 6961 `status_request_v2` is obsoleted — do not implement it. |
 | RFC 7633 | TLS Feature / must-staple awareness for operator tooling. |
 | RFC 4806 | Optional: OCSP in IKEv2, if the IPsec use case is pursued. |
+| NIAP PPCA v2.1 (PP 420) + TLS Functional Package v1.1 | Common Criteria target for the CA/OCSP role. SFR-by-SFR status, including the trusted-path/trusted-channel transport hardening, in [`docs/niap-ppca-gap-matrix.md`](docs/niap-ppca-gap-matrix.md). |
 
 ---
 

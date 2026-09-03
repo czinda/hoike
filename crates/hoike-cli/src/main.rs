@@ -287,6 +287,8 @@ async fn run_server(config_path: PathBuf) {
                 bind: gossip_cfg.bind.clone(),
                 seeds: gossip_cfg.seeds.clone(),
                 node_name: gossip_cfg.node_name.clone(),
+                identity_key: gossip_cfg.identity_key.clone(),
+                peer_keys: gossip_cfg.peer_keys.clone(),
             };
 
             match hoike_gossip::GossipNode::start(gc, msg_tx).await {
@@ -362,22 +364,32 @@ async fn run_server(config_path: PathBuf) {
 
     // The recorder was installed earlier (before the initial load). If
     // configured, expose it on a dedicated private listener — never the public
-    // OCSP port.
+    // OCSP port. Optionally TLS-terminated (server.metrics_tls).
     if let Some(metrics_listen) = config.server.metrics_listen.clone() {
         let metrics_state = app_state.clone();
+        let metrics_tls = config.server.metrics_tls.clone();
         tokio::spawn(async move {
             let router = hoike_server::build_metrics_router(metrics_state);
-            match tokio::net::TcpListener::bind(&metrics_listen).await {
-                Ok(l) => {
-                    info!(listen = %metrics_listen, "metrics listener starting");
-                    if let Err(e) = axum::serve(l, router).await {
-                        warn!(error = %e, "metrics listener exited");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, listen = %metrics_listen, "failed to bind metrics listener")
-                }
-            }
+            serve_listener("metrics", &metrics_listen, router, metrics_tls).await;
+        });
+    }
+
+    // Dedicated admin/UI listener (NIAP PPCA FTP_TRP.1 trusted path). When
+    // `admin_listen` is set, the management surface moves off the OCSP port and
+    // TLS terminates here, leaving the OCSP data plane plaintext. When unset,
+    // admin/UI stay nested on the OCSP router (legacy single-port layout).
+    if let Some(admin_listen) = config.server.admin_listen.clone() {
+        let admin_state = app_state.clone();
+        let admin_tls = config.server.admin_tls.clone();
+        if admin_tls.is_none() {
+            warn!(
+                listen = %admin_listen,
+                "admin listener configured without admin_tls — management surface is PLAINTEXT"
+            );
+        }
+        tokio::spawn(async move {
+            let router = hoike_server::build_admin_router_standalone(admin_state);
+            serve_listener("admin", &admin_listen, router, admin_tls).await;
         });
     }
 
@@ -392,6 +404,45 @@ async fn run_server(config_path: PathBuf) {
 
     info!(listen = %listen, mode = config.server.mode, "hoike OCSP responder starting");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Serve an axum router on `addr`, using TLS when `tls` is `Some` and the binary
+/// was built with `--features tls`. Falls back to plaintext otherwise (warning
+/// if TLS was requested but unavailable). Used for the metrics and admin
+/// management listeners; the OCSP data plane is always plaintext.
+async fn serve_listener(
+    name: &str,
+    addr: &str,
+    router: axum::Router,
+    tls: Option<hoike_core::config::TlsConfig>,
+) {
+    #[cfg(feature = "tls")]
+    if let Some(tls) = tls.as_ref() {
+        info!(listen = %addr, listener = name, "TLS listener starting");
+        if let Err(e) = hoike_server::tls::serve_router_tls(addr, router, tls).await {
+            warn!(error = %e, listener = name, "TLS listener exited");
+        }
+        return;
+    }
+    #[cfg(not(feature = "tls"))]
+    if tls.is_some() {
+        warn!(
+            listener = name,
+            "TLS configured but binary built without --features tls — serving PLAINTEXT"
+        );
+    }
+
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => {
+            info!(listen = %addr, listener = name, "listener starting");
+            if let Err(e) = axum::serve(l, router).await {
+                warn!(error = %e, listener = name, "listener exited");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, listen = %addr, listener = name, "failed to bind listener")
+        }
+    }
 }
 
 async fn run_signer_loop(
@@ -920,6 +971,12 @@ fn run_check(config_path: PathBuf) {
         }
     }
 
+    // ── Transport / Trusted Channels (NIAP PPCA v2.1) ──
+    // Surface cleartext management and inter-component channels. The OCSP data
+    // plane on `server.listen` is intentionally plaintext (responses are
+    // CMS/signature-authenticated) and is not flagged here.
+    check_trusted_channels(&config);
+
     match hoike_core::ResponderState::load(config) {
         Ok(state) => {
             println!("  Bundles:   {}", state.bundle_count());
@@ -934,6 +991,158 @@ fn run_check(config_path: PathBuf) {
             eprintln!("  Bundle:    FAIL — {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Validate transport-security posture for the management and inter-component
+/// channels (NIAP PPCA FTP_TRP.1 / FTP_ITC.1). Warnings are advisory; a
+/// cleartext `forward_to` without the explicit `forward_insecure` escape hatch
+/// is a hard failure (exit 1), matching how other `hoike check` gates behave.
+fn check_trusted_channels(config: &hoike_core::Config) {
+    println!("\n  ── Transport / Trusted Channels (NIAP PPCA) ──");
+    let mut hard_fail = false;
+
+    // Admin trusted path (FTP_TRP.1).
+    let has_operators = config
+        .server
+        .admin
+        .as_ref()
+        .is_some_and(|a| !a.operators.is_empty());
+    match (&config.server.admin_listen, &config.server.admin_tls) {
+        (None, _) if has_operators => {
+            eprintln!(
+                "    WARNING: admin API rides the OCSP port (no admin_listen) — operator \
+                 credentials and session cookies cross in cleartext. Set server.admin_listen \
+                 + server.admin_tls for a trusted path (FTP_TRP.1)."
+            );
+        }
+        (Some(addr), None) => {
+            eprintln!(
+                "    WARNING: admin_listen ({addr}) has no admin_tls — the management channel \
+                 is plaintext. Configure server.admin_tls (FCS_TLSS_EXT.1)."
+            );
+        }
+        (Some(addr), Some(_)) => {
+            println!("    Admin:     TLS on {addr} (FCS_TLSS_EXT.1)");
+        }
+        _ => {}
+    }
+
+    // Metrics channel.
+    match (&config.server.metrics_listen, &config.server.metrics_tls) {
+        (Some(addr), None) => {
+            eprintln!(
+                "    WARNING: metrics_listen ({addr}) has no metrics_tls — Prometheus scrape \
+                 traffic is plaintext. Bind privately or set server.metrics_tls."
+            );
+        }
+        (Some(addr), Some(_)) => {
+            println!("    Metrics:   TLS on {addr}");
+        }
+        _ => {}
+    }
+
+    // Forward proxy channel (FTP_ITC.1).
+    for ca in &config.ca {
+        if let Some(url) = &ca.forward_to {
+            if url.starts_with("https://") {
+                println!("    Forward ({}): https (FTP_ITC.1)", ca.label);
+            } else if ca.forward_insecure {
+                eprintln!(
+                    "    WARNING: CA '{}' forwards to cleartext {url} (forward_insecure=true) — \
+                     lab/testing only.",
+                    ca.label
+                );
+            } else {
+                eprintln!(
+                    "    FAIL: CA '{}' forward_to is cleartext ({url}). Use https:// or set \
+                     forward_insecure=true for lab use (FTP_ITC.1).",
+                    ca.label
+                );
+                hard_fail = true;
+            }
+            if ca.forward_ca.is_some() && url.starts_with("https://") {
+                println!(
+                    "      note: forward_ca must be installed in the system trust store; \
+                     per-target custom roots are not yet wired into the forward path."
+                );
+            }
+        }
+    }
+
+    // 389 DS syncrepl channel (FTP_ITC.1).
+    for ca in &config.ca {
+        if let Some(hoike_core::config::SourceConfig::DogtagSync {
+            ldap_url,
+            bind_password,
+            bind_password_env,
+            tls,
+            ..
+        }) = &ca.source
+        {
+            let has_bind_pw = bind_password.is_some() || bind_password_env.is_some();
+            match tls.as_str() {
+                "ldaps" | "starttls" => {
+                    println!("    Syncrepl ({}): {tls} (FTP_ITC.1)", ca.label);
+                }
+                "none" if has_bind_pw => {
+                    eprintln!(
+                        "    WARNING: CA '{}' dogtag-sync uses plaintext {ldap_url} with a bind \
+                         password — the password crosses in cleartext. Set tls=\"ldaps\" or \
+                         tls=\"starttls\" (FTP_ITC.1).",
+                        ca.label
+                    );
+                }
+                "none" => {}
+                other => {
+                    eprintln!(
+                        "    FAIL: CA '{}' dogtag-sync tls={other:?} is invalid (expected \
+                         ldaps|starttls|none).",
+                        ca.label
+                    );
+                    hard_fail = true;
+                }
+            }
+        }
+    }
+
+    // Gossip message authentication (FPT_ITT.1).
+    if let Some(g) = &config.gossip {
+        if g.enabled {
+            match (&g.identity_key, g.peer_keys.is_empty()) {
+                (Some(_), false) => {
+                    println!(
+                        "    Gossip:    signed + enforced ({} peer key(s)) (FPT_ITT.1)",
+                        g.peer_keys.len()
+                    );
+                }
+                (Some(_), true) => {
+                    eprintln!(
+                        "    WARNING: gossip signs outbound messages (identity_key set) but \
+                         peer_keys is empty — verification is permissive, so unsigned/forged \
+                         messages from peers are still accepted. Populate gossip.peer_keys to \
+                         enforce (FPT_ITT.1)."
+                    );
+                }
+                (None, false) => {
+                    eprintln!(
+                        "    WARNING: gossip.peer_keys is set but this node has no identity_key — \
+                         it enforces inbound signatures but broadcasts its own messages unsigned, \
+                         which enforcing peers will drop. Set gossip.identity_key (FPT_ITT.1)."
+                    );
+                }
+                (None, true) => {
+                    eprintln!(
+                        "    WARNING: gossip is enabled but unauthenticated (no identity_key / \
+                         peer_keys) — membership and generation messages are unsigned (FPT_ITT.1)."
+                    );
+                }
+            }
+        }
+    }
+
+    if hard_fail {
+        std::process::exit(1);
     }
 }
 
