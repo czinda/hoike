@@ -63,8 +63,17 @@ where
     Sig: SignatureBitStringEncoding,
 {
     let now = snapshot.this_update;
-    let next_update_base = now + config.validity_secs;
-    let produced_at = ocsp_time(now)?;
+    let source_end = snapshot.validate_at(crate::source::unix_now()?)?;
+    let next_update_base = now
+        .checked_add(config.validity_secs)
+        .ok_or_else(|| SignError::Config("validity overflows".into()))?
+        .min(source_end);
+    if next_update_base <= crate::source::unix_now()? {
+        return Err(SignError::Config(
+            "generated response would already be expired".into(),
+        ));
+    }
+    let produced_at = ocsp_time(crate::source::unix_now()?)?;
 
     let issuer_name_hash_sha256 = Sha256::digest(&ca.issuer_name_der);
     let issuer_key_hash_sha256 = Sha256::digest(&ca.issuer_key_bytes);
@@ -129,14 +138,16 @@ where
         format_version: 1,
         bundle_id: uuid::Uuid::nil(),
         producer_id: config.producer_id.clone(),
-        created_at: now,
+        created_at: crate::source::unix_now()?,
         bundle_type: BundleType::Full,
         ca_scopes,
         window: Window {
-            produced_at: now,
+            produced_at: crate::source::unix_now()?,
             this_update_min: now,
             next_update_min: next_update_base,
-            next_update_max: next_update_base + config.jitter_secs,
+            next_update_max: next_update_base
+                .saturating_add(config.jitter_secs)
+                .min(source_end),
         },
         integrity: Integrity {
             index_digest: [0; 32],
@@ -209,8 +220,17 @@ where
     Sig2: SignatureBitStringEncoding,
 {
     let now = snapshot.this_update;
-    let next_update_base = now + config.validity_secs;
-    let produced_at = ocsp_time(now)?;
+    let source_end = snapshot.validate_at(crate::source::unix_now()?)?;
+    let next_update_base = now
+        .checked_add(config.validity_secs)
+        .ok_or_else(|| SignError::Config("validity overflows".into()))?
+        .min(source_end);
+    if next_update_base <= crate::source::unix_now()? {
+        return Err(SignError::Config(
+            "generated response would already be expired".into(),
+        ));
+    }
+    let produced_at = ocsp_time(crate::source::unix_now()?)?;
 
     let issuer_name_hash_sha256 = Sha256::digest(&ca.issuer_name_der);
     let issuer_key_hash_sha256 = Sha256::digest(&ca.issuer_key_bytes);
@@ -300,14 +320,16 @@ where
         format_version: 1,
         bundle_id: uuid::Uuid::nil(),
         producer_id: config.producer_id.clone(),
-        created_at: now,
+        created_at: crate::source::unix_now()?,
         bundle_type: BundleType::Full,
         ca_scopes,
         window: Window {
-            produced_at: now,
+            produced_at: crate::source::unix_now()?,
             this_update_min: now,
             next_update_min: next_update_base,
-            next_update_max: next_update_base + config.jitter_secs,
+            next_update_max: next_update_base
+                .saturating_add(config.jitter_secs)
+                .min(source_end),
         },
         integrity: Integrity {
             index_digest: [0; 32],
@@ -473,9 +495,13 @@ fn prepare_entries(
             h.update(serial);
             let d: [u8; 32] = h.finalize().into();
             let frac = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) as u64;
-            (frac * config.jitter_secs) / u32::MAX as u64
+            ((frac as u128 * config.jitter_secs as u128) / u32::MAX as u128) as u64
         };
-        let next_update_time = next_update_base + entry_key_jitter;
+        let next_update_time = next_update_base.saturating_add(entry_key_jitter).min(
+            snapshot
+                .next_update
+                .ok_or_else(|| SignError::Config("missing source expiry".into()))?,
+        );
         let next_update = ocsp_time(next_update_time)?;
 
         match config.certid_compat {
@@ -687,8 +713,8 @@ mod tests {
 
         StatusSnapshot {
             entries,
-            this_update: 1700000000,
-            next_update: Some(1700086400),
+            this_update: crate::source::unix_now().unwrap(),
+            next_update: Some(crate::source::unix_now().unwrap() + 86400),
         }
     }
 
@@ -817,8 +843,8 @@ mod tests {
         }
         StatusSnapshot {
             entries,
-            this_update: 1700000000,
-            next_update: Some(1700086400),
+            this_update: crate::source::unix_now().unwrap(),
+            next_update: Some(crate::source::unix_now().unwrap() + 86400),
         }
     }
 
@@ -1030,6 +1056,58 @@ mod tests {
             classical.unwrap().len(),
             pq.unwrap().len(),
             "classical and PQ responses should differ in size"
+        );
+    }
+    #[test]
+    fn source_expiry_caps_every_signed_entry_even_with_large_jitter() {
+        let mut snapshot = test_snapshot();
+        let end = crate::source::unix_now().unwrap() + 30;
+        snapshot.next_update = Some(end);
+        let config = GenerationConfig {
+            jitter_secs: u64::MAX,
+            ..Default::default()
+        };
+        let mut key = test_signing_key();
+        let bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &test_ca(),
+            &snapshot,
+            &config,
+            &mut key,
+            |_| Ok(vec![]),
+            None,
+        )
+        .unwrap();
+        let bundle = ahu::Bundle::from_bytes(&bytes).unwrap();
+        assert!(bundle.manifest.window.next_update_max <= end);
+        for entry in &bundle.index {
+            let response = bundle.lookup(&entry.entry_key).unwrap();
+            let response = x509_ocsp::OcspResponse::from_der(response).unwrap();
+            let basic = x509_ocsp::BasicOcspResponse::from_der(
+                response.response_bytes.unwrap().response.as_bytes(),
+            )
+            .unwrap();
+            for single in basic.tbs_response_data.responses {
+                assert!(single.next_update.unwrap().0.to_unix_duration().as_secs() <= end);
+            }
+        }
+    }
+
+    #[test]
+    fn expired_source_is_rejected_before_signing() {
+        let mut snapshot = test_snapshot();
+        snapshot.this_update = 1;
+        snapshot.next_update = Some(2);
+        let mut key = test_signing_key();
+        assert!(
+            produce_bundle::<_, p256::ecdsa::DerSignature>(
+                &test_ca(),
+                &snapshot,
+                &GenerationConfig::default(),
+                &mut key,
+                |_| panic!("must not seal stale evidence"),
+                None
+            )
+            .is_err()
         );
     }
 }

@@ -137,8 +137,8 @@ mod tests {
         entries.insert(vec![0x02], CertificateStatus::Good);
         let snapshot = StatusSnapshot {
             entries,
-            this_update: 1700000000,
-            next_update: None,
+            this_update: crate::source::unix_now().unwrap(),
+            next_update: Some(crate::source::unix_now().unwrap() + 86400),
         };
 
         let config = GenerationConfig {
@@ -238,8 +238,8 @@ mod tests {
         entries.insert(vec![0x01], CertificateStatus::Good);
         let snapshot = StatusSnapshot {
             entries,
-            this_update: 1700000000,
-            next_update: None,
+            this_update: crate::source::unix_now().unwrap(),
+            next_update: Some(crate::source::unix_now().unwrap() + 86400),
         };
         let config = GenerationConfig {
             producer_id: "test".into(),

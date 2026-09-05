@@ -48,6 +48,7 @@ pub struct LookupResult {
 /// deployments report accurate per-bundle data instead of the first bundle's.
 pub struct ScopeDetail {
     pub ca_label: String,
+    pub producer_id: String,
     pub epoch: u64,
     pub completeness: String,
     pub entry_count: u64,
@@ -66,7 +67,58 @@ impl ResponderState {
     pub fn load(config: Config) -> Result<Self> {
         let state_db_path = config.storage.state_db.join("state.json");
         let mut state_store = StateStore::open(&state_db_path)?;
-        let scope_map = load_scope_map(&config, &mut state_store)?;
+        let scope_map = match load_scope_map(&config, &mut state_store) {
+            Ok(map) => map,
+            Err(original) if !state_store.active_bundles().is_empty() => {
+                warn!(error = %original, "configured bundle load failed; recovering committed generation");
+                let mut recovery = config.clone();
+                if recovery.ca.is_empty() {
+                    let path = state_store
+                        .active_bundles()
+                        .get("default")
+                        .ok_or(original)?;
+                    let path = path.clone();
+                    let mut candidate = state_store.transaction();
+                    let bundle = load_and_verify_bundle(&path, &config)?;
+                    candidate.check_rollback(&bundle)?;
+                    candidate.check_continuity(&bundle)?;
+                    candidate.advance_from_bundle(&bundle)?;
+                    candidate.snapshot("default", &bundle)?;
+                    let mut entries = HashMap::new();
+                    register_bundle_scopes(
+                        &bundle,
+                        0,
+                        "default",
+                        "ignore",
+                        "authoritative-complete",
+                        None,
+                        &mut entries,
+                    );
+                    state_store.commit(candidate)?;
+                    return Ok(Self {
+                        scope_map: ArcSwap::from_pointee(ScopeMap {
+                            entries,
+                            bundles: vec![Arc::new(bundle)],
+                        }),
+                        config,
+                        state_store: Mutex::new(state_store),
+                    });
+                }
+                for ca in &mut recovery.ca {
+                    ca.bundle_file = Some(
+                        state_store
+                            .active_bundles()
+                            .get(&ca.label)
+                            .ok_or_else(|| {
+                                CoreError::Config(format!("no committed snapshot for {}", ca.label))
+                            })?
+                            .clone(),
+                    );
+                }
+                load_scope_map(&recovery, &mut state_store)?
+            }
+            Err(err) => return Err(err),
+        };
         Ok(ResponderState {
             scope_map: ArcSwap::from_pointee(scope_map),
             config,
@@ -194,6 +246,7 @@ impl ResponderState {
                 let bundle = &map.bundles[entry.bundle_idx];
                 out.push(ScopeDetail {
                     ca_label: entry.ca_label.clone(),
+                    producer_id: bundle.manifest.producer_id.clone(),
                     epoch: bundle
                         .manifest
                         .ca_scopes
@@ -228,7 +281,14 @@ impl ResponderState {
 }
 
 fn validate_nonce_config(config: &Config) -> Result<()> {
+    let mut labels = std::collections::HashSet::new();
     for ca in &config.ca {
+        if !labels.insert(&ca.label) {
+            return Err(CoreError::Config(format!(
+                "duplicate CA label '{}'",
+                ca.label
+            )));
+        }
         match ca.nonce_policy.as_str() {
             "ignore" => {}
             "live" => {
@@ -266,6 +326,13 @@ fn validate_nonce_config(config: &Config) -> Result<()> {
 }
 
 fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
+    let mut candidate = state_store.transaction();
+    let map = load_scope_map_candidate(config, &mut candidate)?;
+    state_store.commit(candidate)?;
+    Ok(map)
+}
+
+fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
     validate_nonce_config(config)?;
 
     let mut bundles: Vec<Arc<Bundle>> = Vec::new();
@@ -293,7 +360,13 @@ fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<Scope
             let bundle_path = if let Some(bf) = &ca_config.bundle_file {
                 bf.clone()
             } else {
-                find_newest_bundle(&config.storage.bundle_dir)?
+                // Configured scopes must read the same per-label destination
+                // used by the signer; newest-file discovery is only for the
+                // legacy configuration with no explicit CA scopes.
+                config
+                    .storage
+                    .bundle_dir
+                    .join(format!("{}.ahu", ca_config.label))
             };
 
             let canonical = bundle_path.canonicalize().unwrap_or(bundle_path.clone());
@@ -320,6 +393,16 @@ fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<Scope
                 ca_config.forward_to.as_deref(),
                 &mut entries,
             );
+        }
+    }
+
+    // All inputs passed validation before writing any new immutable snapshots.
+    let mut labels = std::collections::HashSet::new();
+    for entries_for_scope in entries.values() {
+        for entry in entries_for_scope {
+            if labels.insert(entry.ca_label.clone()) {
+                state_store.snapshot(&entry.ca_label, &bundles[entry.bundle_idx])?;
+            }
         }
     }
 
@@ -413,22 +496,86 @@ fn verify_bundle_seal(bundle: &Bundle, config: &Config) -> Result<()> {
         .as_ref()
         .is_some_and(|v| !v.is_empty());
 
-    if has_trust_anchors {
+    let has_pins = !config.storage.seal_signer_pins.is_empty();
+    if !has_trust_anchors && !has_pins && !config.storage.seal_authorizations.is_empty() {
+        return Err(CoreError::Config(
+            "seal_authorizations requires trust anchors or explicit signer pins".into(),
+        ));
+    }
+    if has_trust_anchors || has_pins {
         if bundle.seal_bytes.is_empty() {
             return Err(CoreError::Config(
                 "seal_trust_anchors configured but bundle has no seal".into(),
             ));
         }
 
-        // Verify the CMS seal integrity (signature over manifest).
-        // NOTE: The current verify_seal checks the signature against the cert
-        // embedded in the seal itself. This proves internal consistency (the seal
-        // wasn't corrupted) but not provenance — a full trust-anchor chain
-        // validation is needed for that. This is an integrity check, not a
-        // provenance check.
-        let _verification = ahu::verify_seal(&bundle.manifest_bytes, &bundle.seal_bytes)
-            .map_err(|e| CoreError::Config(format!("seal verification failed: {e}")))?;
-        info!("CMS seal verified (integrity check)");
+        use der::{Decode, DecodePem, Encode};
+        let read_certs = |paths: &[std::path::PathBuf]| -> Result<Vec<Vec<u8>>> {
+            let mut anchors = Vec::new();
+            for path in paths {
+                let bytes = std::fs::read(path).map_err(|e| {
+                    CoreError::Config(format!(
+                        "cannot read seal trust anchor {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                let cert = if bytes.starts_with(b"-----BEGIN") {
+                    x509_cert::Certificate::from_pem(&bytes)
+                } else {
+                    x509_cert::Certificate::from_der(&bytes)
+                }
+                .map_err(|e| {
+                    CoreError::Config(format!("invalid seal trust anchor {}: {e}", path.display()))
+                })?;
+                anchors.push(
+                    cert.to_der()
+                        .map_err(|e| CoreError::Config(e.to_string()))?,
+                );
+            }
+            Ok(anchors)
+        };
+        let anchors = read_certs(config.storage.seal_trust_anchors.as_deref().unwrap_or(&[]))?;
+        let pins = read_certs(&config.storage.seal_signer_pins)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CoreError::Config(e.to_string()))?
+            .as_secs();
+        let verification = if has_pins {
+            ahu::verify_seal_with_pins(&bundle.manifest_bytes, &bundle.seal_bytes, &pins, now)
+                .or_else(|pin_error| {
+                    if has_trust_anchors {
+                        ahu::verify_seal_with_anchors(
+                            &bundle.manifest_bytes,
+                            &bundle.seal_bytes,
+                            &anchors,
+                            now,
+                        )
+                    } else {
+                        Err(pin_error)
+                    }
+                })
+        } else {
+            ahu::verify_seal_with_anchors(&bundle.manifest_bytes, &bundle.seal_bytes, &anchors, now)
+        }
+        .map_err(|e| CoreError::Config(format!("seal verification failed: {e}")))?;
+        if !config.storage.seal_authorizations.is_empty() {
+            for scope in &bundle.manifest.ca_scopes {
+                if !config.storage.seal_authorizations.iter().any(|auth| {
+                    auth.producer_id == bundle.manifest.producer_id
+                        && auth
+                            .issuer_key_hash
+                            .eq_ignore_ascii_case(&hex::encode(&scope.issuer_key_hash))
+                        && auth
+                            .signer_sha256
+                            .eq_ignore_ascii_case(&verification.signer_sha256)
+                }) {
+                    return Err(CoreError::Config(
+                        "seal signer is not authorized for producer/CA scope".into(),
+                    ));
+                }
+            }
+        }
+        info!(signer = %verification.signer_sha256, "CMS seal authenticated against configured trust policy");
     } else if !bundle.seal_bytes.is_empty() {
         warn!("bundle has a CMS seal but no seal_trust_anchors configured — seal not verified");
     }

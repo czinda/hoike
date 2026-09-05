@@ -3,6 +3,9 @@ mode = "edge"
 listen = "127.0.0.1:2560"
 max_request = 8192
 
+# Synthetic local edge fixture. For authenticated admission provision a real
+# signer certificate and set storage.seal_signer_pins; do not expose this
+# unconfigured-trust fixture to untrusted bundle input.
 [storage]
 bundle_dir = "/tmp/hoike-test"
 state_db = "/tmp/hoike-test/state"
@@ -12,4 +15,4 @@ max_chain = 24
 label = "test-ca"
 bundle_file = "/tmp/hoike-test/test.ahu"
 nonce_policy = "ignore"
-completeness = "authoritative-complete"
+completeness = "partial"

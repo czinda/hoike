@@ -53,6 +53,8 @@ cargo-check:
       - .cargo/git/db
       - target/
   script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends cmake build-essential pkg-config
     - rustup component add clippy rustfmt
     - cargo check --workspace --locked
     - cargo clippy --workspace --locked -- -D warnings
@@ -79,7 +81,14 @@ cargo-test:
       - .cargo/git/db
       - target/
   script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends cmake build-essential pkg-config
+    - set -o pipefail
     - cargo test --workspace --locked 2>&1 | tee test-output.txt
+    - cargo test --workspace --locked --features tls,metrics,pkcs11,dogtag-sync
+    - cargo check -p ahu --no-default-features --lib --locked
+    - cargo test -p ahu --no-default-features --locked
+    - cargo test -p ahu --release --locked --test integration overflowing_entry_offsets_never_panic_in_heap_or_mmap
     - echo "Test summary:"
     - grep "^test result" test-output.txt
   artifacts:
@@ -109,6 +118,8 @@ build-linux-x86_64:
       - .cargo/git/db
       - target/
   script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends cmake build-essential pkg-config
     - cargo build --release --locked
     - strip target/release/hoike target/release/ahu || true
     - mkdir -p artifacts

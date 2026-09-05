@@ -71,6 +71,8 @@ pub async fn ocsp_query(
         issuer_name_hash: inh,
         issuer_key_hash: ikh,
         serial_number: serial,
+        // build_certid_der() hardcodes the SHA-256 AlgorithmIdentifier.
+        hash_alg_oid: "2.16.840.1.101.3.4.2.1".to_string(),
     };
 
     match state.responder.lookup(&parsed, &preferred_algs) {

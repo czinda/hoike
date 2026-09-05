@@ -79,8 +79,7 @@ pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
         if record.is_tombstone() {
             continue;
         }
-        let end = record.data_offset + record.data_length as u64;
-        if end > bundle.data.len() as u64 {
+        if bundle.entry_bytes(record).is_none() {
             result.entry_bounds_ok = false;
             return Err(AhuError::EntryOutOfBounds {
                 offset: record.data_offset,

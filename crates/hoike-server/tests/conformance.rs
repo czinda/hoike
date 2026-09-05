@@ -11,6 +11,13 @@ use x509_ocsp::{CertId, OcspRequest, OcspResponse, Request, TbsRequest};
 
 // ── Test infrastructure ────────────────────────────────────────────
 
+fn current_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 const ISSUER_NAME: &[u8] = b"CN=Conformance CA,O=Hoike Test";
 const ISSUER_KEY: &[u8] = b"conformance-ca-public-key";
 
@@ -40,7 +47,7 @@ fn build_conformance_bundle() -> Vec<u8> {
     entries.insert(
         vec![10u8],
         CertificateStatus::Revoked {
-            revocation_time: 4102400000,
+            revocation_time: current_time() - 44800,
             reason: Some(CrlReason::KeyCompromise),
         },
     );
@@ -48,15 +55,15 @@ fn build_conformance_bundle() -> Vec<u8> {
     entries.insert(
         vec![11u8],
         CertificateStatus::Revoked {
-            revocation_time: 4102410000,
+            revocation_time: current_time() - 34800,
             reason: None,
         },
     );
 
     let snapshot = StatusSnapshot {
         entries,
-        this_update: 4102444800,
-        next_update: Some(4102531200),
+        this_update: current_time() - 1,
+        next_update: Some(current_time() + 86400),
     };
 
     let config = GenerationConfig {

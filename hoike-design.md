@@ -32,7 +32,7 @@ machine.** Everything else in this design follows from that.
 - Keyless edge nodes.
 - Post-quantum ready: ML-DSA response signing as a first-class configuration,
   not a patch.
-- Usable in air-gapped and disconnected enclaves without degradation.
+- Usable in air-gapped and disconnected enclaves within the imported evidence validity window; fresh revocations require a new import.
 
 ### 1.2 Non-goals
 
@@ -56,6 +56,7 @@ machine.** Everything else in this design follows from that.
 | RFC 9846 / RFC 6066 §8 | Stapling context. Note RFC 6961 `status_request_v2` is obsoleted — do not implement it. |
 | RFC 7633 | TLS Feature / must-staple awareness for operator tooling. |
 | RFC 4806 | Optional: OCSP in IKEv2, if the IPsec use case is pursued. |
+| NIAP PPCA v2.1 (PP 420) + TLS Functional Package v1.1 | Common Criteria target for the CA/OCSP role. SFR-by-SFR status, including the trusted-path/trusted-channel transport hardening, in [`docs/niap-ppca-gap-matrix.md`](docs/niap-ppca-gap-matrix.md). |
 
 ---
 
@@ -385,6 +386,13 @@ conservative.
 
 ### 6.3 Gossip
 
+> **Implementation status after security remediation:** Membership and generation
+> announcements are implemented, with bounded generation storage and signed
+> broadcasts authorized through `peer_identities`. Automatic anti-entropy bundle
+> pull remains unimplemented. SWIM liveness is not authenticated and payloads are
+> not encrypted. See the [remediation ledger](docs/review-remediation.md) for
+> tested behavior and deployment qualifications.
+
 SWIM via `foca`, or Scuttlebutt via `chitchat`. Three uses, and nothing else:
 
 1. **Membership and failure detection.** Who is up, who left, who to route to.
@@ -486,6 +494,13 @@ the far side of an air gap confirm what they received before importing it.
 ---
 
 ## 9. Observability
+
+> **Status (v0.2.0): implemented.** All series below are registered in
+> `hoike-server/src/obs.rs` and exposed on `GET /metrics` (Prometheus text
+> format) via the `server.metrics_listen` private listener when built with
+> `--features metrics`. A structured audit log (`tracing` target `audit`) records
+> bundle loads, epoch transitions, signer generations, and load failures. Without
+> the feature flag the instrumentation compiles to no-ops.
 
 Metrics (Prometheus):
 
@@ -602,8 +617,9 @@ classical one to demonstrate both.
 | **M1** | Single-CA edge: load a bundle, serve GET and POST, correct headers, `unauthorized` on miss. Interop against OpenSSL and Go. |
 | **M2** | Signer tier: Dogtag adapter, batch production, PKCS#11 delegated signing, full and delta generations. |
 | **M3** | Multi-CA routing with the issuerKeyHash multimap; nonce policy all three modes; combined mode. |
-| **M4** | Gossip membership and generation propagation; enclave import path; anti-rollback persistence hardening. |
+| **M4** | Gossip membership and generation propagation; enclave import path; anti-rollback persistence hardening. **Done** — membership + generation table + fleet view landed in v0.2.0 (anti-entropy pull still open; broadcasts are now signed). |
 | **M5** | ML-DSA scopes end to end; publish the batching-vs-size curve; Infrared conformance module. |
+| **Ops** | On-demand signing API + web UI; Prometheus `/metrics` + audit log (§9); ahu diff/extract/apply over the admin API. **Done** in v0.2.0. |
 
 ---
 

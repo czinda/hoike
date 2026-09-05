@@ -20,6 +20,20 @@ pub struct GossipConfigSection {
     pub seeds: Vec<String>,
     #[serde(default = "default_gossip_node_name")]
     pub node_name: String,
+    /// Path to an Ed25519 PKCS#8 private key used to sign outbound gossip
+    /// messages (design §6.3, FPT_ITT.1). When set, every message this node
+    /// broadcasts is signed; peers with the matching public key verify and drop
+    /// unauthenticated messages. When unset, gossip stays unauthenticated
+    /// (backward compatible).
+    pub identity_key: Option<PathBuf>,
+    /// Paths to Ed25519 public keys (PEM/DER) trusted to sign peer gossip
+    /// messages. When `identity_key` is set and this is empty, a node verifies
+    /// only its own signature scheme is well-formed; populate with peer keys to
+    /// authenticate the mesh.
+    #[serde(default)]
+    pub peer_keys: Vec<PathBuf>,
+    #[serde(default)]
+    pub peer_identities: std::collections::BTreeMap<String, PathBuf>,
 }
 
 fn default_gossip_bind() -> String {
@@ -39,6 +53,40 @@ pub struct ServerConfig {
     pub max_request: usize,
     pub admin: Option<AdminConfig>,
     pub webui: Option<WebUiConfig>,
+    /// Optional dedicated listener for the Prometheus `/metrics` endpoint, e.g.
+    /// "127.0.0.1:9184". Kept off the public OCSP port. Requires a build with
+    /// the `metrics` feature to expose data; otherwise `/metrics` returns 503.
+    pub metrics_listen: Option<String>,
+    /// Optional dedicated listener for the admin API + web UI, e.g.
+    /// "127.0.0.1:2561". When set, the management surface binds here instead of
+    /// riding the public OCSP port — required to give it a trusted path
+    /// (NIAP PPCA FTP_TRP.1) without wrapping the plaintext OCSP data plane.
+    /// Pair with `admin_tls` to terminate TLS. When unset, admin/UI remain on
+    /// `listen` for backward compatibility.
+    pub admin_listen: Option<String>,
+    /// TLS material for the `admin_listen` listener. Requires a build with the
+    /// `tls` feature; startup fails if TLS support is unavailable.
+    pub admin_tls: Option<TlsConfig>,
+    /// TLS material for the `metrics_listen` listener. Requires the `tls`
+    /// feature. When unset the metrics listener stays plaintext (private-bound).
+    pub metrics_tls: Option<TlsConfig>,
+}
+
+/// PEM certificate/key material for a TLS-terminated listener.
+///
+/// `client_ca`, when set, turns on mutual TLS: clients must present a
+/// certificate chaining to one of these anchors (NIAP PPCA FCS_TLSS_EXT.2).
+/// When absent, the listener does server-auth TLS only (FCS_TLSS_EXT.1) and
+/// authentication falls to the existing bcrypt/RBAC login.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    /// Path to the server certificate chain (PEM, leaf first).
+    pub cert: PathBuf,
+    /// Path to the server private key (PKCS#8 or RSA/SEC1 PEM).
+    pub key: PathBuf,
+    /// Optional PEM bundle of CAs trusted to sign client certificates.
+    /// Presence enables mutual TLS (client-cert required).
+    pub client_ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -80,6 +128,20 @@ pub struct StorageConfig {
     /// When set, bundles without a valid CMS seal are rejected on load.
     #[serde(default)]
     pub seal_trust_anchors: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    pub seal_authorizations: Vec<SealAuthorization>,
+    /// Explicitly trusted signer certificates, distinct from CA trust anchors.
+    #[serde(default)]
+    pub seal_signer_pins: Vec<PathBuf>,
+}
+
+/// Optional restriction of trusted seal certificates to producer and CA scope.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SealAuthorization {
+    pub producer_id: String,
+    pub issuer_key_hash: String,
+    /// SHA-256 of the DER signer certificate, hex encoded.
+    pub signer_sha256: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -96,8 +158,22 @@ pub struct CaConfig {
     /// Hex-encoded issuerKeyHash for explicit routing.
     /// If absent, extracted from the bundle manifest on load.
     pub issuer_key_hash: Option<String>,
-    /// URL to forward nonce-bearing requests to (for nonce_policy = "forward")
+    /// URL to forward nonce-bearing requests to (for nonce_policy = "forward").
+    /// Must be `https://` (trusted channel, FTP_ITC.1) unless `forward_insecure`
+    /// is set.
     pub forward_to: Option<String>,
+    /// Allow a plaintext `http://` `forward_to` target. Lab/testing only —
+    /// `hoike check` refuses a cleartext forward URL without this escape hatch.
+    #[serde(default)]
+    pub forward_insecure: bool,
+    /// Optional PEM CA bundle for the forward target's server certificate.
+    ///
+    /// NOTE: per-target custom roots are not yet wired into the forward path.
+    /// The shared outbound client validates the forward target against the
+    /// system trust store, so this CA must currently be installed system-wide to
+    /// take effect; setting it alone does not change validation. `hoike check`
+    /// emits the same caveat. Retained as forward-looking config.
+    pub forward_ca: Option<PathBuf>,
     /// Revocation source (required for combined/signer mode)
     pub source: Option<SourceConfig>,
     /// Batch production interval in seconds (combined/signer mode)
@@ -202,7 +278,10 @@ pub enum SigningKeyConfig {
 #[serde(tag = "type")]
 pub enum SourceConfig {
     #[serde(rename = "crl")]
-    Crl { path: PathBuf },
+    Crl {
+        path: PathBuf,
+        issuer_cert: Option<PathBuf>,
+    },
 
     /// RFC 4533 syncrepl against a Dogtag 389 DS certificate repository.
     ///
@@ -228,7 +307,21 @@ pub enum SourceConfig {
         /// LDAP filter (default: `(objectClass=certificateRecord)`)
         #[serde(default = "default_sync_filter")]
         filter: Option<String>,
+        /// Transport security for the LDAP connection (FTP_ITC.1):
+        /// `"ldaps"` (implicit TLS), `"starttls"` (upgrade before bind), or
+        /// `"none"` (plaintext — the default, for backward compatibility).
+        /// With `starttls` the upgrade completes *before* the bind, so the bind
+        /// password is never sent in cleartext.
+        #[serde(default = "default_ldap_tls")]
+        tls: String,
+        /// Optional PEM CA bundle to validate the directory server's TLS
+        /// certificate against (instead of the system roots).
+        ca_cert: Option<PathBuf>,
     },
+}
+
+fn default_ldap_tls() -> String {
+    "none".into()
 }
 
 fn default_bind_dn() -> String {
@@ -261,7 +354,7 @@ fn default_nonce_policy() -> String {
     "ignore".into()
 }
 fn default_completeness() -> String {
-    "authoritative-complete".into()
+    "partial".into()
 }
 fn default_batch_interval() -> u64 {
     3600
@@ -288,7 +381,57 @@ impl Config {
         self.is_combined() || self.is_signer()
     }
 
+    /// Validate the actual build before binding listeners or producing bundles.
+    pub fn validate_transport(&self, tls_supported: bool) -> crate::error::Result<()> {
+        let fail = |s: &str| crate::error::CoreError::Config(s.into());
+        if (self.server.admin_tls.is_some() || self.server.metrics_tls.is_some()) && !tls_supported
+        {
+            return Err(fail(
+                "TLS configured but this binary was built without the tls feature",
+            ));
+        }
+        if self.server.admin_tls.is_some() && self.server.admin_listen.is_none() {
+            return Err(fail(
+                "admin_tls requires admin_listen; refusing plaintext management fallback",
+            ));
+        }
+        if self.server.metrics_tls.is_some() && self.server.metrics_listen.is_none() {
+            return Err(fail("metrics_tls requires metrics_listen"));
+        }
+        self.validate_for_mode()
+    }
+
     pub fn validate_for_mode(&self) -> crate::error::Result<()> {
+        if self
+            .gossip
+            .as_ref()
+            .is_some_and(|g| g.enabled && !g.peer_keys.is_empty())
+        {
+            return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));
+        }
+        let mut labels = std::collections::HashSet::new();
+        for ca in &self.ca {
+            if ca.label.is_empty()
+                || ca.label == "."
+                || ca.label == ".."
+                || ca.label.contains(['/', '\\'])
+                || !labels.insert(&ca.label)
+            {
+                return Err(crate::error::CoreError::Config(
+                    "CA labels must be unique nonempty file names".into(),
+                ));
+            }
+            if let Some(url) = &ca.forward_to {
+                if !url.starts_with("https://")
+                    && !(ca.forward_insecure && url.starts_with("http://"))
+                {
+                    return Err(crate::error::CoreError::Config(format!(
+                        "CA '{}': forward_to requires https:// (or explicit forward_insecure for http://)",
+                        ca.label
+                    )));
+                }
+            }
+        }
         let valid_sig_algs = ["ecdsa-p256", "ml-dsa-44", "ml-dsa-65", "ml-dsa-87"];
         for ca in &self.ca {
             if !valid_sig_algs.contains(&ca.sig_alg.as_str()) {

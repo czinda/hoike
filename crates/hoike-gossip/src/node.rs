@@ -1,17 +1,79 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use foca::{AccumulatingRuntime, Config as FocaConfig, Foca, PostcardCodec, Timer};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::broadcast::{GossipMessage, HoikeBroadcastHandler};
 use crate::config::GossipConfig;
+use crate::crypto::{self, GossipSigner, GossipVerifier, VerifyPolicy};
+
+/// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// SWIM liveness state of a fleet member, mirrored from foca's [`foca::State`]
+/// into a type the admin API and UI can consume without a foca dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberState {
+    Alive,
+    Suspect,
+    Down,
+}
+
+impl From<foca::State> for MemberState {
+    fn from(s: foca::State) -> Self {
+        match s {
+            foca::State::Alive => MemberState::Alive,
+            foca::State::Suspect => MemberState::Suspect,
+            foca::State::Down => MemberState::Down,
+        }
+    }
+}
+
+/// A point-in-time snapshot of one fleet member's identity and liveness.
+#[derive(Clone, Debug, Serialize)]
+pub struct MemberInfo {
+    pub name: String,
+    pub addr: SocketAddr,
+    /// The identity's own incarnation counter (bumped on rejoin), not foca's
+    /// per-member suspicion incarnation.
+    pub incarnation: u64,
+    pub state: MemberState,
+    /// True for the local node, which foca does not list among its peers.
+    pub is_self: bool,
+}
+
+/// The latest generation this node has heard a given peer announce for a given
+/// scope. Keyed in the table by (origin node, producer, issuer-key-hash).
+#[derive(Clone, Debug, Serialize)]
+pub struct GenRecord {
+    /// Name of the announcing node (empty for pre-`origin_node` senders).
+    pub origin_node: String,
+    pub producer_id: String,
+    /// Hex-encoded issuer key hash — identifies the CA scope.
+    pub issuer_key_hash: String,
+    pub epoch: u64,
+    pub manifest_digest: String,
+    /// Wall-clock (Unix seconds) when this announcement was last observed.
+    pub last_seen_unix: u64,
+}
+
+/// Table key: one row per (announcing node, CA scope).
+type GenKey = (String, String, String);
+type GenerationTable = Arc<RwLock<HashMap<GenKey, GenRecord>>>;
 
 /// Node identity in the gossip mesh. Includes the address (for routing)
 /// and a monotonic incarnation counter (for conflict resolution on rejoin).
@@ -50,6 +112,14 @@ pub struct GossipNode {
     #[allow(dead_code)]
     socket: Arc<UdpSocket>,
     config: GossipConfig,
+    /// This node's own gossip identity — used to stamp outgoing announcements
+    /// and to include the local node in the fleet view.
+    identity: NodeId,
+    /// Per-(node, scope) generation records built from received announcements.
+    generations: GenerationTable,
+    /// Ed25519 signer for outbound broadcasts (FPT_ITT.1). `None` when no
+    /// `identity_key` is configured — broadcasts go out unsigned, as before.
+    signer: Option<GossipSigner>,
 }
 
 impl GossipNode {
@@ -83,7 +153,50 @@ impl GossipNode {
                 .unwrap_or_default()
                 .as_nanos() as u64,
         );
-        let broadcast_handler = HoikeBroadcastHandler::new(msg_tx);
+        // Message authentication (FPT_ITT.1). Load this node's signing key (if
+        // any) and the trusted peer keys, then derive the rollout policy: an
+        // empty `peer_keys` list stays permissive (accept unsigned during a
+        // rolling upgrade), a populated one enforces (drop unsigned/forged).
+        let signer = match &config.identity_key {
+            Some(path) => {
+                let key = crypto::load_signing_key(path)
+                    .map_err(|e| format!("gossip identity_key {}: {e}", path.display()))?;
+                info!(key = %path.display(), "gossip message signing enabled");
+                Some(GossipSigner::new(key))
+            }
+            None => None,
+        };
+
+        if !config.peer_keys.is_empty() {
+            return Err("gossip.peer_keys is no longer safe: migrate to gossip.peer_identities (node name -> public key path)".into());
+        }
+        let mut identities = Vec::new();
+        for (name, path) in &config.peer_identities {
+            if name.is_empty() || name.len() > 256 {
+                return Err("gossip peer identity must contain 1..=256 bytes".into());
+            }
+            identities.push((name.clone(), crypto::load_verifying_key(path)?));
+        }
+        if let Some(s) = &signer {
+            identities.push((config.node_name.clone(), s.verifying_key()));
+        }
+        let verifier = if signer.is_some() || !identities.is_empty() {
+            let policy = if config.peer_identities.is_empty() {
+                VerifyPolicy::Permissive
+            } else {
+                VerifyPolicy::Required
+            };
+            Some(GossipVerifier::for_identities(identities, policy))
+        } else {
+            None
+        };
+
+        let broadcast_handler = HoikeBroadcastHandler::new(msg_tx, verifier);
+
+        // Keep a copy of our identity: `with_custom_broadcast` consumes it, but
+        // we need it to stamp outgoing announcements and to show the local node
+        // in the fleet view (foca lists only *peers*, never self).
+        let self_identity = identity.clone();
 
         let foca = Foca::with_custom_broadcast(
             identity,
@@ -101,6 +214,9 @@ impl GossipNode {
             foca: Arc::clone(&foca),
             socket: Arc::clone(&socket),
             config: config.clone(),
+            identity: self_identity,
+            generations: Arc::new(RwLock::new(HashMap::new())),
+            signer,
         };
 
         // Spawn the receive loop
@@ -149,6 +265,16 @@ impl GossipNode {
         Ok(node)
     }
 
+    /// Wrap a JSON broadcast payload in a signed frame when signing is enabled,
+    /// or pass it through unchanged otherwise. Isolated so both announce paths
+    /// share one code path for the wire format.
+    fn frame_broadcast(&self, payload: Vec<u8>) -> Vec<u8> {
+        match &self.signer {
+            Some(signer) => signer.frame(&payload),
+            None => payload,
+        }
+    }
+
     /// Broadcast a generation announcement to the gossip mesh.
     pub async fn announce_generation(
         &self,
@@ -164,9 +290,10 @@ impl GossipNode {
             epoch,
             manifest_digest,
             bundle_url,
+            origin_node: self.identity.name.clone(),
         };
 
-        let data = serde_json::to_vec(&msg)?;
+        let data = self.frame_broadcast(serde_json::to_vec(&msg)?);
         let mut foca = self.foca.lock().await;
         foca.add_broadcast(&data)?;
 
@@ -185,9 +312,10 @@ impl GossipNode {
             producer_id,
             issuer_key_hash,
             epoch,
+            origin_node: self.identity.name.clone(),
         };
 
-        let data = serde_json::to_vec(&msg)?;
+        let data = self.frame_broadcast(serde_json::to_vec(&msg)?);
         let mut foca = self.foca.lock().await;
         foca.add_broadcast(&data)?;
 
@@ -197,6 +325,98 @@ impl GossipNode {
 
     pub fn config(&self) -> &GossipConfig {
         &self.config
+    }
+
+    /// This node's own gossip identity.
+    pub fn identity(&self) -> &NodeId {
+        &self.identity
+    }
+
+    /// Snapshot the current cluster membership, including the local node.
+    ///
+    /// foca tracks only *peers* — the local node never appears in its own
+    /// member list — so we append `self` (always `Alive` from its own vantage)
+    /// to give the fleet view a complete roster.
+    pub async fn members(&self) -> Vec<MemberInfo> {
+        let foca = self.foca.lock().await;
+        let mut out: Vec<MemberInfo> = foca
+            .iter_membership_state()
+            .map(|m| {
+                let id = m.id();
+                MemberInfo {
+                    name: id.name.clone(),
+                    addr: id.addr,
+                    incarnation: id.incarnation,
+                    state: m.state().into(),
+                    is_self: false,
+                }
+            })
+            .collect();
+        drop(foca);
+
+        out.push(MemberInfo {
+            name: self.identity.name.clone(),
+            addr: self.identity.addr,
+            incarnation: self.identity.incarnation,
+            state: MemberState::Alive,
+            is_self: true,
+        });
+        out
+    }
+
+    /// Fold a received generation announcement into the generation table.
+    ///
+    /// Only advances a (node, scope) row when the incoming epoch is newer,
+    /// mirroring the anti-rollback stance of the serving path — a delayed or
+    /// replayed lower-epoch announcement must not appear to regress a peer.
+    /// `last_seen` is refreshed on every observation regardless, so liveness
+    /// tracking stays accurate even when the epoch is unchanged.
+    pub async fn record_generation(&self, msg: &GossipMessage) {
+        let GossipMessage::GenerationAnnouncement {
+            producer_id,
+            issuer_key_hash,
+            epoch,
+            manifest_digest,
+            origin_node,
+            ..
+        } = msg
+        else {
+            return;
+        };
+
+        if !msg.valid_bounds() {
+            return;
+        }
+        let ikh_hex = hex::encode(issuer_key_hash);
+        let key: GenKey = (origin_node.clone(), producer_id.clone(), ikh_hex.clone());
+        let now = now_unix();
+
+        let mut table = self.generations.write().await;
+        table.retain(|_, row| now.saturating_sub(row.last_seen_unix) < 3600);
+        if !table.contains_key(&key) && table.len() >= 4096 {
+            return;
+        }
+        let entry = table.entry(key).or_insert_with(|| GenRecord {
+            origin_node: origin_node.clone(),
+            producer_id: producer_id.clone(),
+            issuer_key_hash: ikh_hex,
+            epoch: *epoch,
+            manifest_digest: hex::encode(manifest_digest),
+            last_seen_unix: now,
+        });
+        if *epoch >= entry.epoch {
+            entry.epoch = *epoch;
+            entry.manifest_digest = hex::encode(manifest_digest);
+        }
+        entry.last_seen_unix = now;
+    }
+
+    /// Snapshot all known per-(node, scope) generation records.
+    pub async fn generations(&self) -> Vec<GenRecord> {
+        let mut table = self.generations.write().await;
+        let now = now_unix();
+        table.retain(|_, row| now.saturating_sub(row.last_seen_unix) < 3600);
+        table.values().cloned().collect()
     }
 }
 
@@ -351,6 +571,27 @@ async fn drain_runtime(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn generation_storage_is_bounded_and_expires() {
+        let node = test_node("edge").await;
+        for n in 0..4100 {
+            node.record_generation(&GossipMessage::GenerationAnnouncement {
+                producer_id: format!("producer-{n}"),
+                issuer_key_hash: vec![1; 32],
+                epoch: 1,
+                manifest_digest: [0; 32],
+                bundle_url: None,
+                origin_node: "peer".into(),
+            })
+            .await;
+        }
+        assert_eq!(node.generations().await.len(), 4096);
+        for row in node.generations.write().await.values_mut() {
+            row.last_seen_unix = 0;
+        }
+        assert!(node.generations().await.is_empty());
+    }
+
     #[test]
     fn node_id_identity_trait() {
         let id = NodeId {
@@ -385,5 +626,85 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         let decoded: NodeId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, decoded);
+    }
+
+    /// Bind a real (but isolated: no seeds) gossip node on an ephemeral port.
+    async fn test_node(name: &str) -> GossipNode {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let config = GossipConfig {
+            enabled: true,
+            bind: "127.0.0.1:0".into(),
+            seeds: vec![],
+            node_name: name.into(),
+            identity_key: None,
+            peer_keys: vec![],
+            peer_identities: Default::default(),
+        };
+        GossipNode::start(config, tx).await.expect("node starts")
+    }
+
+    // A freshly started node has no peers, but the fleet view must still list
+    // the local node — otherwise a single-node deployment shows an empty roster.
+    #[tokio::test]
+    async fn members_always_includes_self() {
+        let node = test_node("solo").await;
+        let members = node.members().await;
+        assert_eq!(members.len(), 1, "no peers, only self");
+        assert!(members[0].is_self);
+        assert_eq!(members[0].name, "solo");
+        assert_eq!(members[0].state, MemberState::Alive);
+    }
+
+    #[tokio::test]
+    async fn record_generation_tracks_latest_epoch_per_scope() {
+        let node = test_node("signer").await;
+        let ikh = vec![0xAB; 32];
+
+        let announce = |epoch: u64| GossipMessage::GenerationAnnouncement {
+            producer_id: "prod-1".into(),
+            issuer_key_hash: ikh.clone(),
+            epoch,
+            manifest_digest: [epoch as u8; 32],
+            bundle_url: None,
+            origin_node: "peer-a".into(),
+        };
+
+        node.record_generation(&announce(5)).await;
+        node.record_generation(&announce(7)).await;
+        // A stale/replayed lower epoch must not regress the recorded row.
+        node.record_generation(&announce(6)).await;
+
+        let gens = node.generations().await;
+        assert_eq!(gens.len(), 1, "one (node, scope) row");
+        assert_eq!(gens[0].epoch, 7);
+        assert_eq!(gens[0].origin_node, "peer-a");
+        assert_eq!(gens[0].producer_id, "prod-1");
+        assert_eq!(gens[0].issuer_key_hash, hex::encode(&ikh));
+    }
+
+    // Two different announcing nodes for the same scope are distinct rows —
+    // that separation is what lets the fleet view compute per-node staleness.
+    #[tokio::test]
+    async fn record_generation_separates_scopes_and_nodes() {
+        let node = test_node("edge").await;
+        node.record_generation(&GossipMessage::GenerationAnnouncement {
+            producer_id: "prod-1".into(),
+            issuer_key_hash: vec![0x01; 32],
+            epoch: 3,
+            manifest_digest: [0; 32],
+            bundle_url: None,
+            origin_node: "node-a".into(),
+        })
+        .await;
+        node.record_generation(&GossipMessage::GenerationAnnouncement {
+            producer_id: "prod-1".into(),
+            issuer_key_hash: vec![0x01; 32],
+            epoch: 3,
+            manifest_digest: [0; 32],
+            bundle_url: None,
+            origin_node: "node-b".into(),
+        })
+        .await;
+        assert_eq!(node.generations().await.len(), 2, "two distinct nodes");
     }
 }

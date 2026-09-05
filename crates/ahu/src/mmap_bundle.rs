@@ -10,8 +10,8 @@ use crate::manifest::Manifest;
 
 /// A memory-mapped ahu bundle for zero-copy serving at scale.
 ///
-/// Uses MAP_PRIVATE (copy-on-write) so the process is isolated from
-/// any subsequent modifications to the file on disk. The OS demand-pages
+/// Uses MAP_PRIVATE (copy-on-write). The backing inode must remain immutable:
+/// publish replacements with atomic rename, never truncate an open bundle. The OS demand-pages
 /// only the regions actually accessed — a 45 GB bundle uses ~200 MB RSS
 /// under typical access patterns.
 ///
@@ -36,15 +36,15 @@ impl MmapBundle {
     ///
     /// # Safety
     ///
-    /// Uses `unsafe` for the mmap syscall. MAP_PRIVATE ensures isolation
-    /// from disk modifications. The file size is validated against header
+    /// Uses `unsafe` for the mmap syscall. Publishers must replace files atomically;
+    /// MAP_PRIVATE does not protect against truncation. Size is validated against header
     /// offsets before any section is accessed.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len();
 
-        if (file_size as usize) < HEADER_SIZE {
+        if usize::try_from(file_size).is_err() || file_size < HEADER_SIZE as u64 {
             return Err(AhuError::HeaderOutOfBounds {
                 field: "file",
                 offset: 0,
@@ -53,7 +53,7 @@ impl MmapBundle {
             });
         }
 
-        // SAFETY: MAP_PRIVATE (map_copy) ensures copy-on-write isolation.
+        // SAFETY: Publishers must keep this inode immutable and replace by rename.
         // File size is validated before any offset access.
         let mmap = unsafe {
             MmapOptions::new()
@@ -127,12 +127,14 @@ impl MmapBundle {
         if flags.contains(IndexFlags::TOMBSTONE) {
             return None;
         }
-        let start = self.data_offset + offset as usize;
-        let end = start + length as usize;
-        if end > self.data_offset + self.data_length {
+        let relative = usize::try_from(offset).ok()?;
+        let relative_end = relative.checked_add(usize::try_from(length).ok()?)?;
+        if relative_end > self.data_length {
             return None;
         }
-        Some(&self.mmap[start..end])
+        let start = self.data_offset.checked_add(relative)?;
+        let end = self.data_offset.checked_add(relative_end)?;
+        self.mmap.get(start..end)
     }
 
     /// Binary search for `(entry_key, discriminator)` in the mmap'd index.

@@ -27,10 +27,73 @@ pub struct LoginResponse {
     pub expires_in_secs: u64,
 }
 
+// Process-wide limits cover every listener without attacker-controlled map keys.
+fn login_slots() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+}
+
+fn admit_login() -> bool {
+    static RATE: std::sync::OnceLock<std::sync::Mutex<(Instant, u32)>> = std::sync::OnceLock::new();
+    let mut rate = RATE
+        .get_or_init(|| std::sync::Mutex::new((Instant::now(), 0)))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if rate.0.elapsed() >= Duration::from_secs(60) {
+        *rate = (Instant::now(), 0);
+    }
+    if rate.1 >= 60 {
+        return false;
+    }
+    rate.1 += 1;
+    true
+}
+
 pub async fn login(
     State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
+    request: axum::http::Request<axum::body::Body>,
 ) -> impl IntoResponse {
+    // No admission queue: bound both slow request bodies and bcrypt jobs. The
+    // owned permit remains inside spawn_blocking even if the HTTP task is cancelled.
+    let permit = match login_slots().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (StatusCode::TOO_MANY_REQUESTS, "login capacity exhausted").into_response();
+        }
+    };
+    if !admit_login() {
+        return (StatusCode::TOO_MANY_REQUESTS, "login rate exceeded").into_response();
+    }
+    let bytes = match tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(request.into_body(), 4096),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "login body exceeds 4096 bytes",
+            )
+                .into_response();
+        }
+        Err(_) => return (StatusCode::REQUEST_TIMEOUT, "login body timed out").into_response(),
+    };
+    let req: LoginRequest = match serde_json::from_slice(&bytes) {
+        Ok(req) => req,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid login request").into_response(),
+    };
+    if req.name.len() > 256 || req.password.len() > 72 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "login fields exceed supported lengths",
+        )
+            .into_response();
+    }
     let admin_config = match &state.admin.config.server.admin {
         Some(c) => c,
         None => {
@@ -54,14 +117,17 @@ pub async fn login(
         .map(|op| op.password_hash.clone())
         .unwrap_or_else(|| DUMMY_HASH.to_string());
     let password = req.password.clone();
-    let password_ok = tokio::task::spawn_blocking(move || match bcrypt::verify(&password, &hash) {
-        Ok(valid) => valid,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "bcrypt verification error — check password_hash format in config"
-            );
-            false
+    let password_ok = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match bcrypt::verify(&password, &hash) {
+            Ok(valid) => valid,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "bcrypt verification error — check password_hash format in config"
+                );
+                false
+            }
         }
     })
     .await
@@ -95,6 +161,13 @@ pub async fn login(
         let mut sessions = state.admin.sessions.lock().await;
         let now = Instant::now();
         sessions.retain(|_, s| s.expires_at > now);
+        if sessions.len() >= 4096 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session capacity exhausted",
+            )
+                .into_response();
+        }
         sessions.insert(token.clone(), session);
     }
 
@@ -135,6 +208,33 @@ fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_release_blocking_job_admission() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let _ = started.send(());
+                wait.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        running.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(slots.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), slots.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+    }
 
     #[test]
     fn dummy_hash_is_valid_bcrypt() {

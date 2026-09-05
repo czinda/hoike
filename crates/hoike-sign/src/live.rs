@@ -19,11 +19,13 @@ use x509_ocsp::{
 
 use crate::error::{Result, SignError};
 use crate::generate::ocsp_time;
+use x509_cert::Certificate as CertificateForLive;
 
 /// Certificate status for live signing.
 #[derive(Debug, Clone)]
 pub enum LiveCertStatus {
     Good,
+    Unknown,
     Revoked {
         revocation_time: u64,
         reason: Option<x509_cert::ext::pkix::CrlReason>,
@@ -50,10 +52,66 @@ where
     S: Signer<Sig> + DynSignatureAlgorithmIdentifier,
     Sig: SignatureBitStringEncoding,
 {
+    let next = now
+        .checked_add(validity_secs)
+        .ok_or_else(|| SignError::Config("live validity overflow".into()))?;
+    sign_live_response_with_window(
+        cert_id_der,
+        status,
+        nonce_bytes,
+        responder_key_bytes,
+        signer,
+        now,
+        now,
+        next,
+        responder_cert_der,
+    )
+}
+
+/// Sign only within the authenticated source window; producedAt is signing time,
+/// thisUpdate remains the time the source actually established the status.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_live_response_with_window<S, Sig>(
+    cert_id_der: &[u8],
+    status: LiveCertStatus,
+    nonce_bytes: &[u8],
+    responder_key_bytes: &[u8],
+    signer: &mut S,
+    now: u64,
+    source_this_update: u64,
+    source_next_update: u64,
+    responder_cert_der: Option<&[u8]>,
+) -> Result<Vec<u8>>
+where
+    S: Signer<Sig> + DynSignatureAlgorithmIdentifier,
+    Sig: SignatureBitStringEncoding,
+{
+    if source_this_update > now
+        || source_next_update <= now
+        || source_next_update <= source_this_update
+    {
+        return Err(SignError::Config(
+            "live source is not currently valid".into(),
+        ));
+    }
+    let mut next_update_epoch = source_next_update;
+    if let Some(bytes) = responder_cert_der {
+        let cert = CertificateForLive::from_der(bytes).map_err(SignError::Der)?;
+        let validity = &cert.tbs_certificate.validity;
+        let before = validity.not_before.to_unix_duration().as_secs();
+        let after = validity.not_after.to_unix_duration().as_secs();
+        if now < before || now >= after {
+            return Err(SignError::Config(
+                "responder certificate is not currently valid".into(),
+            ));
+        }
+        next_update_epoch = next_update_epoch.min(after);
+    }
     let cert_id = CertId::from_der(cert_id_der).map_err(SignError::Der)?;
 
     let cert_status = match status {
         LiveCertStatus::Good => CertStatus::good(),
+        LiveCertStatus::Unknown => CertStatus::unknown(),
         LiveCertStatus::Revoked {
             revocation_time,
             reason,
@@ -66,8 +124,8 @@ where
         }
     };
 
-    let this_update = ocsp_time(now)?;
-    let next_update = ocsp_time(now + validity_secs)?;
+    let this_update = ocsp_time(source_this_update)?;
+    let next_update = ocsp_time(next_update_epoch)?;
     let produced_at = ocsp_time(now)?;
 
     let single =
@@ -97,66 +155,155 @@ where
     ocsp_response.to_der().map_err(SignError::Der)
 }
 
-/// Extract the CertStatus from a pre-signed OCSPResponse's first SingleResponse.
-///
-/// Used to determine the certificate's status from the bundle before
-/// re-signing with a nonce.
-pub fn extract_status_from_response(response_der: &[u8]) -> Result<LiveCertStatus> {
-    let ocsp_resp = OcspResponse::from_der(response_der).map_err(SignError::Der)?;
+/// Validated software-key material, shared by startup and rotation.
+pub struct LiveSigningMaterial {
+    pub key: p256::ecdsa::SigningKey,
+    pub responder_key_bytes: Vec<u8>,
+    pub responder_cert_der: Option<Vec<u8>>,
+}
 
-    let response_bytes = ocsp_resp
-        .response_bytes
-        .as_ref()
-        .ok_or_else(|| SignError::OcspBuilder("no responseBytes in stored response".into()))?;
+pub fn load_live_material(
+    ca: &hoike_core::config::CaConfig,
+) -> std::result::Result<LiveSigningMaterial, String> {
+    use hoike_core::config::SigningKeyConfig;
+    let key = match &ca.signing_key {
+        Some(SigningKeyConfig::File { path }) => {
+            crate::load_ecdsa_p256_key(path).map_err(|e| e.to_string())?
+        }
+        Some(SigningKeyConfig::Demo) => crate::demo_ecdsa_p256_key(),
+        _ => return Err("live signing requires an ECDSA file or explicit demo key".into()),
+    };
+    let cert_der = crate::orchestrate::load_responder_cert(ca)?;
+    let responder_key_bytes = if let Some(bytes) = &cert_der {
+        let cert = CertificateForLive::from_der(bytes).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        if now
+            < cert
+                .tbs_certificate
+                .validity
+                .not_before
+                .to_unix_duration()
+                .as_secs()
+            || now
+                >= cert
+                    .tbs_certificate
+                    .validity
+                    .not_after
+                    .to_unix_duration()
+                    .as_secs()
+        {
+            return Err("live responder certificate is outside its validity period".into());
+        }
+        let bytes = cert
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .as_bytes()
+            .ok_or_else(|| "responder public key has unused bits".to_string())?;
+        let certificate_key =
+            p256::ecdsa::VerifyingKey::from_sec1_bytes(bytes).map_err(|e| e.to_string())?;
+        if certificate_key != *key.verifying_key() {
+            return Err("live signing key does not match responder certificate".into());
+        }
+        bytes.to_vec()
+    } else {
+        let bytes = crate::orchestrate::decode_issuer_key(ca)?;
+        if !matches!(ca.signing_key, Some(SigningKeyConfig::Demo)) {
+            let issuer_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&bytes)
+                .map_err(|e| format!("CA-direct issuer key: {e}"))?;
+            if issuer_key != *key.verifying_key() {
+                return Err("CA-direct signing key does not match issuer key".into());
+            }
+        }
+        bytes
+    };
+    Ok(LiveSigningMaterial {
+        key,
+        responder_key_bytes,
+        responder_cert_der: cert_der,
+    })
+}
 
-    let basic =
-        BasicOcspResponse::from_der(response_bytes.response.as_bytes()).map_err(SignError::Der)?;
+/// Status and authenticated freshness from exactly one matching SingleResponse.
+pub struct LiveResponseSource {
+    pub status: LiveCertStatus,
+    pub this_update: u64,
+    pub next_update: u64,
+}
 
-    let single = basic
+pub fn extract_status_for_cert(
+    response_der: &[u8],
+    cert_id_der: &[u8],
+) -> Result<LiveResponseSource> {
+    let requested = CertId::from_der(cert_id_der).map_err(SignError::Der)?;
+    let basic = parse_basic(response_der)?;
+    let mut matches = basic
         .tbs_response_data
         .responses
-        .first()
-        .ok_or_else(|| SignError::OcspBuilder("no SingleResponse in stored response".into()))?;
+        .iter()
+        .filter(|r| r.cert_id == requested);
+    let single = matches
+        .next()
+        .ok_or_else(|| SignError::OcspBuilder("requested CertID absent from response".into()))?;
+    if matches.next().is_some() {
+        return Err(SignError::OcspBuilder(
+            "ambiguous duplicate CertID in response".into(),
+        ));
+    }
+    let next = single
+        .next_update
+        .as_ref()
+        .ok_or_else(|| SignError::OcspBuilder("live source requires nextUpdate".into()))?;
+    Ok(LiveResponseSource {
+        status: status_from_single(single),
+        this_update: generalized_time_to_epoch(&single.this_update),
+        next_update: generalized_time_to_epoch(next),
+    })
+}
 
+fn parse_basic(response_der: &[u8]) -> Result<BasicOcspResponse> {
+    let response = OcspResponse::from_der(response_der).map_err(SignError::Der)?;
+    if response.response_status != x509_ocsp::OcspResponseStatus::Successful {
+        return Err(SignError::OcspBuilder(
+            "source OCSP response was not successful".into(),
+        ));
+    }
+    let bytes = response
+        .response_bytes
+        .ok_or_else(|| SignError::OcspBuilder("missing responseBytes".into()))?;
+    if bytes.response_type.to_string() != "1.3.6.1.5.5.7.48.1.1" {
+        return Err(SignError::OcspBuilder("unsupported response type".into()));
+    }
+    BasicOcspResponse::from_der(bytes.response.as_bytes()).map_err(SignError::Der)
+}
+
+fn status_from_single(single: &SingleResponse) -> LiveCertStatus {
     match &single.cert_status {
-        CertStatus::Good(_) => Ok(LiveCertStatus::Good),
-        CertStatus::Revoked(info) => {
-            let revocation_time = generalized_time_to_epoch(&info.revocation_time);
-            Ok(LiveCertStatus::Revoked {
-                revocation_time,
-                reason: info.revocation_reason,
-            })
-        }
-        CertStatus::Unknown(_) => Ok(LiveCertStatus::Good),
+        CertStatus::Good(_) => LiveCertStatus::Good,
+        CertStatus::Unknown(_) => LiveCertStatus::Unknown,
+        CertStatus::Revoked(info) => LiveCertStatus::Revoked {
+            revocation_time: generalized_time_to_epoch(&info.revocation_time),
+            reason: info.revocation_reason,
+        },
     }
 }
 
-fn generalized_time_to_epoch(gt: &OcspGeneralizedTime) -> u64 {
-    let dt = gt.0.to_date_time();
-    let year = dt.year() as u64;
-    let month = dt.month() as u64;
-    let day = dt.day() as u64;
-    let hour = dt.hour() as u64;
-    let minutes = dt.minutes() as u64;
-    let seconds = dt.seconds() as u64;
+/// Diagnostic compatibility API. Batched sources require explicit CertID selection.
+pub fn extract_status_from_response(response_der: &[u8]) -> Result<LiveCertStatus> {
+    let basic = parse_basic(response_der)?;
+    if basic.tbs_response_data.responses.len() != 1 {
+        return Err(SignError::OcspBuilder(
+            "CertID required for a batched response".into(),
+        ));
+    }
+    Ok(status_from_single(&basic.tbs_response_data.responses[0]))
+}
 
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-            366
-        } else {
-            365
-        };
-    }
-    let mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days += mdays[m as usize] as u64;
-        if m == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
-            days += 1;
-        }
-    }
-    days += day - 1;
-    days * 86400 + hour * 3600 + minutes * 60 + seconds
+fn generalized_time_to_epoch(gt: &OcspGeneralizedTime) -> u64 {
+    gt.0.to_unix_duration().as_secs()
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ fn test_ca() -> CaIdentity {
 }
 
 fn test_snapshot(count: usize) -> StatusSnapshot {
+    let now = hoike_sign::source::unix_now().unwrap();
     let mut entries = BTreeMap::new();
     for i in 0..count {
         let serial = vec![(i >> 8) as u8, (i & 0xFF) as u8];
@@ -33,8 +34,8 @@ fn test_snapshot(count: usize) -> StatusSnapshot {
     }
     StatusSnapshot {
         entries,
-        this_update: 1700000000,
-        next_update: Some(1700086400),
+        this_update: now,
+        next_update: Some(now + 86400),
     }
 }
 

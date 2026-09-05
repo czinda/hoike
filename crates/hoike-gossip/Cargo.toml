@@ -15,6 +15,7 @@ tracing = { workspace = true }
 bytes = "1"
 rand = "0.10"
 hex = { workspace = true }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

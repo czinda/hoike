@@ -1,12 +1,116 @@
 mod admin;
 mod handlers;
+pub mod obs;
 mod state;
+#[cfg(feature = "tls")]
+pub mod tls;
 
-pub use state::{AppState, LiveSignerState};
+pub use state::{AppState, LiveSignerState, SignerContext};
 
 use axum::Router;
+
+/// Announce every CA scope in a freshly produced bundle to the gossip mesh.
+///
+/// Parses the sealed bundle bytes to recover each scope's `producer_id`,
+/// `issuer_key_hash`, and `epoch`, plus the manifest index digest used as the
+/// generation identifier, then broadcasts one `GenerationAnnouncement` per
+/// scope. Failures are logged, never fatal — gossip is best-effort and must not
+/// break a successful signing pass. Centralized here because this is the only
+/// crate that depends on both `ahu` (to parse) and `hoike-gossip` (to send).
+pub async fn announce_bundle_scopes(gossip: &hoike_gossip::GossipNode, bytes: &[u8]) {
+    let bundle = match ahu::Bundle::from_bytes(bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "gossip announce: failed to parse produced bundle");
+            return;
+        }
+    };
+    let producer_id = bundle.manifest.producer_id.clone();
+    let manifest_digest = bundle.manifest.integrity.index_digest;
+    for scope in &bundle.manifest.ca_scopes {
+        if let Err(e) = gossip
+            .announce_generation(
+                producer_id.clone(),
+                scope.issuer_key_hash.clone(),
+                scope.epoch,
+                manifest_digest,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, epoch = scope.epoch, "gossip announce failed");
+        }
+    }
+}
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
+/// Install the global Prometheus recorder. No-op (returns `false`) unless the
+/// `metrics` feature is enabled. Call once at startup before serving.
+pub fn install_metrics() -> bool {
+    obs::install()
+}
+
+/// Build a minimal router exposing `GET /metrics` in Prometheus text format.
+///
+/// Kept separate from the main OCSP router so operators bind it on a private
+/// listener (`server.metrics_listen`), never the public OCSP port.
+pub fn build_metrics_router(state: AppState) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .with_state(state)
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    // Collect-on-scrape: refresh the freshness gauges from the loaded scopes so
+    // age/next-update reflect the scrape-time clock, not the last request.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    obs::update_bundle_gauges(&state.responder.bundle_scopes(), now);
+
+    // Census the gossip fleet on scrape, if a node is attached.
+    if let Some(gossip) = state.gossip.as_ref() {
+        use hoike_gossip::node::MemberState;
+        let members = gossip.members().await;
+        let (mut alive, mut suspect, mut down) = (0u64, 0u64, 0u64);
+        for m in &members {
+            match m.state {
+                MemberState::Alive => alive += 1,
+                MemberState::Suspect => suspect += 1,
+                MemberState::Down => down += 1,
+            }
+        }
+        obs::record_gossip_members(alive, suspect, down);
+    }
+
+    match obs::render() {
+        Some(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+            body,
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics not enabled (build with --features metrics)",
+        )
+            .into_response(),
+    }
+}
+
+/// Build the public OCSP router.
+///
+/// When no dedicated admin listener is configured (`server.admin_listen`
+/// unset), the admin API and web UI are nested onto this same router for
+/// backward compatibility — the legacy single-port layout. When `admin_listen`
+/// *is* set, the management surface moves to its own listener
+/// (`build_admin_router`) so it can be given a trusted path (TLS, FTP_TRP.1)
+/// without wrapping the plaintext OCSP data plane; this router then serves OCSP
+/// only.
 pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/", post(handlers::handle_post))
@@ -15,9 +119,32 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{*path}", post(handlers::handle_post))
         .with_state(state.clone());
 
-    let admin_router = admin::build_admin_router(state.clone());
-    app = app.nest("/api/admin", admin_router);
+    // Legacy layout: admin + UI ride the OCSP port only when no dedicated admin
+    // listener is configured.
+    if state.admin.config.server.admin_listen.is_none() {
+        let admin_router = admin::build_admin_router(state.clone());
+        app = app.nest("/api/admin", admin_router);
+        app = mount_webui(app, &state);
+    }
 
+    app
+}
+
+/// Build the standalone admin router (admin API + web UI) for a dedicated
+/// management listener. Contains no OCSP routes, so it can be TLS-terminated
+/// independently of the plaintext OCSP data plane.
+pub fn build_admin_router_standalone(state: AppState) -> Router {
+    // `admin::build_admin_router` already applies `.with_state`, yielding a
+    // fully-stated `Router<()>`; nesting it needs no further state.
+    let admin_router = admin::build_admin_router(state.clone());
+    let app = Router::new().nest("/api/admin", admin_router);
+    mount_webui(app, &state)
+}
+
+/// Mount the web UI (disk-served `static_dir`, or the embedded SPA) onto a
+/// router. Shared by the legacy single-port layout and the standalone admin
+/// router so both surface the UI identically.
+fn mount_webui(mut app: Router, state: &AppState) -> Router {
     if let Some(webui_config) = &state.admin.config.server.webui {
         if let Some(static_dir) = &webui_config.static_dir {
             let serve = tower_http::services::ServeDir::new(static_dir).fallback(
