@@ -1,5 +1,13 @@
 # hoike — NIAP PPCA v2.1 SFR Gap Matrix
 
+> **Remediation status (September 2026):** The security review found defects in
+> implemented status, trust, freshness, rollback, and transport mechanisms.
+> The historical “Met”/conformance statements below are not current release
+> acceptance evidence. Consult the [remediation ledger](review-remediation.md) for corrections,
+> tests and outstanding qualification. No CC/FIPS certification is claimed;
+> enabling a dependency feature alone does not establish an evaluated deployment.
+
+
 **Scope of this document.** This maps hoike against the security functional
 requirements (SFRs) of the **NIAP Protection Profile for Certification
 Authorities, Version 2.1 (PP 420)** and its dependent **Functional Package for

@@ -206,3 +206,79 @@ fn advance_is_atomic() {
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(contents.contains("\"p:k\""));
 }
+
+#[test]
+fn identical_chained_bundle_passes_continuity_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let (a, _) = make_bundle("test", 1, None);
+    let (b, _) = make_bundle("test", 2, Some(ahu::manifest_digest(&a.manifest_bytes)));
+    let mut store = StateStore::open(&path).unwrap();
+    store.advance_from_bundle(&a).unwrap();
+    store.check_continuity(&b).unwrap();
+    store.advance_from_bundle(&b).unwrap();
+    let store = StateStore::open(&path).unwrap();
+    store.check_rollback(&b).unwrap();
+    store.check_continuity(&b).unwrap();
+}
+
+#[test]
+fn failed_persist_does_not_change_in_memory_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let mut store = StateStore::open(&path).unwrap();
+    store.advance("p", "k", 1, [1; 32]).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(store.advance("p", "k", 2, [2; 32]).is_err());
+    assert_eq!(store.get_high_water("p", "k"), Some(1));
+    assert_eq!(store.get_manifest_digest("p", "k"), Some([1; 32]));
+}
+
+#[test]
+fn failed_multi_bundle_reload_keeps_marks_and_recovers_committed_snapshots() {
+    use hoike_core::{Config, ResponderState};
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+mode = "edge"
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+[[ca]]
+label = "a"
+bundle_file = "{dir}/a.ahu"
+[[ca]]
+label = "b"
+bundle_file = "{dir}/b.ahu"
+"#,
+            dir = dir.path().display()
+        ),
+    )
+    .unwrap();
+    let config = Config::from_file(&config_path).unwrap();
+    let (_, a) = make_bundle("a", 1, None);
+    let (_, b) = make_bundle("b", 1, None);
+    std::fs::write(dir.path().join("a.ahu"), a).unwrap();
+    std::fs::write(dir.path().join("b.ahu"), b).unwrap();
+    let responder = ResponderState::load(config.clone()).unwrap();
+    let state_path = dir.path().join("state/state.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let (_, newer_a) = make_bundle("a", 2, None);
+    std::fs::write(dir.path().join("a.ahu"), newer_a).unwrap();
+    std::fs::write(dir.path().join("b.ahu"), b"interrupted write").unwrap();
+    assert!(responder.reload().is_err());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    assert!(responder.bundle_scopes().iter().all(|s| s.epoch == 1));
+    drop(responder);
+    let recovered = ResponderState::load(config).unwrap();
+    assert_eq!(recovered.bundle_count(), 2);
+    assert!(recovered.bundle_scopes().iter().all(|s| s.epoch == 1));
+    let marks = StateStore::open(&state_path).unwrap();
+    assert_eq!(marks.get_high_water("a", &hex::encode([0xbb; 32])), Some(1));
+    assert_eq!(marks.get_high_water("b", &hex::encode([0xbb; 32])), Some(1));
+}

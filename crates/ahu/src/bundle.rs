@@ -54,6 +54,35 @@ impl Bundle {
         })
     }
 
+    /// Serialize the already parsed sections without changing the signed manifest.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut index = Vec::new();
+        for record in &self.index {
+            record.write_to(&mut index)?;
+        }
+        let mut header = self.header.clone();
+        header.manifest_offset = HEADER_SIZE as u64;
+        header.manifest_length = u32::try_from(self.manifest_bytes.len())
+            .map_err(|_| AhuError::InvalidOperation("manifest too large".into()))?;
+        header.seal_offset = header.manifest_offset + u64::from(header.manifest_length);
+        header.seal_length = u32::try_from(self.seal_bytes.len())
+            .map_err(|_| AhuError::InvalidOperation("seal too large".into()))?;
+        header.index_offset = header.seal_offset + u64::from(header.seal_length);
+        header.index_length = index.len() as u64;
+        header.data_offset = header
+            .index_offset
+            .checked_add(header.index_length)
+            .ok_or_else(|| AhuError::InvalidOperation("bundle too large".into()))?;
+        header.data_length = self.data.len() as u64;
+        let mut out = Vec::new();
+        header.write_to(&mut out)?;
+        out.extend_from_slice(&self.manifest_bytes);
+        out.extend_from_slice(&self.seal_bytes);
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&self.data);
+        Ok(out)
+    }
+
     /// Look up an entry by its entry key (SHA-256 of DER CertID).
     /// Returns the default (discriminator=0) entry.
     pub fn lookup(&self, entry_key: &[u8; 32]) -> Option<&[u8]> {
@@ -72,12 +101,10 @@ impl Bundle {
         if record.is_tombstone() {
             return None;
         }
-        let start = record.data_offset as usize;
-        let end = start + record.data_length as usize;
-        if end > self.data.len() {
-            return None;
-        }
-        Some(&self.data[start..end])
+        let start = usize::try_from(record.data_offset).ok()?;
+        let length = usize::try_from(record.data_length).ok()?;
+        let end = start.checked_add(length)?;
+        self.data.get(start..end)
     }
 
     /// Get the raw response bytes for an index record.
@@ -85,26 +112,27 @@ impl Bundle {
         if record.is_tombstone() {
             return None;
         }
-        let start = record.data_offset as usize;
-        let end = start + record.data_length as usize;
-        if end > self.data.len() {
-            return None;
-        }
-        Some(&self.data[start..end])
+        let start = usize::try_from(record.data_offset).ok()?;
+        let length = usize::try_from(record.data_length).ok()?;
+        let end = start.checked_add(length)?;
+        self.data.get(start..end)
     }
 
     fn read_section(bytes: &[u8], offset: u64, length: u64) -> Result<Vec<u8>> {
-        let start = offset as usize;
-        let end = start + length as usize;
-        if end > bytes.len() {
-            return Err(AhuError::HeaderOutOfBounds {
+        let range = usize::try_from(offset).ok().and_then(|start| {
+            usize::try_from(length)
+                .ok()
+                .and_then(|len| start.checked_add(len).map(|end| start..end))
+        });
+        range
+            .and_then(|r| bytes.get(r))
+            .map(<[u8]>::to_vec)
+            .ok_or(AhuError::HeaderOutOfBounds {
                 field: "section",
                 offset,
                 length,
                 file_size: bytes.len() as u64,
-            });
-        }
-        Ok(bytes[start..end].to_vec())
+            })
     }
 
     fn parse_index(index_bytes: &[u8]) -> Result<Vec<IndexRecord>> {

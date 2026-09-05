@@ -158,6 +158,9 @@ export interface DeltaStat {
 }
 
 export interface ApplyResult {
+  sealed: boolean;
+  status: 'unsigned_intermediate';
+  notice: string;
   entry_count: number;
   final_epoch: number;
   byte_length: number;

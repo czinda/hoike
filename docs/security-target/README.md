@@ -1,5 +1,13 @@
 # hoike — Security Target Package (NIAP Common Criteria)
 
+> **Remediation status (September 2026):** The security review found defects in
+> implemented status, trust, freshness, rollback, and transport mechanisms.
+> The historical “Met”/conformance statements below are not current release
+> acceptance evidence. Consult the [remediation ledger](../review-remediation.md) for corrections,
+> tests and outstanding qualification. No CC/FIPS certification is claimed;
+> enabling a dependency feature alone does not establish an evaluated deployment.
+
+
 This directory is the **Security Target (ST) package** for **hoike**, evaluated as a
 composite claim (a **PP-Configuration**) against three NIAP documents:
 

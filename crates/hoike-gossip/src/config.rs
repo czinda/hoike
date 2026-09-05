@@ -15,12 +15,13 @@ pub struct GossipConfig {
     /// When set, every custom broadcast this node emits is signed.
     #[serde(default)]
     pub identity_key: Option<PathBuf>,
-    /// Ed25519 SPKI public keys trusted to sign peer broadcasts. When non-empty,
-    /// the node enforces authentication (drops unsigned/forged messages); when
-    /// empty, it stays permissive for a mixed-fleet rollout. See
-    /// [`crate::crypto`] for the full policy.
+    /// Deprecated unbound key list. Nonempty values fail startup with migration
+    /// instructions; use peer_identities to authorize each key's node identity.
     #[serde(default)]
     pub peer_keys: Vec<PathBuf>,
+    /// Authorized node name to Ed25519 SPKI public key.
+    #[serde(default)]
+    pub peer_identities: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl Default for GossipConfig {
@@ -32,6 +33,7 @@ impl Default for GossipConfig {
             node_name: default_node_name(),
             identity_key: None,
             peer_keys: Vec::new(),
+            peer_identities: Default::default(),
         }
     }
 }

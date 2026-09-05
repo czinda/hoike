@@ -53,3 +53,6 @@ pkcs11 = ["hoike-sign/pkcs11", "dep:cryptoki"]
 dogtag-sync = ["hoike-sign/dogtag-sync"]
 metrics = ["hoike-server/metrics"]
 tls = ["hoike-server/tls"]
+
+[dev-dependencies]
+tempfile = "3"

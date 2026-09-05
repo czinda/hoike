@@ -330,6 +330,9 @@ pub async fn apply_deltas(auth: Authenticated, Json(req): Json<ApplyRequest>) ->
             "entry_count": result.entry_count,
             "final_epoch": result.final_epoch,
             "byte_length": result.bytes.len(),
+            "sealed": false,
+            "status": "unsigned_intermediate",
+            "notice": "Must be sealed by an authorized signer before trusted installation",
             "deltas": result.deltas.iter().map(|s| serde_json::json!({
                 "added": s.added,
                 "replaced": s.replaced,

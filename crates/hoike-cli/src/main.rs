@@ -131,7 +131,7 @@ fn main() {
             ca,
             crl,
             output,
-            issuer: _,
+            issuer,
             epoch,
             certid_compat,
             good_serials,
@@ -148,6 +148,7 @@ fn main() {
                 ca,
                 crl,
                 output,
+                issuer,
                 epoch,
                 certid_compat,
                 good_serials,
@@ -186,13 +187,23 @@ async fn run_server(config_path: PathBuf) {
         std::process::exit(1);
     });
 
-    if let Err(e) = config.validate_for_mode() {
+    if let Err(e) = config.validate_transport(cfg!(feature = "tls")) {
         eprintln!("Configuration error: {e}");
         std::process::exit(1);
     }
 
     let listen = config.server.listen.clone();
     let needs_signing = config.needs_signing();
+
+    // Recover expired delegated certificates before initial signing or live loading.
+    if needs_signing {
+        for ca in &config.ca {
+            if let Err(e) = prepare_signer_material(ca).await {
+                eprintln!("Signing material preflight failed for {}: {e}", ca.label);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Create persistent revocation sources — stateful sources like DogtagSync
     // must survive across signer loop iterations to retain their in-memory
@@ -256,21 +267,13 @@ async fn run_server(config_path: PathBuf) {
         app_state = app_state.with_signer_context(ctx);
     }
 
-    // If any CA has nonce_policy=live, load a signing key for live responses
-    let has_live_nonce = config.ca.iter().any(|ca| ca.nonce_policy == "live");
-    if has_live_nonce && config.needs_signing() {
-        if let Some(ca) = config.ca.iter().find(|ca| ca.nonce_policy == "live") {
-            match load_live_signer(ca) {
-                Ok(live) => {
-                    info!("live nonce signing enabled");
-                    app_state = app_state.with_live_signer(live);
-                }
-                Err(e) => {
-                    eprintln!("Failed to load live signer: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
+    // A distinct signer is required for every live CA.
+    for ca in config.ca.iter().filter(|ca| ca.nonce_policy == "live") {
+        let live = load_live_signer(ca).unwrap_or_else(|e| {
+            eprintln!("Failed to load live signer for {}: {e}", ca.label);
+            std::process::exit(1);
+        });
+        app_state = app_state.with_live_signer_for(&ca.label, live);
     }
 
     // Start gossip BEFORE the signer loop so the loop can announce generations
@@ -289,6 +292,7 @@ async fn run_server(config_path: PathBuf) {
                 node_name: gossip_cfg.node_name.clone(),
                 identity_key: gossip_cfg.identity_key.clone(),
                 peer_keys: gossip_cfg.peer_keys.clone(),
+                peer_identities: gossip_cfg.peer_identities.clone(),
             };
 
             match hoike_gossip::GossipNode::start(gc, msg_tx).await {
@@ -353,7 +357,7 @@ async fn run_server(config_path: PathBuf) {
     // successful pass announces the new generation to the mesh.
     if needs_signing {
         if let Some(ctx) = app_state.signer.clone() {
-            let signer_state = app_state.responder.clone();
+            let signer_state = app_state.clone();
             let signer_config = config.clone();
             let signer_gossip = app_state.gossip.clone();
             tokio::spawn(async move {
@@ -428,8 +432,9 @@ async fn serve_listener(
     if tls.is_some() {
         warn!(
             listener = name,
-            "TLS configured but binary built without --features tls — serving PLAINTEXT"
+            "TLS configured but binary built without --features tls — listener disabled"
         );
+        return;
     }
 
     match tokio::net::TcpListener::bind(addr).await {
@@ -445,8 +450,69 @@ async fn serve_listener(
     }
 }
 
+/// Renewal runs before startup and every generation; an invalid replacement
+/// must never reach bundle publication. Valid external renewals need no command.
+async fn prepare_signer_material(ca: &hoike_core::config::CaConfig) -> Result<(), String> {
+    if let Some(cert) = hoike_sign::orchestrate::load_responder_cert(ca)? {
+        let renew_before = ca
+            .key_rotation
+            .as_ref()
+            .map(|r| r.renew_before_days.saturating_mul(86400))
+            .unwrap_or(7 * 86400);
+        let status = hoike_sign::check_and_log_rotation(&ca.label, &cert, renew_before)
+            .map_err(|e| e.to_string())?;
+        if matches!(
+            status,
+            hoike_sign::RotationStatus::RenewSoon { .. } | hoike_sign::RotationStatus::Expired
+        ) {
+            if let Some(command) = ca
+                .key_rotation
+                .as_ref()
+                .and_then(|r| r.rotation_command.clone())
+            {
+                let label = ca.label.clone();
+                tokio::task::spawn_blocking(move || {
+                    hoike_sign::run_rotation_command(&label, &command)
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+            }
+        }
+        // Re-read after rotation, including on restart with an expired certificate.
+        let replacement = hoike_sign::orchestrate::load_responder_cert(ca)?
+            .ok_or("responder certificate disappeared")?;
+        let parsed =
+            hoike_sign::rotation::parse_certificate(&replacement).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        if now
+            < parsed
+                .tbs_certificate
+                .validity
+                .not_before
+                .to_unix_duration()
+                .as_secs()
+            || now
+                >= parsed
+                    .tbs_certificate
+                    .validity
+                    .not_after
+                    .to_unix_duration()
+                    .as_secs()
+        {
+            return Err("responder certificate is not currently valid after renewal check".into());
+        }
+    }
+    if ca.nonce_policy == "live" {
+        load_live_signer(ca)?;
+    }
+    Ok(())
+}
+
 async fn run_signer_loop(
-    state: Arc<hoike_core::ResponderState>,
+    state: hoike_server::AppState,
     config: hoike_core::Config,
     ctx: Arc<hoike_server::SignerContext>,
     gossip: Option<Arc<hoike_gossip::GossipNode>>,
@@ -467,47 +533,28 @@ async fn run_signer_loop(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(min_interval)).await;
 
-        // Check certificate rotation before production
-        for ca_config in &config.ca {
-            if let Some(cert_path) = &ca_config.responder_cert {
-                if let Ok(cert_der) = std::fs::read(cert_path) {
-                    let renew_before = ca_config
-                        .key_rotation
-                        .as_ref()
-                        .map(|kr| kr.renew_before_days * 86400)
-                        .unwrap_or(7 * 86400);
-
-                    match hoike_sign::check_and_log_rotation(
-                        &ca_config.label,
-                        &cert_der,
-                        renew_before,
-                    ) {
-                        Ok(hoike_sign::RotationStatus::RenewSoon { .. }) => {
-                            if let Some(kr) = &ca_config.key_rotation {
-                                if let Some(cmd) = &kr.rotation_command {
-                                    if let Err(e) =
-                                        hoike_sign::run_rotation_command(&ca_config.label, cmd)
-                                    {
-                                        error!(ca = ca_config.label, error = %e, "rotation command failed");
-                                    }
-                                }
-                            }
-                        }
-                        Ok(hoike_sign::RotationStatus::Expired) => {
-                            error!(
-                                ca = ca_config.label,
-                                "OCSP signing cert EXPIRED — bundles will be rejected by clients"
-                            );
-                        }
-                        _ => {}
+        // Serialize key rotation and generation against on-demand management.
+        let sources = ctx.sources.lock().await;
+        let mut material_ready = true;
+        for ca in &config.ca {
+            match prepare_signer_material(ca).await {
+                Ok(()) => {
+                    if let Err(e) = state.reload_live_signer(ca) {
+                        error!(ca = ca.label, error = %e, "live material reload failed");
+                        material_ready = false;
                     }
+                }
+                Err(e) => {
+                    error!(ca = ca.label, error = %e, "signing material rejected; preserving active generation");
+                    material_ready = false;
                 }
             }
         }
+        if !material_ready {
+            continue;
+        }
 
         info!("signer loop: starting production cycle");
-        // Serialize against on-demand admin signing via the shared mutex.
-        let sources = ctx.sources.lock().await;
         let gen_start = std::time::Instant::now();
         match hoike_sign::sign_and_write_all(&config, &sources) {
             Ok(signed) => {
@@ -523,7 +570,7 @@ async fn run_signer_loop(
                         "produced bundle on schedule"
                     );
                 }
-                if let Err(e) = state.reload() {
+                if let Err(e) = state.responder.reload() {
                     hoike_server::obs::record_bundle_load_failure(
                         "all",
                         hoike_server::obs::load_failure_reason(&e),
@@ -582,53 +629,7 @@ fn decode_b64_field(
 fn load_live_signer(
     ca: &hoike_core::config::CaConfig,
 ) -> std::result::Result<hoike_server::LiveSignerState, String> {
-    let signing_key = match &ca.signing_key {
-        Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-            hoike_sign::load_ecdsa_p256_key(path)
-                .map_err(|e| format!("failed to load live signing key: {e}"))?
-        }
-        Some(hoike_core::config::SigningKeyConfig::Demo) => {
-            warn!("live nonce signer using demo key — NOT FOR PRODUCTION");
-            hoike_sign::demo_ecdsa_p256_key()
-        }
-        Some(hoike_core::config::SigningKeyConfig::Pkcs11 { .. }) => {
-            return Err(
-                "PKCS#11 live nonce signing not yet supported — use file key or demo".into(),
-            );
-        }
-        None => {
-            return Err(format!(
-                "CA '{}': nonce_policy=live requires a signing_key",
-                ca.label
-            ));
-        }
-    };
-
-    let responder_cert_der = hoike_sign::orchestrate::load_responder_cert(ca)?;
-
-    // RFC 6960: KeyHash = SHA-1(responder's subjectPublicKey).
-    // When delegated (cert provided), hash the cert's SPKI.
-    // When CA-direct, hash the CA's key bytes.
-    let responder_key_bytes = if let Some(cert_der) = &responder_cert_der {
-        use sha1::Digest;
-        let cert = <x509_cert::Certificate as der::Decode>::from_der(cert_der)
-            .map_err(|e| format!("parse responder cert for SPKI: {e}"))?;
-        let key_bytes = cert
-            .tbs_certificate
-            .subject_public_key_info
-            .subject_public_key
-            .raw_bytes();
-        sha1::Sha1::digest(key_bytes).to_vec()
-    } else {
-        hoike_sign::orchestrate::decode_issuer_key(ca)?
-    };
-
-    Ok(hoike_server::LiveSignerState {
-        signer: tokio::sync::Mutex::new(signing_key),
-        responder_key_bytes,
-        validity_secs: ca.validity_secs,
-        responder_cert_der,
-    })
+    hoike_server::LiveSignerState::from_config(ca)
 }
 
 fn run_query(
@@ -929,7 +930,7 @@ fn run_check(config_path: PathBuf) {
     println!("  Listen:    {}", config.server.listen);
     println!("  Bundle:    {}", config.storage.bundle_dir.display());
 
-    if let Err(e) = config.validate_for_mode() {
+    if let Err(e) = config.validate_transport(cfg!(feature = "tls")) {
         eprintln!("  Mode:      FAIL — {e}");
         std::process::exit(1);
     }
@@ -1109,24 +1110,24 @@ fn check_trusted_channels(config: &hoike_core::Config) {
     // Gossip message authentication (FPT_ITT.1).
     if let Some(g) = &config.gossip {
         if g.enabled {
-            match (&g.identity_key, g.peer_keys.is_empty()) {
+            match (&g.identity_key, g.peer_identities.is_empty()) {
                 (Some(_), false) => {
                     println!(
                         "    Gossip:    signed + enforced ({} peer key(s)) (FPT_ITT.1)",
-                        g.peer_keys.len()
+                        g.peer_identities.len()
                     );
                 }
                 (Some(_), true) => {
                     eprintln!(
                         "    WARNING: gossip signs outbound messages (identity_key set) but \
-                         peer_keys is empty — verification is permissive, so unsigned/forged \
-                         messages from peers are still accepted. Populate gossip.peer_keys to \
+                         peer_identities is empty — verification is permissive, so unsigned/forged \
+                         messages from peers are still accepted. Populate gossip.peer_identities to \
                          enforce (FPT_ITT.1)."
                     );
                 }
                 (None, false) => {
                     eprintln!(
-                        "    WARNING: gossip.peer_keys is set but this node has no identity_key — \
+                        "    WARNING: gossip.peer_identities is set but this node has no identity_key — \
                          it enforces inbound signatures but broadcasts its own messages unsigned, \
                          which enforcing peers will drop. Set gossip.identity_key (FPT_ITT.1)."
                     );
@@ -1134,7 +1135,7 @@ fn check_trusted_channels(config: &hoike_core::Config) {
                 (None, true) => {
                     eprintln!(
                         "    WARNING: gossip is enabled but unauthenticated (no identity_key / \
-                         peer_keys) — membership and generation messages are unsigned (FPT_ITT.1)."
+                         peer_identities) — membership and generation messages are unsigned (FPT_ITT.1)."
                     );
                 }
             }
@@ -1151,6 +1152,7 @@ fn run_sign(
     ca_label: String,
     crl_path: PathBuf,
     output: PathBuf,
+    issuer_path: Option<PathBuf>,
     epoch: u64,
     certid_compat: String,
     good_serials: Option<PathBuf>,
@@ -1208,6 +1210,50 @@ fn run_sign(
             std::process::exit(1);
         })
     };
+
+    let issuer_bytes = issuer_path
+        .as_ref()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "--issuer must name a readable authorized CRL issuer certificate (PEM or DER)"
+            );
+            std::process::exit(1);
+        });
+    let issuer_cert = hoike_sign::rotation::parse_certificate(&issuer_bytes).unwrap_or_else(|e| {
+        eprintln!("Invalid issuer certificate: {e}");
+        std::process::exit(1);
+    });
+    let source = source
+        .with_issuer_certificate(&issuer_bytes)
+        .unwrap_or_else(|e| {
+            eprintln!("CRL authentication setup failed: {e}");
+            std::process::exit(1);
+        });
+    use base64::Engine as _;
+    use der::Encode as _;
+    let issuer_name_b64 = issuer_name_b64.or_else(|| {
+        Some(
+            base64::engine::general_purpose::STANDARD.encode(
+                issuer_cert
+                    .tbs_certificate
+                    .subject
+                    .to_der()
+                    .expect("valid issuer name"),
+            ),
+        )
+    });
+    let issuer_key_b64 = issuer_key_b64.or_else(|| {
+        Some(
+            base64::engine::general_purpose::STANDARD.encode(
+                issuer_cert
+                    .tbs_certificate
+                    .subject_public_key_info
+                    .subject_public_key
+                    .raw_bytes(),
+            ),
+        )
+    });
 
     let issuer_name_der = decode_b64_field(
         &issuer_name_b64,
@@ -1461,7 +1507,7 @@ fn run_sign(
         std::process::exit(1);
     });
 
-    std::fs::write(&output, &bundle_bytes).unwrap_or_else(|e| {
+    hoike_sign::orchestrate::write_bundle_atomic(&output, &bundle_bytes).unwrap_or_else(|e| {
         eprintln!("Failed to write bundle to {}: {e}", output.display());
         std::process::exit(1);
     });
@@ -1483,4 +1529,68 @@ fn run_sign(
         println!("  Signature overhead: ~{sig_overhead} bytes ({sig_alg})");
     }
     println!("  Output:            {}", output.display());
+}
+
+#[cfg(test)]
+mod rotation_preflight_tests {
+    use super::*;
+    use der::{Decode, Encode};
+    use p256::pkcs8::EncodePrivateKey;
+
+    #[tokio::test]
+    async fn expired_live_certificate_is_renewed_before_startup_and_bad_pair_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = hoike_sign::demo_ecdsa_p256_key();
+        let valid = hoike_sign::generate_seal_cert(&key).unwrap();
+        let mut expired = x509_cert::Certificate::from_der(&valid).unwrap();
+        expired.tbs_certificate.validity.not_after = x509_cert::time::Time::GeneralTime(
+            der::asn1::GeneralizedTime::from_unix_duration(std::time::Duration::from_secs(
+                1_700_000_000,
+            ))
+            .unwrap(),
+        );
+        std::fs::write(
+            dir.path().join("key.der"),
+            key.to_pkcs8_der().unwrap().as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("valid.der"), &valid).unwrap();
+        std::fs::write(dir.path().join("active.der"), expired.to_der().unwrap()).unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[server]
+mode = "combined"
+[storage]
+bundle_dir = '{0}'
+[[ca]]
+label = "test"
+nonce_policy = "live"
+responder_cert = '{0}/active.der'
+[ca.signing_key]
+type = "file"
+path = '{0}/key.der'
+[ca.key_rotation]
+renew_before_days = 7
+rotation_command = "cp '{0}/valid.der' '{0}/active.der'"
+"#,
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let config = hoike_core::Config::from_file(&config_path).unwrap();
+        assert!(load_live_signer(&config.ca[0]).is_err());
+        prepare_signer_material(&config.ca[0]).await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("active.der")).unwrap(), valid);
+        assert!(load_live_signer(&config.ca[0]).is_ok());
+        let other = p256::ecdsa::SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        std::fs::write(
+            dir.path().join("key.der"),
+            other.to_pkcs8_der().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(prepare_signer_material(&config.ca[0]).await.is_err());
+    }
 }

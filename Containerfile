@@ -7,7 +7,7 @@
 FROM docker.io/library/rust:1.97-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev \
+    pkg-config libssl-dev cmake build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

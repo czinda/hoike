@@ -71,7 +71,6 @@ pub async fn sign_ca(
         entry_count = signed.entry_count,
         "produced bundle on demand"
     );
-    drop(sources);
 
     // Hot-reload the freshly written bundle into the serving router.
     if let Err(e) = state.responder.reload() {
@@ -160,7 +159,6 @@ pub async fn sign_all(State(state): State<AppState>, auth: Authenticated) -> imp
             "produced bundle on demand (all scopes)"
         );
     }
-    drop(sources);
 
     if let Err(e) = state.responder.reload() {
         crate::obs::record_bundle_load_failure("all", crate::obs::load_failure_reason(&e));
@@ -221,23 +219,34 @@ pub async fn rotate_ca(
                 .into_response();
         }
     };
+    let Some(ctx) = &state.signer else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"detail":"rotation requires a signer node"})),
+        )
+            .into_response();
+    };
+    let _guard = ctx.sources.lock().await;
     let command = ca
         .key_rotation
         .as_ref()
         .and_then(|kr| kr.rotation_command.as_deref());
     match command {
-        Some(cmd) => match hoike_sign::rotation::run_rotation_command(&label, cmd) {
-            Ok(()) => Json(serde_json::json!({
-                "status": "ok",
-                "ca_label": label,
-                "command": cmd,
-            }))
-            .into_response(),
+        Some(cmd) => {
+            let name = label.clone(); let command = cmd.to_owned();
+            let result = tokio::task::spawn_blocking(move || hoike_sign::rotation::run_rotation_command(&name, &command))
+                .await.map_err(|e| e.to_string()).and_then(|r| r);
+            match result {
+            Ok(()) => match state.reload_live_signer(ca) {
+                Ok(()) => Json(serde_json::json!({"status":"ok", "ca_label":label})).into_response(),
+                Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail":format!("rotation completed but replacement material was rejected: {e}")}))).into_response(),
+            },
             Err(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"detail": format!("rotation command failed: {e}")})),
             )
                 .into_response(),
+            }
         },
         None => (
             axum::http::StatusCode::BAD_REQUEST,

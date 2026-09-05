@@ -32,6 +32,8 @@ pub struct GossipConfigSection {
     /// authenticate the mesh.
     #[serde(default)]
     pub peer_keys: Vec<PathBuf>,
+    #[serde(default)]
+    pub peer_identities: std::collections::BTreeMap<String, PathBuf>,
 }
 
 fn default_gossip_bind() -> String {
@@ -63,7 +65,7 @@ pub struct ServerConfig {
     /// `listen` for backward compatibility.
     pub admin_listen: Option<String>,
     /// TLS material for the `admin_listen` listener. Requires a build with the
-    /// `tls` feature; ignored (with a startup warning) otherwise.
+    /// `tls` feature; startup fails if TLS support is unavailable.
     pub admin_tls: Option<TlsConfig>,
     /// TLS material for the `metrics_listen` listener. Requires the `tls`
     /// feature. When unset the metrics listener stays plaintext (private-bound).
@@ -126,6 +128,20 @@ pub struct StorageConfig {
     /// When set, bundles without a valid CMS seal are rejected on load.
     #[serde(default)]
     pub seal_trust_anchors: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    pub seal_authorizations: Vec<SealAuthorization>,
+    /// Explicitly trusted signer certificates, distinct from CA trust anchors.
+    #[serde(default)]
+    pub seal_signer_pins: Vec<PathBuf>,
+}
+
+/// Optional restriction of trusted seal certificates to producer and CA scope.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SealAuthorization {
+    pub producer_id: String,
+    pub issuer_key_hash: String,
+    /// SHA-256 of the DER signer certificate, hex encoded.
+    pub signer_sha256: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -262,7 +278,10 @@ pub enum SigningKeyConfig {
 #[serde(tag = "type")]
 pub enum SourceConfig {
     #[serde(rename = "crl")]
-    Crl { path: PathBuf },
+    Crl {
+        path: PathBuf,
+        issuer_cert: Option<PathBuf>,
+    },
 
     /// RFC 4533 syncrepl against a Dogtag 389 DS certificate repository.
     ///
@@ -335,7 +354,7 @@ fn default_nonce_policy() -> String {
     "ignore".into()
 }
 fn default_completeness() -> String {
-    "authoritative-complete".into()
+    "partial".into()
 }
 fn default_batch_interval() -> u64 {
     3600
@@ -362,7 +381,57 @@ impl Config {
         self.is_combined() || self.is_signer()
     }
 
+    /// Validate the actual build before binding listeners or producing bundles.
+    pub fn validate_transport(&self, tls_supported: bool) -> crate::error::Result<()> {
+        let fail = |s: &str| crate::error::CoreError::Config(s.into());
+        if (self.server.admin_tls.is_some() || self.server.metrics_tls.is_some()) && !tls_supported
+        {
+            return Err(fail(
+                "TLS configured but this binary was built without the tls feature",
+            ));
+        }
+        if self.server.admin_tls.is_some() && self.server.admin_listen.is_none() {
+            return Err(fail(
+                "admin_tls requires admin_listen; refusing plaintext management fallback",
+            ));
+        }
+        if self.server.metrics_tls.is_some() && self.server.metrics_listen.is_none() {
+            return Err(fail("metrics_tls requires metrics_listen"));
+        }
+        self.validate_for_mode()
+    }
+
     pub fn validate_for_mode(&self) -> crate::error::Result<()> {
+        if self
+            .gossip
+            .as_ref()
+            .is_some_and(|g| g.enabled && !g.peer_keys.is_empty())
+        {
+            return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));
+        }
+        let mut labels = std::collections::HashSet::new();
+        for ca in &self.ca {
+            if ca.label.is_empty()
+                || ca.label == "."
+                || ca.label == ".."
+                || ca.label.contains(['/', '\\'])
+                || !labels.insert(&ca.label)
+            {
+                return Err(crate::error::CoreError::Config(
+                    "CA labels must be unique nonempty file names".into(),
+                ));
+            }
+            if let Some(url) = &ca.forward_to {
+                if !url.starts_with("https://")
+                    && !(ca.forward_insecure && url.starts_with("http://"))
+                {
+                    return Err(crate::error::CoreError::Config(format!(
+                        "CA '{}': forward_to requires https:// (or explicit forward_insecure for http://)",
+                        ca.label
+                    )));
+                }
+            }
+        }
         let valid_sig_algs = ["ecdsa-p256", "ml-dsa-44", "ml-dsa-65", "ml-dsa-87"];
         for ca in &self.ca {
             if !valid_sig_algs.contains(&ca.sig_alg.as_str()) {

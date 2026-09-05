@@ -12,10 +12,11 @@ and `ahu-format-spec.md` for the bundle format specification.
 ```bash
 cargo build                          # build all crates
 cargo build --features pkcs11        # with PKCS#11 HSM support
-cargo test --workspace               # 176 tests: unit, integration, e2e, conformance
+cargo test --workspace               # default unit/integration/e2e/conformance
+cargo test --workspace --features tls,metrics,pkcs11,dogtag-sync
 cargo run --bin ahu -- inspect test.ahu
 cargo run --bin hoike -- serve --config testdata/hoike-test.toml
-cargo run --bin hoike -- sign --ca test --crl test.crl --demo-key -o test.ahu
+cargo run --bin hoike -- sign --ca test --crl test.crl --issuer issuer.der --demo-key -o test.ahu
 cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-name-b64 ... --issuer-key-b64 ...
 ```
 
@@ -31,6 +32,9 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 | `hoike-cli` | `hoike` and `ahu` binaries | GPL-3.0+ |
 
 ## Key dependency notes
+
+- Default signer builds use AWS-LC for RSA CRL verification; install a C compiler,
+  CMake and pkg-config. This is not a FIPS-validation claim.
 
 - `x509-ocsp` 0.2.1 depends on `der` 0.7, while `ahu` uses `der` 0.8. Any crate
   that parses or constructs OCSP types must use `der` 0.7 (matching x509-ocsp).
@@ -53,7 +57,10 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 
 - **CMS seal**: Real CMS `SignedData` seal. Produced by `hoike-sign/src/seal.rs`,
   verified by `ahu/src/seal.rs` (behind `seal-verify` default feature). Verified
-  on bundle load when `seal_trust_anchors` is configured in storage config.
+  on bundle load with `seal_signer_pins` (exact signer certificate matches) or
+  `seal_trust_anchors` (bounded direct-issued CA profile). Use `seal_authorizations`
+  for producer/CA scope restrictions. No configured trust means no authenticated
+  seal admission; do not treat embedded certificates as trust anchors.
 - **Signing keys**: PKCS#8 file (`--signing-key`), PKCS#11/HSM (`signing_key.type = "pkcs11"`,
   behind `--features pkcs11`), or ephemeral demo (`--demo-key`). CLI refuses to
   sign without explicit key source. PKCS#11 PIN resolved via: interactive prompt → env var → config.
@@ -62,7 +69,10 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 - **Delegated signing**: Responder cert embedded in `BasicOCSPResponse.certs` per
   RFC 9919 §3.2.2. ResponderID computed from the cert's SPKI key hash.
 - **Revocation sources**: CRL ingest adapter + 389 DS syncrepl adapter (`dogtag-sync`
-  feature). Syncrepl provides positive issuance for `authoritative-complete` bundles.
+  feature). CRL sources require independently provisioned `issuer_cert` (PEM/DER),
+  valid signatures and fresh nextUpdate. Partial completeness is the default; only
+  proven full directory snapshots may generate `authoritative-complete` bundles.
+  Tests producing responses must use fresh source windows, not historic constants.
 - **Key rotation**: Monitors responder cert expiry, logs warnings, executes
   `rotation_command` when configured.
 - **ML-DSA post-quantum signing**: ML-DSA-44/65/87 via PKCS#8 key loading with
@@ -76,8 +86,9 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 - **OCSP query client**: `hoike query` CLI diagnostic tool with `--prefer` for
   algorithm negotiation.
 - **389 DS syncrepl adapter**: RFC 4533 Content Synchronization source for Dogtag
-  certificate databases in `hoike-sign/src/dogtag_sync.rs`. Persistent cookie,
-  positive issuance for `authoritative-complete` bundles.
+  certificate databases in `hoike-sign/src/dogtag_sync.rs`. Source-bound atomic
+  population/cookie checkpoints, UUID deletion/present handling, and positive issuance
+  after successful complete refresh. Legacy cookie-only files require reconstruction.
 - **On-demand signing endpoint**: `POST /api/admin/sign/{label}` and `/api/admin/sign`
   produce a bundle and hot-reload it, sharing the background loop's `SignerContext`
   mutex so epoch derivation and `.ahu` writes never race. Orchestration lives in
@@ -100,8 +111,8 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 - **Gossip message authentication (FPT_ITT.1)**: Generation/urgent-revocation broadcasts
   are Ed25519-signed at the JSON payload boundary and verified on receive
   (`hoike-gossip/src/crypto.rs`, `broadcast.rs::receive_item`); forged/unsigned messages
-  are dropped before re-propagation. `gossip.identity_key` signs; `gossip.peer_keys` is the
-  trusted set and flips enforcement (empty = permissive rollout, populated = drop-unsigned).
+  are dropped before re-propagation. `gossip.identity_key` signs; `gossip.peer_identities` maps
+  node names to authorized public-key files. Legacy nonempty `peer_keys` is rejected.
   One-byte frame tag (`0x01`, unambiguous vs. legacy `{` JSON) keeps a mixed fleet
   interoperable. `hoike check` reports the gossip auth posture.
 
@@ -113,8 +124,8 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
   surface.
 - **Gossip bundle pull-on-announce**: Receiving a `GenerationAnnouncement` records it in
   the generation table but does not yet fetch/verify/swap the peer's bundle.
-- **Seal trust anchor chain validation**: Verifies CMS signature integrity, but doesn't
-  build a full PKIX path against trust anchors. Self-referential verification only.
+- **General PKIX path building**: Seal admission supports exact certificate pins or
+  a bounded direct-issued CA profile, not arbitrary intermediate chains/policies.
 - **SCVP**: Server-based Certificate Validation Protocol — separate protocol, not planned.
 
 ## Current state
@@ -123,7 +134,10 @@ All five milestones (M0–M5) plus post-milestone features (CMS seal, PKCS#11,
 delegated cert, live nonce, key rotation, syncrepl, on-demand signing, Prometheus
 metrics + audit log, ahu admin tooling, and the M4 gossip fleet view) are
 implemented. The design doc (`hoike-design.md`) is the roadmap — it describes the
-target architecture including features not yet built (gossip message signing,
-bundle pull-on-announce). The README describes what runs today.
+target architecture including automatic bundle pull-on-announce, which is not built. The README describes what runs today.
 
-176 tests. ~19,000 lines of Rust.
+See `docs/review-remediation.md` for all 29 review findings, migrations and evidence.
+Keep one writer per state directory; immutable committed bundle snapshots and rollback
+marks must be backed up/restored together. Default delta apply is an unsigned
+intermediate: authenticate inputs and use a real authorized seal before installation.
+Feature-enabled tests do not establish live 389 DS, HSM or power-loss qualification.

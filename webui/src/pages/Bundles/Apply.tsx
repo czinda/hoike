@@ -86,8 +86,14 @@ export default function BundleApply() {
 
         {result && (
           <>
-            <Alert variant="success" title="Materialized full bundle" style={{ marginBottom: '1rem' }} />
+            <Alert variant="warning" title="Unsigned intermediate created" style={{ marginBottom: '1rem' }}>
+              {result.notice || 'This bundle must be sealed by an authorized signer before trusted installation.'}
+            </Alert>
             <DescriptionList isHorizontal columnModifier={{ default: '2Col' }} style={{ maxWidth: 720, marginBottom: '1rem' }}>
+              <DescriptionListGroup>
+                <DescriptionListTerm>Seal status</DescriptionListTerm>
+                <DescriptionListDescription>{result.status === 'unsigned_intermediate' ? 'Unsigned — sealing required' : 'Unverified — confirm before installation'}</DescriptionListDescription>
+              </DescriptionListGroup>
               <DescriptionListGroup>
                 <DescriptionListTerm>Entry count</DescriptionListTerm>
                 <DescriptionListDescription>{result.entry_count}</DescriptionListDescription>
@@ -127,8 +133,8 @@ export default function BundleApply() {
             </Table>
 
             <div style={{ marginTop: '1rem' }}>
-              <Button variant="secondary" onClick={() => downloadBase64(result.bundle_b64, `materialized-epoch-${result.final_epoch}.ahu`)}>
-                Download bundle
+              <Button variant="secondary" onClick={() => downloadBase64(result.bundle_b64, `unsigned-epoch-${result.final_epoch}.ahu`)}>
+                Download unsigned intermediate
               </Button>
             </div>
           </>

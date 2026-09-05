@@ -33,6 +33,21 @@ pub enum GossipMessage {
 }
 
 impl GossipMessage {
+    pub(crate) fn valid_bounds(&self) -> bool {
+        let (producer, hash) = self.scope_key();
+        !producer.is_empty()
+            && producer.len() <= 256
+            && self.origin_node().len() <= 256
+            && matches!(hash.len(), 20 | 32)
+            && match self {
+                Self::GenerationAnnouncement {
+                    bundle_url: Some(url),
+                    ..
+                } => url.len() <= 1024,
+                _ => true,
+            }
+    }
+
     pub fn scope_key(&self) -> (&str, &[u8]) {
         match self {
             GossipMessage::GenerationAnnouncement {
@@ -121,6 +136,7 @@ pub struct HoikeBroadcastHandler {
     /// entirely — today's unauthenticated behavior — used when no gossip
     /// `identity_key`/`peer_keys` are configured.
     verifier: Option<crate::crypto::GossipVerifier>,
+    admitted: std::collections::HashMap<(String, Vec<u8>), std::time::Instant>,
 }
 
 impl HoikeBroadcastHandler {
@@ -128,7 +144,11 @@ impl HoikeBroadcastHandler {
         tx: tokio::sync::mpsc::Sender<GossipMessage>,
         verifier: Option<crate::crypto::GossipVerifier>,
     ) -> Self {
-        Self { tx, verifier }
+        Self {
+            tx,
+            verifier,
+            admitted: Default::default(),
+        }
     }
 }
 
@@ -152,6 +172,9 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
         data: &[u8],
         _sender: Option<&T>,
     ) -> Result<Option<Self::Key>, Self::Error> {
+        if data.len() > 2048 {
+            return Ok(None);
+        }
         // Authenticate before decoding. A dropped message returns `Ok(None)` so
         // foca neither stores nor re-broadcasts it — the forgery dies at this hop.
         let payload: &[u8] = match &self.verifier {
@@ -174,6 +197,16 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
         let msg: GossipMessage =
             serde_json::from_slice(payload).map_err(|e| BroadcastError(format!("decode: {e}")))?;
 
+        if !msg.valid_bounds() {
+            return Ok(None);
+        }
+        self.admitted
+            .retain(|_, seen| seen.elapsed() < std::time::Duration::from_secs(3600));
+        let scope = (msg.scope_key().0.to_string(), msg.scope_key().1.to_vec());
+        if !self.admitted.contains_key(&scope) && self.admitted.len() >= 4096 {
+            return Ok(None);
+        }
+        self.admitted.insert(scope, std::time::Instant::now());
         let key = BroadcastKey {
             producer_id: msg.scope_key().0.to_string(),
             issuer_key_hash: msg.scope_key().1.to_vec(),
@@ -191,6 +224,33 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handler_bounds_new_scopes_and_payloads() {
+        use foca::BroadcastHandler;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8192);
+        let mut handler = HoikeBroadcastHandler::new(tx, None);
+        for n in 0..4100 {
+            let msg = GossipMessage::UrgentRevocation {
+                producer_id: format!("p{n}"),
+                issuer_key_hash: vec![1; 32],
+                epoch: 1,
+                origin_node: "peer".into(),
+            };
+            let accepted = handler
+                .receive_item(&serde_json::to_vec(&msg).unwrap(), None::<&()>)
+                .unwrap()
+                .is_some();
+            assert_eq!(accepted, n < 4096);
+        }
+        assert!(
+            handler
+                .receive_item(&vec![0; 2049], None::<&()>)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(handler.admitted.len(), 4096);
+    }
 
     #[test]
     fn gossip_message_serialization_round_trip() {

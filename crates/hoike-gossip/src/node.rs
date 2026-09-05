@@ -167,32 +167,26 @@ impl GossipNode {
             None => None,
         };
 
-        let mut trusted = Vec::new();
-        for path in &config.peer_keys {
-            let vk = crypto::load_verifying_key(path)
-                .map_err(|e| format!("gossip peer_key {}: {e}", path.display()))?;
-            trusted.push(vk);
+        if !config.peer_keys.is_empty() {
+            return Err("gossip.peer_keys is no longer safe: migrate to gossip.peer_identities (node name -> public key path)".into());
         }
-        // Trust our own key so broadcasts echoed back through the mesh verify.
+        let mut identities = Vec::new();
+        for (name, path) in &config.peer_identities {
+            if name.is_empty() || name.len() > 256 {
+                return Err("gossip peer identity must contain 1..=256 bytes".into());
+            }
+            identities.push((name.clone(), crypto::load_verifying_key(path)?));
+        }
         if let Some(s) = &signer {
-            trusted.push(s.verifying_key());
+            identities.push((config.node_name.clone(), s.verifying_key()));
         }
-
-        // A verifier exists whenever this node participates in the signed scheme
-        // at all (has its own key or names trusted peers). `peer_keys` populated
-        // ⇒ enforce; otherwise permissive.
-        let verifier = if signer.is_some() || !config.peer_keys.is_empty() {
-            let policy = if config.peer_keys.is_empty() {
+        let verifier = if signer.is_some() || !identities.is_empty() {
+            let policy = if config.peer_identities.is_empty() {
                 VerifyPolicy::Permissive
             } else {
                 VerifyPolicy::Required
             };
-            info!(
-                ?policy,
-                trusted_keys = trusted.len(),
-                "gossip verification enabled"
-            );
-            Some(GossipVerifier::new(trusted, policy))
+            Some(GossipVerifier::for_identities(identities, policy))
         } else {
             None
         };
@@ -390,11 +384,18 @@ impl GossipNode {
             return;
         };
 
+        if !msg.valid_bounds() {
+            return;
+        }
         let ikh_hex = hex::encode(issuer_key_hash);
         let key: GenKey = (origin_node.clone(), producer_id.clone(), ikh_hex.clone());
         let now = now_unix();
 
         let mut table = self.generations.write().await;
+        table.retain(|_, row| now.saturating_sub(row.last_seen_unix) < 3600);
+        if !table.contains_key(&key) && table.len() >= 4096 {
+            return;
+        }
         let entry = table.entry(key).or_insert_with(|| GenRecord {
             origin_node: origin_node.clone(),
             producer_id: producer_id.clone(),
@@ -412,7 +413,10 @@ impl GossipNode {
 
     /// Snapshot all known per-(node, scope) generation records.
     pub async fn generations(&self) -> Vec<GenRecord> {
-        self.generations.read().await.values().cloned().collect()
+        let mut table = self.generations.write().await;
+        let now = now_unix();
+        table.retain(|_, row| now.saturating_sub(row.last_seen_unix) < 3600);
+        table.values().cloned().collect()
     }
 }
 
@@ -567,6 +571,27 @@ async fn drain_runtime(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn generation_storage_is_bounded_and_expires() {
+        let node = test_node("edge").await;
+        for n in 0..4100 {
+            node.record_generation(&GossipMessage::GenerationAnnouncement {
+                producer_id: format!("producer-{n}"),
+                issuer_key_hash: vec![1; 32],
+                epoch: 1,
+                manifest_digest: [0; 32],
+                bundle_url: None,
+                origin_node: "peer".into(),
+            })
+            .await;
+        }
+        assert_eq!(node.generations().await.len(), 4096);
+        for row in node.generations.write().await.values_mut() {
+            row.last_seen_unix = 0;
+        }
+        assert!(node.generations().await.is_empty());
+    }
+
     #[test]
     fn node_id_identity_trait() {
         let id = NodeId {
@@ -613,6 +638,7 @@ mod tests {
             node_name: name.into(),
             identity_key: None,
             peer_keys: vec![],
+            peer_identities: Default::default(),
         };
         GossipNode::start(config, tx).await.expect("node starts")
     }

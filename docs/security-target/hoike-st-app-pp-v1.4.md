@@ -1,5 +1,13 @@
 # Security Target — hoike against the Protection Profile for Application Software v1.4
 
+> **Remediation status (September 2026):** The security review found defects in
+> implemented status, trust, freshness, rollback, and transport mechanisms.
+> The historical “Met”/conformance statements below are not current release
+> acceptance evidence. Consult the [remediation ledger](../review-remediation.md) for corrections,
+> tests and outstanding qualification. No CC/FIPS certification is claimed;
+> enabling a dependency feature alone does not establish an evaluated deployment.
+
+
 **Status:** Evaluation-ready architecture, not an evaluated product. See the
 [package posture disclaimer](README.md#posture-disclaimer-read-first).
 

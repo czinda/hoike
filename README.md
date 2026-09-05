@@ -68,6 +68,11 @@ See [`ahu-format-spec.md`](ahu-format-spec.md) for the full specification.
 
 ## Building from source
 
+Install a C compiler, CMake and pkg-config as well as the repository Rust
+toolchain. The signing crate uses AWS-LC for RSA CRL verification, including
+builds without TLS. On Debian-based builders these packages are
+`build-essential cmake pkg-config`.
+
 ```bash
 cargo build --release
 
@@ -89,15 +94,15 @@ cargo test --workspace
 
 ```bash
 # Produce a bundle from a CRL (requires explicit key source)
-hoike sign --ca my-ca --crl revoked.crl --signing-key responder.p8 -o bundle.ahu
+hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --signing-key responder.p8 -o bundle.ahu
 
 # Or with ML-DSA post-quantum signing (demo key for testing)
-hoike sign --ca my-ca --crl revoked.crl --sig-alg ml-dsa-65 --demo-key -o bundle.ahu
+hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --sig-alg ml-dsa-65 --demo-key -o bundle.ahu
 
 # Inspect the bundle
 ahu inspect bundle.ahu
 
-# Verify bundle integrity (including CMS seal)
+# Inspect structural integrity; trusted admission also needs configured seal trust
 ahu verify bundle.ahu
 
 # Start the responder
@@ -151,77 +156,77 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 
 ## Configuration
 
+A keyless edge needs bundle storage and explicit seal trust. Paths below are
+operator-provisioned examples; see the [remediation migration guide](docs/review-remediation.md)
+before upgrading existing state or configuration.
+
 ```toml
 [server]
-mode           = "edge"         # "signer" | "edge" | "combined"
-listen         = "0.0.0.0:2560"
-max_request    = 8192           # bytes
-metrics_listen = "127.0.0.1:9184"  # optional; Prometheus /metrics on a private port
-                                    # (requires building with --features metrics)
+mode = "edge"
+listen = "0.0.0.0:2560"
+max_request = 8192
 
 [storage]
-bundle_dir         = "/var/lib/hoike/bundles"
-state_db           = "/var/lib/hoike/state"     # epoch high-water marks (fsync'd)
-max_chain          = 24                         # max delta chain length
-seal_trust_anchors = ["/etc/hoike/seal-ca.pem"] # verify CMS seal on load
+bundle_dir = "/var/lib/hoike/bundles"
+state_db = "/var/lib/hoike/state"
+max_chain = 24
+# Exact signer certificate pins (PEM or DER), not SPKI hashes:
+seal_signer_pins = ["/etc/hoike/seal-signer.pem"]
+# Alternative: dedicated CA anchors for the supported direct-issuer profile.
+# seal_trust_anchors = ["/etc/hoike/seal-ca.pem"]
+# Restrict trusted signers to producer/CA scopes with [[storage.seal_authorizations]].
+# See migration guide for DER certificate fingerprint and dual-scope rules.
 
 [[ca]]
-label          = "enterprise-issuing-01"
-nonce_policy   = "forward"       # "ignore", "forward", or "live" (signer/combined only)
-completeness   = "authoritative-complete"
-forward_to     = "https://signer.pki.example:2560"
-responder_cert = "/etc/hoike/responder-01.pem"  # embedded in BasicOCSPResponse.certs
+label = "enterprise-issuing-01"
+bundle_file = "/var/lib/hoike/bundles/enterprise-issuing-01.ahu"
+nonce_policy = "ignore"
+completeness = "partial"
 
-# Revocation source (required for combined/signer mode)
+[gossip]
+enabled = false
+bind = "0.0.0.0:7946"
+seeds = []
+node_name = "edge-01"
+# Before enabling authenticated gossip, provision the local signing key and
+# mappings for each authorized origin (including this node where needed):
+# identity_key = "/etc/hoike/gossip/edge-01.ed25519.p8"
+# [gossip.peer_identities]
+# edge-01 = "/etc/hoike/gossip/edge-01.pub.pem"
+# edge-02 = "/etc/hoike/gossip/edge-02.pub.pem"
+```
+
+For a signer or combined process, configure the CA's signing key,
+`responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.
+CRL sources require an independently authorized issuer certificate; its identity
+is used when explicit issuer-name/key bytes are not configured:
+
+```toml
+# Add to the relevant [[ca]] table, before its nested source/signing tables:
+responder_cert = "/etc/hoike/responder-01.pem"
+seal_key = "/etc/hoike/seal-key.p8"
+seal_cert = "/etc/hoike/seal-signer.pem"
+
 [ca.source]
 type = "crl"
 path = "/var/lib/hoike/crls/enterprise.crl"
+issuer_cert = "/etc/hoike/issuer.der"
 
-# Or: 389 DS syncrepl for positive issuance (authoritative-complete)
-# [ca.source]
-# type = "dogtag-sync"
-# ldap_url = "ldap://ds-iot.cert-lab.local:3389"
-# base_dn = "ou=certificateRepository,ou=ca,o=pki-iot-ca-CA"
-# bind_dn = "cn=Directory Manager"
-# bind_password_env = "HOIKE_LDAP_PASSWORD"
-# filter = "(objectClass=certificateRecord)"
-# cookie_path = "/var/lib/hoike/syncrepl-cookie"
-
-# Signing key (required for combined/signer mode)
 [ca.signing_key]
-type        = "pkcs11"
-module      = "/usr/lib64/pkcs11/libkryoptic_pkcs11.so"
+type = "pkcs11"
+module = "/usr/lib64/pkcs11/libkryoptic_pkcs11.so"
 token_label = "hoike-ocsp"
-key_label   = "ocsp-signing"
-pin_env     = "HOIKE_HSM_PIN"   # or omit for interactive prompt
-
-# Or: file-based signing key
-# [ca.signing_key]
-# type = "file"
-# path = "/etc/hoike/responder-01.p8"
-
-# CMS seal key (separate from OCSP signing key)
-seal_key  = "/etc/hoike/seal-key.p8"
-seal_cert = "/etc/hoike/seal-cert.pem"
-
-# Key rotation monitoring
-[ca.key_rotation]
-renew_before_days = 7
-check_interval_hours = 1
-rotation_command = "/usr/local/bin/renew-ocsp-cert.sh"
-
-# Gossip for edge fleet coordination
-[gossip]
-enabled   = true
-bind      = "0.0.0.0:7946"
-seeds     = ["edge-a.pki.example:7946", "edge-b.pki.example:7946"]
-node_name = "edge-01"
-# Message authentication (FPT_ITT.1). identity_key signs outbound broadcasts;
-# peer_keys is the trusted set for inbound verification. Empty peer_keys = permissive
-# (accept unsigned during a rolling upgrade); populated = enforced (drop unsigned/forged).
-identity_key = "/etc/hoike/gossip/edge-01.ed25519.p8"   # Ed25519 PKCS#8 private key
-peer_keys    = ["/etc/hoike/gossip/edge-a.pub.pem", "/etc/hoike/gossip/edge-b.pub.pem"]
+key_label = "ocsp-signing"
+pin_env = "HOIKE_HSM_PIN"
 ```
+
+Build with `pkcs11` for that signing key, `dogtag-sync` for directory sources,
+and `tls` when configuring TLS/mTLS. A configured security feature that is not
+available must fail rather than fall back. `nonce_policy = "forward"` requires
+an HTTPS `forward_to`; `live` belongs on signer/combined nodes. CRL enumeration
+cannot establish authoritative completeness. Dogtag's `authoritative-complete`
+mode additionally requires a successful complete source refresh; see the migration
+guide for source-bound snapshot/cookie checkpoints and full-refresh requirements.
 
 ## Workspace layout
 
@@ -242,6 +247,10 @@ hoike/
 
 ## Milestones
 
+These statuses describe feature implementation, not production qualification.
+The [29-finding remediation ledger](docs/review-remediation.md) records corrective
+changes, regression evidence, migration requirements, and remaining release gates.
+
 | | Scope | Status |
 |--|-------|--------|
 | **M0** | `ahu` crate: read, write, verify, CLI | Done |
@@ -256,14 +265,18 @@ hoike/
 ## Known limitations
 
 - **Gossip: broadcasts signed, channel not encrypted** — generation/urgent-revocation
-  broadcasts are Ed25519-signed and verified on receive (`gossip.identity_key` +
-  `gossip.peer_keys`, design §6.3); forged or unsigned messages are dropped. Not yet
+  broadcasts are Ed25519-signed and verified by named-origin mappings
+  (`gossip.identity_key` + `gossip.peer_identities`, design §6.3). Enforced mode
+  rejects unsigned, forged, or misattributed broadcasts. Not yet
   covered: payload *confidentiality* and authentication of foca's SWIM liveness traffic
   (pings/acks).
-- **Seal trust anchor validation** — `verify_seal` checks the CMS signature
-  against the certificate carried in the seal. Full chain validation against
-  configured trust anchors verifies integrity but does not yet build a full
-  PKIX path. A self-signed seal cert passes verification.
+- **Bounded CMS trust profile** — explicit certificate pins or direct-issued
+  seal certificates under configured CA anchors. General intermediate-chain PKIX
+  validation is unsupported. Configure producer/CA authorizations where needed.
+- **CRL profile** — authenticated direct complete CRLs only; unsupported algorithms,
+  delta/indirect CRLs and unsupported critical extensions reject explicitly.
+- **Delta apply output** — unsigned intermediate by default; authenticate inputs and
+  use an authorized real CMS sealing callback before trusted installation.
 - **Multi-CertID requests** — only the first `CertID` in a multi-Request
   `OCSPRequest` is answered. Defensible under RFC 9919's single-Request profile
   but provides no signal to the client.

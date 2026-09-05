@@ -74,9 +74,12 @@ pub fn create_persistent_sources(
             } => {
                 let password =
                     resolve_ldap_password(bind_password.as_deref(), bind_password_env.as_deref())?;
-                let cookie = cookie_path
-                    .clone()
-                    .unwrap_or_else(|| config.storage.state_db.join("sync-cookie.dat"));
+                let cookie = cookie_path.clone().unwrap_or_else(|| {
+                    config
+                        .storage
+                        .state_db
+                        .join(format!("sync-{}.json", ca_config.label))
+                });
                 let sync_config = crate::DogtagSyncConfig {
                     ldap_url: ldap_url.clone(),
                     base_dn: base_dn.clone(),
@@ -117,16 +120,29 @@ fn resolve_source<'a>(
         .ok_or_else(|| format!("CA '{}': no revocation source configured", ca_config.label))?;
 
     let fresh: Box<dyn RevocationSource> = match source_config {
-        hoike_core::config::SourceConfig::Crl { path } => {
+        hoike_core::config::SourceConfig::Crl { path, issuer_cert } => {
             let crl_data = std::fs::read(path)
                 .map_err(|e| format!("failed to read CRL {}: {e}", path.display()))?;
-            if crl_data.starts_with(b"-----BEGIN") {
+            let source = if crl_data.starts_with(b"-----BEGIN") {
                 let pem =
                     String::from_utf8(crl_data).map_err(|e| format!("CRL not valid UTF-8: {e}"))?;
-                Box::new(CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?)
+                CrlSource::from_pem(&pem).map_err(|e| format!("CRL parse: {e}"))?
             } else {
-                Box::new(CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?)
-            }
+                CrlSource::from_der(crl_data).map_err(|e| format!("CRL parse: {e}"))?
+            };
+            let issuer_path = issuer_cert.as_ref().ok_or_else(|| {
+                format!(
+                    "CA '{}': CRL source requires issuer_cert for authentication",
+                    ca_config.label
+                )
+            })?;
+            let issuer =
+                std::fs::read(issuer_path).map_err(|e| format!("read issuer certificate: {e}"))?;
+            Box::new(
+                source
+                    .with_issuer_certificate(&issuer)
+                    .map_err(|e| format!("issuer certificate: {e}"))?,
+            )
         }
         #[cfg(feature = "dogtag-sync")]
         hoike_core::config::SourceConfig::DogtagSync { .. } => {
@@ -181,9 +197,26 @@ pub fn sign_ca_scope(
         epoch,
         validity_secs: ca_config.validity_secs,
         certid_compat: crate::CertIdCompat::Dual,
+        completeness: match ca_config.completeness.as_str() {
+            "authoritative-complete" if source.is_authoritative_complete() => {
+                ahu::Completeness::AuthoritativeComplete
+            }
+            "authoritative-complete" => {
+                return Err(format!(
+                    "CA '{}': source cannot prove authoritative completeness; configure partial",
+                    ca_config.label
+                ));
+            }
+            "partial" => ahu::Completeness::Partial,
+            other => return Err(format!("unknown completeness: {other}")),
+        },
         ..Default::default()
     };
 
+    // Also protect on-demand generation against invalid live key/cert replacements.
+    if ca_config.nonce_policy == "live" {
+        crate::live::load_live_material(ca_config)?;
+    }
     let responder_cert_der = load_responder_cert(ca_config)?;
     let (seal_key, seal_cert_der) = load_seal_materials(ca_config)?;
 
@@ -250,11 +283,43 @@ pub fn write_bundle(
     label: &str,
     bytes: &[u8],
 ) -> std::result::Result<PathBuf, String> {
-    std::fs::create_dir_all(&config.storage.bundle_dir)
-        .map_err(|e| format!("create bundle_dir: {e}"))?;
-    let path = config.storage.bundle_dir.join(format!("{label}.ahu"));
-    std::fs::write(&path, bytes).map_err(|e| format!("write bundle: {e}"))?;
+    let path = config
+        .ca
+        .iter()
+        .find(|ca| ca.label == label)
+        .and_then(|ca| ca.bundle_file.clone())
+        .unwrap_or_else(|| config.storage.bundle_dir.join(format!("{label}.ahu")));
+    write_bundle_atomic(&path, bytes)?;
     Ok(path)
+}
+
+/// Durable replacement: readers see either complete old or complete new bytes.
+pub fn write_bundle_atomic(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::result::Result<(), String> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("create bundle directory: {e}"))?;
+    let tmp = parent.join(format!(".hoike-{}.tmp", uuid::Uuid::now_v7()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("publish {}: {e}", path.display()))
 }
 
 /// Dispatch bundle production over the CA's configured signing-key source and
@@ -429,8 +494,32 @@ fn decode_b64_field(
     }
 }
 
+fn configured_issuer(ca: &CaConfig) -> std::result::Result<Option<x509_cert::Certificate>, String> {
+    if let Some(hoike_core::config::SourceConfig::Crl {
+        issuer_cert: Some(path),
+        ..
+    }) = &ca.source
+    {
+        let bytes = std::fs::read(path).map_err(|e| format!("read issuer certificate: {e}"))?;
+        return crate::rotation::parse_certificate(&bytes)
+            .map(Some)
+            .map_err(|e| e.to_string());
+    }
+    Ok(None)
+}
+
 /// Decode the issuer DN (DER) for a CA, falling back to a synthetic `CN=<label>`.
 pub fn decode_issuer_name(ca: &CaConfig) -> std::result::Result<Vec<u8>, String> {
+    if ca.issuer_name_der_b64.is_none() {
+        if let Some(cert) = configured_issuer(ca)? {
+            use der::Encode;
+            return cert
+                .tbs_certificate
+                .subject
+                .to_der()
+                .map_err(|e| e.to_string());
+        }
+    }
     decode_b64_field(
         &ca.issuer_name_der_b64,
         "issuer_name_der_b64",
@@ -441,6 +530,17 @@ pub fn decode_issuer_name(ca: &CaConfig) -> std::result::Result<Vec<u8>, String>
 
 /// Decode the issuer public-key bytes for a CA, falling back to a synthetic key.
 pub fn decode_issuer_key(ca: &CaConfig) -> std::result::Result<Vec<u8>, String> {
+    if ca.issuer_key_bytes_b64.is_none() {
+        if let Some(cert) = configured_issuer(ca)? {
+            return cert
+                .tbs_certificate
+                .subject_public_key_info
+                .subject_public_key
+                .as_bytes()
+                .map(|b| b.to_vec())
+                .ok_or_else(|| "issuer public key has unused bits".into());
+        }
+    }
     decode_b64_field(
         &ca.issuer_key_bytes_b64,
         "issuer_key_bytes_b64",
@@ -645,5 +745,54 @@ pub fn ml_dsa_pkcs11_params(
             crate::ML_DSA_87_OID,
         )),
         other => Err(format!("unknown ML-DSA variant for PKCS#11: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn configured_bundle_destination_is_respected_and_failure_preserves_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("custom/active.ahu");
+        let config_path = dir.path().join("hoike.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[server]
+[storage]
+bundle_dir = "{}/default"
+[[ca]]
+label = "test"
+bundle_file = "{}"
+"#,
+                dir.path().display(),
+                destination.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::from_file(&config_path).unwrap();
+        assert_eq!(write_bundle(&config, "test", b"old").unwrap(), destination);
+        write_bundle(&config, "test", b"complete replacement").unwrap();
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"complete replacement"
+        );
+        assert!(!config.storage.bundle_dir.join("test.ahu").exists());
+        // A rename onto a directory fails after the temporary file is written.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("previous"), b"old").unwrap();
+        assert!(write_bundle_atomic(&blocked, b"new").is_err());
+        assert_eq!(std::fs::read(blocked.join("previous")).unwrap(), b"old");
+        assert!(
+            !std::fs::read_dir(dir.path()).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+        );
     }
 }

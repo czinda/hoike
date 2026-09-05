@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::bundle::{Bundle, BundleBuilder};
@@ -111,8 +112,20 @@ pub const MAX_CHAIN_LENGTH: u64 = 24;
 /// Apply an ordered chain of delta bundles onto a full base bundle, producing a
 /// materialized full bundle. Verifies the continuity chain (base digest, then
 /// `prev_manifest_digest` links) and rejects type mismatches. Callers are
-/// responsible for having verified each bundle's structure beforehand if desired.
+/// responsible for authenticating inputs against their configured trust policy.
+/// Output is an UNSIGNED INTERMEDIATE, with an empty seal; it must be sealed
+/// before installation on an authenticated responder.
 pub fn apply(base: &Bundle, deltas: &[Bundle]) -> Result<ApplyResult> {
+    apply_sealed(base, deltas, |_| Ok(Vec::new()))
+}
+
+/// Materialize a delta chain and authenticate its final manifest using `seal_fn`.
+/// The caller must authenticate every input and authorize the output signer.
+pub fn apply_sealed<F>(base: &Bundle, deltas: &[Bundle], seal_fn: F) -> Result<ApplyResult>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>>,
+{
+    crate::verify_structure(base)?;
     if base.manifest.bundle_type != BundleType::Full {
         return Err(AhuError::InvalidOperation(
             "base bundle must be a full bundle, not a delta".into(),
@@ -121,12 +134,13 @@ pub fn apply(base: &Bundle, deltas: &[Bundle]) -> Result<ApplyResult> {
 
     // Working set keyed by (entry_key, discriminator) so dual-algorithm entries
     // are tracked independently.
-    let mut working_set: BTreeMap<([u8; 32], u16), (Vec<u8>, IndexFlags)> = BTreeMap::new();
+    type RetainedEntry = (Vec<u8>, IndexFlags, crate::Window);
+    let mut working_set: BTreeMap<([u8; 32], u16), RetainedEntry> = BTreeMap::new();
     for record in &base.index {
         if let Some(data) = base.entry_bytes(record) {
             working_set.insert(
                 (record.entry_key, record.discriminator),
-                (data.to_vec(), record.flags),
+                (data.to_vec(), record.flags, base.manifest.window.clone()),
             );
         }
     }
@@ -151,18 +165,34 @@ pub fn apply(base: &Bundle, deltas: &[Bundle]) -> Result<ApplyResult> {
             )));
         }
 
-        // First delta must chain from the base.
-        if i == 0 {
-            if let Some(ref base_digest) = delta.manifest.continuity.base_manifest_digest {
-                if *base_digest != base_manifest_digest {
-                    return Err(AhuError::InvalidOperation(format!(
-                        "delta {} base_manifest_digest does not match base bundle",
-                        i + 1
-                    )));
-                }
-            }
+        crate::verify_structure(delta)?;
+        if delta.manifest.continuity.base_manifest_digest != Some(base_manifest_digest) {
+            return Err(AhuError::InvalidOperation(format!(
+                "delta {} base_manifest_digest does not match base bundle",
+                i + 1
+            )));
         }
-
+        let scopes = |bundle: &Bundle| {
+            bundle
+                .manifest
+                .ca_scopes
+                .iter()
+                .map(|scope| {
+                    (
+                        scope.hash_algorithm.clone(),
+                        scope.issuer_name_hash.clone(),
+                        scope.issuer_key_hash.clone(),
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        if delta.manifest.producer_id != base.manifest.producer_id || scopes(delta) != scopes(base)
+        {
+            return Err(AhuError::InvalidOperation(format!(
+                "delta {} producer/CA scopes do not match base",
+                i + 1
+            )));
+        }
         // Every delta must chain from its predecessor.
         if let Some(ref prev_digest) = delta.manifest.continuity.prev_manifest_digest {
             if *prev_digest != prev_manifest_digest {
@@ -189,7 +219,10 @@ pub fn apply(base: &Bundle, deltas: &[Bundle]) -> Result<ApplyResult> {
                 }
             } else if let Some(data) = delta.entry_bytes(record) {
                 if working_set
-                    .insert(key, (data.to_vec(), record.flags))
+                    .insert(
+                        key,
+                        (data.to_vec(), record.flags, delta.manifest.window.clone()),
+                    )
                     .is_some()
                 {
                     replaced += 1;
@@ -219,17 +252,43 @@ pub fn apply(base: &Bundle, deltas: &[Bundle]) -> Result<ApplyResult> {
     manifest.continuity.prev_manifest_digest = Some(prev_manifest_digest);
     manifest.continuity.base_manifest_digest = None;
 
-    let final_epoch = max_epoch + 1;
+    let final_epoch = max_epoch
+        .checked_add(1)
+        .ok_or_else(|| AhuError::InvalidOperation("epoch exhausted".into()))?;
     for scope in &mut manifest.ca_scopes {
         scope.epoch = final_epoch;
     }
 
+    // Retained payloads carry their source validity envelope. Taking the
+    // earliest expiry is conservative even for batched/multi-algorithm data;
+    // replaced and tombstoned payloads no longer constrain the result.
+    if !working_set.is_empty() {
+        let windows: Vec<_> = working_set.values().map(|(_, _, w)| w).collect();
+        if windows
+            .iter()
+            .any(|w| w.this_update_min > w.next_update_min || w.next_update_min > w.next_update_max)
+        {
+            return Err(AhuError::InvalidOperation(
+                "inconsistent source validity window".into(),
+            ));
+        }
+        manifest.window.this_update_min = windows.iter().map(|w| w.this_update_min).min().unwrap();
+        manifest.window.produced_at = windows.iter().map(|w| w.produced_at).max().unwrap();
+        let expires = windows.iter().map(|w| w.next_update_min).min().unwrap();
+        if manifest.window.produced_at >= expires {
+            return Err(AhuError::InvalidOperation(
+                "retained response validity windows do not overlap".into(),
+            ));
+        }
+        manifest.window.next_update_min = expires;
+        manifest.window.next_update_max = expires;
+    }
     let mut builder = BundleBuilder::new(manifest);
-    for ((entry_key, disc), (data, _flags)) in &working_set {
+    for ((entry_key, disc), (data, _flags, _window)) in &working_set {
         builder.add_entry_with_discriminator(*entry_key, *disc, data.clone());
     }
 
-    let bytes = builder.build(|m| Ok(Sha256::digest(m).to_vec()))?;
+    let bytes = builder.build(seal_fn)?;
     let entry_count = working_set.len();
 
     Ok(ApplyResult {
@@ -439,5 +498,38 @@ mod tests {
         let delta = delta_from(&base, &base, 6, MAX_CHAIN_LENGTH + 1, &[(2, b"two")], &[]);
         let result = apply(&base, &[delta]).unwrap();
         assert!(result.deltas[0].chain_length_warning);
+    }
+    #[test]
+    fn every_delta_must_reference_base_even_without_predecessor() {
+        let base = full_bundle(1, &[(1, b"one")]);
+        let first = delta_from(&base, &base, 2, 1, &[], &[]);
+        let mut second = delta_from(&first, &base, 3, 2, &[], &[]);
+        second.manifest.continuity.base_manifest_digest = Some([0xff; 32]);
+        second.manifest.continuity.prev_manifest_digest = None;
+        assert!(apply(&base, &[first, second]).is_err());
+    }
+
+    #[test]
+    fn delta_validity_tracks_retained_payloads_and_output_is_unsigned() {
+        let base = full_bundle(1, &[(1, b"one"), (2, b"two")]);
+        let mut delta = delta_from(&base, &base, 2, 1, &[(1, b"ONE")], &[]);
+        let expiry = base.manifest.window.produced_at + 10;
+        delta.manifest.window.next_update_min = expiry;
+        delta.manifest.window.next_update_max = expiry;
+        let output = apply(&base, &[delta]).unwrap();
+        let materialized = Bundle::from_bytes(&output.bytes).unwrap();
+        assert_eq!(materialized.manifest.window.next_update_max, expiry);
+        assert!(materialized.seal_bytes.is_empty());
+    }
+
+    #[test]
+    fn delta_cannot_change_producer_or_ca_scope() {
+        let base = full_bundle(1, &[(1, b"one")]);
+        let mut delta = delta_from(&base, &base, 2, 1, &[], &[]);
+        delta.manifest.producer_id = "other".into();
+        assert!(apply(&base, &[delta]).is_err());
+        let mut delta = delta_from(&base, &base, 2, 1, &[], &[]);
+        delta.manifest.ca_scopes[0].issuer_key_hash = vec![0xff; 32];
+        assert!(apply(&base, &[delta]).is_err());
     }
 }

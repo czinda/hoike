@@ -348,7 +348,18 @@ pub fn apply(
     base_path: &Path,
     delta_paths: &[std::path::PathBuf],
     output_path: &Path,
+    seal_key_path: Option<&Path>,
+    seal_cert_path: Option<&Path>,
+    input_signer_pins: &[std::path::PathBuf],
 ) -> Result<()> {
+    if seal_key_path.is_some() != seal_cert_path.is_some() {
+        return Err("--seal-key and --seal-cert must be supplied together".into());
+    }
+    if seal_key_path.is_some() && input_signer_pins.is_empty() {
+        return Err(
+            "signed output requires --input-signer-pin to authenticate every input bundle".into(),
+        );
+    }
     println!("Loading base bundle: {}", base_path.display());
     let base = Bundle::from_file(base_path)?;
     ahu::verify_structure(&base)?;
@@ -361,7 +372,37 @@ pub fn apply(
         deltas.push(delta);
     }
 
-    let result = ahu::apply(&base, &deltas)?;
+    let result = if let (Some(key_path), Some(cert_path)) = (seal_key_path, seal_cert_path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let pins = input_signer_pins
+            .iter()
+            .map(|path| read_certificate(path))
+            .collect::<Result<Vec<_>>>()?;
+        for bundle in std::iter::once(&base).chain(deltas.iter()) {
+            ahu::verify_seal_with_pins(&bundle.manifest_bytes, &bundle.seal_bytes, &pins, now)?;
+        }
+        let key = hoike_sign::SealKey::EcdsaP256(hoike_sign::load_ecdsa_p256_key(key_path)?);
+        let cert = read_certificate(cert_path)?;
+        let applied = ahu::ops::apply_sealed(&base, &deltas, |manifest| {
+            hoike_sign::create_cms_seal(manifest, &key, &cert)
+                .map_err(|e| ahu::AhuError::SealInvalid(e.to_string()))
+        })?;
+        let output = Bundle::from_bytes(&applied.bytes)?;
+        // Reject mismatched keys, expired certificates and disallowed key usage
+        // before publishing any bytes to the destination.
+        ahu::verify_seal_with_pins(&output.manifest_bytes, &output.seal_bytes, &[cert], now)?;
+        println!(
+            "Output status: CMS sealed; configure the signer in the destination trust policy."
+        );
+        applied
+    } else {
+        eprintln!(
+            "WARNING: output is an UNSIGNED INTERMEDIATE. Seal with an authorized key before trusted installation."
+        );
+        ahu::apply(&base, &deltas)?
+    };
 
     for (i, stat) in result.deltas.iter().enumerate() {
         if stat.chain_length_warning {
@@ -380,7 +421,8 @@ pub fn apply(
         );
     }
 
-    std::fs::write(output_path, &result.bytes)?;
+    hoike_sign::orchestrate::write_bundle_atomic(output_path, &result.bytes)
+        .map_err(std::io::Error::other)?;
     println!(
         "\nWrote materialized bundle: {} ({} bytes, {} entries, epoch {})",
         output_path.display(),
@@ -390,4 +432,15 @@ pub fn apply(
     );
 
     Ok(())
+}
+
+fn read_certificate(path: &Path) -> Result<Vec<u8>> {
+    use der::{Decode, DecodePem, Encode};
+    let bytes = std::fs::read(path)?;
+    let cert = if bytes.starts_with(b"-----BEGIN") {
+        x509_cert::Certificate::from_pem(&bytes)?
+    } else {
+        x509_cert::Certificate::from_der(&bytes)?
+    };
+    Ok(cert.to_der()?)
 }

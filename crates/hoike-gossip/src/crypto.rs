@@ -19,16 +19,10 @@
 //!
 //! ## Rollout policy
 //!
-//! Encoded entirely by the two config fields already present on the gossip
-//! section, with no third flag:
-//!
-//! * `identity_key` set  → this node **signs** every outbound broadcast.
-//! * `peer_keys` empty   → [`VerifyPolicy::Permissive`]: accept unsigned legacy
-//!   messages (a signed-but-invalid message is still dropped). This is the first
-//!   phase of a rolling upgrade — everyone starts signing while the fleet still
-//!   contains nodes that don't.
-//! * `peer_keys` populated → [`VerifyPolicy::Required`]: drop anything without a
-//!   valid signature from a trusted key. This is the enforced end state.
+//! `identity_key` signs outbound messages. `peer_identities` binds each trusted
+//! key to its node name; a nonempty mapping requires authenticated broadcasts.
+//! An empty mapping retains unsigned rollout compatibility. Legacy `peer_keys`
+//! is rejected at startup because a key list cannot authorize node identities.
 
 use std::fs;
 use std::path::Path;
@@ -143,11 +137,26 @@ pub enum VerifyOutcome<'a> {
 pub struct GossipVerifier {
     trusted: Vec<VerifyingKey>,
     policy: VerifyPolicy,
+    identities: Vec<(String, VerifyingKey)>,
 }
 
 impl GossipVerifier {
-    pub fn new(trusted: Vec<VerifyingKey>, policy: VerifyPolicy) -> Self {
-        Self { trusted, policy }
+    #[cfg(test)]
+    pub(crate) fn new(trusted: Vec<VerifyingKey>, policy: VerifyPolicy) -> Self {
+        Self {
+            trusted,
+            policy,
+            identities: Vec::new(),
+        }
+    }
+
+    /// Bind a verified key to the origin claimed in the signed payload.
+    pub fn for_identities(identities: Vec<(String, VerifyingKey)>, policy: VerifyPolicy) -> Self {
+        Self {
+            trusted: identities.iter().map(|(_, key)| *key).collect(),
+            policy,
+            identities,
+        }
     }
 
     pub fn policy(&self) -> VerifyPolicy {
@@ -172,6 +181,18 @@ impl GossipVerifier {
                 let payload = &data[1 + SIG_LEN..];
                 let ok = self.trusted.iter().any(|k| k.verify(payload, &sig).is_ok());
                 if ok {
+                    if !self.identities.is_empty() {
+                        let Ok(msg) =
+                            serde_json::from_slice::<crate::broadcast::GossipMessage>(payload)
+                        else {
+                            return VerifyOutcome::Reject("invalid signed message");
+                        };
+                        if !self.identities.iter().any(|(name, key)| {
+                            name == msg.origin_node() && key.verify_strict(payload, &sig).is_ok()
+                        }) {
+                            return VerifyOutcome::Reject("signing key not authorized for origin");
+                        }
+                    }
                     VerifyOutcome::Accept(payload)
                 } else {
                     VerifyOutcome::Reject("no trusted key verified signature")
@@ -217,6 +238,34 @@ mod tests {
 
     fn test_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn authenticated_peer_cannot_claim_another_origin() {
+        let signer = GossipSigner::new(test_key(1));
+        let verifier = GossipVerifier::for_identities(
+            vec![("node-a".into(), signer.verifying_key())],
+            VerifyPolicy::Required,
+        );
+        let message = |origin: &str| {
+            serde_json::to_vec(&crate::broadcast::GossipMessage::UrgentRevocation {
+                producer_id: "p".into(),
+                issuer_key_hash: vec![1; 32],
+                epoch: 1,
+                origin_node: origin.into(),
+            })
+            .unwrap()
+        };
+        assert!(matches!(
+            verifier.check(&signer.frame(&message("node-a"))),
+            VerifyOutcome::Accept(_)
+        ));
+        for origin in ["node-b", ""] {
+            assert!(matches!(
+                verifier.check(&signer.frame(&message(origin))),
+                VerifyOutcome::Reject(_)
+            ));
+        }
     }
 
     #[test]

@@ -294,3 +294,75 @@ label = "test-ca"
     let config = Config::from_file(&config_path).unwrap();
     assert!(config.gossip.is_none());
 }
+
+fn parse_config(text: &str) -> Config {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, text).unwrap();
+    Config::from_file(&path).unwrap()
+}
+
+#[test]
+fn configured_tls_never_degrades_to_plaintext() {
+    let config = parse_config(
+        r#"
+[server]
+admin_listen = "127.0.0.1:8443"
+[server.admin_tls]
+cert = "cert.pem"
+key = "key.pem"
+[storage]
+bundle_dir = "/tmp/bundles"
+"#,
+    );
+    assert!(
+        config
+            .validate_transport(false)
+            .unwrap_err()
+            .to_string()
+            .contains("without the tls feature")
+    );
+    assert!(config.validate_transport(true).is_ok());
+    let mut no_listener = config.clone();
+    no_listener.server.admin_listen = None;
+    assert!(
+        no_listener
+            .validate_transport(true)
+            .unwrap_err()
+            .to_string()
+            .contains("admin_listen")
+    );
+}
+
+#[test]
+fn plaintext_forwarding_requires_explicit_opt_in() {
+    let mut config = parse_config(
+        r#"
+[server]
+[storage]
+bundle_dir = "/tmp/bundles"
+[[ca]]
+label = "test"
+forward_to = "http://127.0.0.1/ocsp"
+"#,
+    );
+    assert!(config.validate_for_mode().is_err());
+    config.ca[0].forward_insecure = true;
+    assert!(config.validate_for_mode().is_ok());
+    config.ca[0].forward_to = Some("file:///etc/passwd".into());
+    assert!(config.validate_for_mode().is_err());
+}
+
+#[test]
+fn generic_source_defaults_to_partial_completeness() {
+    let config = parse_config(
+        r#"
+[server]
+[storage]
+bundle_dir = "/tmp/bundles"
+[[ca]]
+label = "test"
+"#,
+    );
+    assert_eq!(config.ca[0].completeness, "partial");
+}
