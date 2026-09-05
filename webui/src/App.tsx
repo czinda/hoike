@@ -27,6 +27,9 @@ const Dashboard = React.lazy(() => import('./pages/Dashboard'));
 const Bundles = React.lazy(() => import('./pages/Bundles'));
 const BundleDetail = React.lazy(() => import('./pages/Bundles/Detail'));
 const BundleInspect = React.lazy(() => import('./pages/Bundles/Inspect'));
+const BundleDiff = React.lazy(() => import('./pages/Bundles/Diff'));
+const BundleExtract = React.lazy(() => import('./pages/Bundles/Extract'));
+const BundleApply = React.lazy(() => import('./pages/Bundles/Apply'));
 const CAs = React.lazy(() => import('./pages/CAs'));
 const CADetail = React.lazy(() => import('./pages/CAs/Detail'));
 const Signing = React.lazy(() => import('./pages/Signing'));
@@ -149,6 +152,13 @@ export default function App() {
         <Route path="/bundles" element={<Bundles />} />
         <Route path="/bundles/:label" element={<BundleDetail />} />
         <Route path="/bundles/inspect" element={<BundleInspect />} />
+        <Route path="/bundles/extract" element={<BundleExtract />} />
+        <Route path="/bundles/diff" element={
+          <RoleGuard minRole="operator"><BundleDiff /></RoleGuard>
+        } />
+        <Route path="/bundles/apply" element={
+          <RoleGuard minRole="operator"><BundleApply /></RoleGuard>
+        } />
         <Route path="/cas" element={<CAs />} />
         <Route path="/cas/:label" element={<CADetail />} />
         <Route path="/signing" element={

@@ -37,6 +37,7 @@ pub async fn get_status(State(state): State<AppState>, auth: Authenticated) -> i
 #[derive(Serialize)]
 struct BundleInfo {
     ca_label: String,
+    producer_id: String,
     epoch: u64,
     completeness: String,
     entry_count: u64,
@@ -61,6 +62,7 @@ pub async fn get_bundles(State(state): State<AppState>, auth: Authenticated) -> 
         .into_iter()
         .map(|s| BundleInfo {
             ca_label: s.ca_label,
+            producer_id: s.producer_id,
             epoch: s.epoch,
             completeness: s.completeness,
             entry_count: s.entry_count,
@@ -179,15 +181,96 @@ pub async fn get_gossip(State(state): State<AppState>, auth: Authenticated) -> i
     if let Err(e) = auth.require_role(OperatorRole::Viewer) {
         return e;
     }
-    let gossip_enabled = state
-        .admin
-        .config
-        .gossip
-        .as_ref()
-        .is_some_and(|g| g.enabled);
+
+    let Some(gossip) = state.gossip.as_ref() else {
+        // Config may mark gossip enabled, but if no live node is attached the
+        // fleet view has nothing to show — report disabled rather than fabricate.
+        let configured = state
+            .admin
+            .config
+            .gossip
+            .as_ref()
+            .is_some_and(|g| g.enabled);
+        return Json(serde_json::json!({
+            "enabled": false,
+            "configured": configured,
+            "message": if configured {
+                "gossip is enabled in config but no gossip node is running"
+            } else {
+                "gossip is disabled"
+            },
+            "members": [],
+            "generations": [],
+        }))
+        .into_response();
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let members = gossip.members().await;
+    let gens = gossip.generations().await;
+
+    // Highest epoch seen for each scope (producer_id, issuer_key_hash), across
+    // every node. A node's distance below this is its propagation lag.
+    let mut scope_max: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+    for g in &gens {
+        let key = (g.producer_id.clone(), g.issuer_key_hash.clone());
+        let e = scope_max.entry(key).or_insert(0);
+        if g.epoch > *e {
+            *e = g.epoch;
+        }
+    }
+
+    let members_json: Vec<_> = members
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "name": m.name,
+                "addr": m.addr.to_string(),
+                "incarnation": m.incarnation,
+                "state": m.state,
+                "is_self": m.is_self,
+            })
+        })
+        .collect();
+
+    let generations_json: Vec<_> = gens
+        .iter()
+        .map(|g| {
+            let scope_key = (g.producer_id.clone(), g.issuer_key_hash.clone());
+            let max_epoch = scope_max.get(&scope_key).copied().unwrap_or(g.epoch);
+            let epochs_behind = max_epoch.saturating_sub(g.epoch);
+            let age_secs = now.saturating_sub(g.last_seen_unix);
+            serde_json::json!({
+                "origin_node": g.origin_node,
+                "producer_id": g.producer_id,
+                "issuer_key_hash": g.issuer_key_hash,
+                "epoch": g.epoch,
+                "manifest_digest": g.manifest_digest,
+                "last_seen_unix": g.last_seen_unix,
+                "age_secs": age_secs,
+                "epochs_behind": epochs_behind,
+                "stale": epochs_behind > 0,
+            })
+        })
+        .collect();
+
+    let id = gossip.identity();
     Json(serde_json::json!({
-        "enabled": gossip_enabled,
-        "message": if gossip_enabled { "gossip cluster status not yet exposed via admin API" } else { "gossip is disabled" },
+        "enabled": true,
+        "configured": true,
+        "self": {
+            "name": id.name,
+            "addr": id.addr.to_string(),
+            "incarnation": id.incarnation,
+        },
+        "member_count": members.len(),
+        "members": members_json,
+        "generations": generations_json,
     }))
     .into_response()
 }

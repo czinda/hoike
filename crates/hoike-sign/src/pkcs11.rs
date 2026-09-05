@@ -154,7 +154,12 @@ fn find_slot(ctx: &Pkcs11, config: &Pkcs11Config) -> Result<cryptoki::slot::Slot
             .map_err(|e| SignError::Pkcs11(format!("get slots: {e}")))?;
         slots
             .into_iter()
-            .find(|s| u64::from(s.id()) == id)
+            .find(|s| {
+                // CK_ULONG is 32-bit on some targets, while config uses u64.
+                #[allow(clippy::useless_conversion)]
+                let slot_id = u64::from(s.id());
+                slot_id == id
+            })
             .ok_or_else(|| SignError::Pkcs11(format!("slot {id} not found")))
     } else if let Some(label) = &config.token_label {
         let slots = ctx
@@ -253,7 +258,7 @@ impl Pkcs11MlDsaSigner {
             return Err(SignError::Pkcs11(format!(
                 "token on slot {} does not support CKM_ML_DSA — \
                  check firmware version or use a software key",
-                u64::from(slot.id())
+                slot.id()
             )));
         }
 
@@ -553,8 +558,8 @@ mod tests {
     fn raw_ecdsa_to_der_valid() {
         // Both r and s are 32-byte scalars, no high-bit padding needed
         let mut raw = vec![0u8; 64];
-        raw[0] = 0x01; // r = 1 (31 leading zeros + 0x01)
-        raw[32] = 0x02; // s = 2 (31 leading zeros + 0x02)
+        raw[31] = 0x01; // r = 1 (31 leading zeros + 0x01)
+        raw[63] = 0x02; // s = 2 (31 leading zeros + 0x02)
 
         let der = raw_ecdsa_to_der(&raw).unwrap();
         // Should be SEQUENCE { INTEGER 1, INTEGER 2 }
@@ -583,5 +588,16 @@ mod tests {
     fn raw_ecdsa_to_der_wrong_length() {
         let result = raw_ecdsa_to_der(&[0u8; 48]);
         assert!(result.is_err());
+    }
+    #[test]
+    fn raw_ecdsa_conversion_preserves_a_real_signature() {
+        use signature::{Signer, Verifier};
+        let key = crate::demo_ecdsa_p256_key();
+        let message = b"PKCS11 encoding regression";
+        let signature: p256::ecdsa::Signature = key.sign(message);
+        let der = raw_ecdsa_to_der(signature.to_bytes().as_ref()).unwrap();
+        let decoded = p256::ecdsa::Signature::from_der(&der).unwrap();
+        assert_eq!(signature, decoded);
+        key.verifying_key().verify(message, &decoded).unwrap();
     }
 }

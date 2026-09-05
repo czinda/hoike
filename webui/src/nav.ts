@@ -10,13 +10,13 @@ export interface NavItem {
 }
 
 export const NAV_ITEMS: NavItem[] = [
-  { path: '/', label: 'Dashboard', access: 'public', end: true },
-  { path: '/bundles', label: 'Bundles', access: 'public' },
-  { path: '/cas', label: 'CAs', access: 'public' },
+  { path: '/', label: 'Dashboard', access: { minRole: 'viewer' }, end: true },
+  { path: '/bundles', label: 'Bundles', access: { minRole: 'viewer' } },
+  { path: '/cas', label: 'CAs', access: { minRole: 'viewer' } },
   { path: '/signing', label: 'Signing', access: { minRole: 'operator' } },
-  { path: '/query', label: 'Query', access: 'public' },
-  { path: '/gossip', label: 'Gossip', access: 'public' },
-  { path: '/config', label: 'Config', access: 'public' },
+  { path: '/query', label: 'Query', access: { minRole: 'viewer' } },
+  { path: '/gossip', label: 'Gossip', access: { minRole: 'viewer' } },
+  { path: '/config', label: 'Config', access: { minRole: 'viewer' } },
 ];
 
 const ROLE_RANK: Record<Role, number> = {

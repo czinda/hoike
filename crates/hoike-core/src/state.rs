@@ -14,10 +14,13 @@ use ahu::Bundle;
 /// verification, since seal trust-anchor enforcement is optional.
 pub const MAX_EPOCH_JUMP: u64 = 10_000;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedState {
     high_water_marks: HashMap<String, u64>,
     manifest_digests: HashMap<String, String>,
+    /// Immutable bundle snapshots committed with the rollback marks.
+    #[serde(default)]
+    active_bundles: HashMap<String, PathBuf>,
 }
 
 impl PersistedState {
@@ -26,9 +29,11 @@ impl PersistedState {
     }
 }
 
+#[derive(Clone)]
 pub struct StateStore {
     path: PathBuf,
     state: PersistedState,
+    staged: bool,
 }
 
 impl StateStore {
@@ -62,6 +67,7 @@ impl StateStore {
         Ok(StateStore {
             path: path.to_path_buf(),
             state,
+            staged: false,
         })
     }
 
@@ -89,17 +95,84 @@ impl StateStore {
         epoch: u64,
         manifest_digest: [u8; 32],
     ) -> Result<()> {
+        let mut next = self.clone();
         let key = PersistedState::make_key(producer_id, issuer_key_hash_hex);
-        let current = self.state.high_water_marks.get(&key).copied().unwrap_or(0);
-        if epoch > current {
-            self.state.high_water_marks.insert(key.clone(), epoch);
-            self.state
+        let current = next.state.high_water_marks.get(&key).copied();
+        if current.is_none_or(|current| epoch > current) {
+            next.state.high_water_marks.insert(key.clone(), epoch);
+            next.state
                 .manifest_digests
                 .insert(key, hex::encode(manifest_digest));
-            self.persist()
-        } else {
-            Ok(())
+            if !self.staged {
+                next.persist()?;
+            }
+            self.state = next.state;
         }
+        Ok(())
+    }
+
+    pub(crate) fn transaction(&self) -> Self {
+        let mut candidate = self.clone();
+        candidate.staged = true;
+        candidate.state.active_bundles.clear();
+        candidate
+    }
+
+    pub(crate) fn commit(&mut self, candidate: Self) -> Result<()> {
+        candidate.persist()?;
+        self.state = candidate.state;
+        // Only collect after the new descriptor is durable. In-flight requests
+        // hold heap bundles; an unlinked prior snapshot cannot change their data.
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("generations");
+        if let Ok(files) = std::fs::read_dir(&dir) {
+            for file in files.flatten() {
+                let path = file.path();
+                let generated = path.extension().is_some_and(|ext| ext == "ahu")
+                    && path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+                if generated
+                    && !self
+                        .state
+                        .active_bundles
+                        .values()
+                        .any(|active| active == &path)
+                {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        tracing::warn!(%error, "could not remove obsolete generation snapshot");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn active_bundles(&self) -> &HashMap<String, PathBuf> {
+        &self.state.active_bundles
+    }
+
+    /// Persist immutable content before the descriptor that references it.
+    pub(crate) fn snapshot(&mut self, label: &str, bundle: &Bundle) -> Result<()> {
+        let bytes = bundle.to_bytes()?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("generations");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{digest}.ahu"));
+        // Existing blobs are verified, never trusted solely by their filename.
+        if !path.exists() || std::fs::read(&path)? != bytes {
+            Self::write_atomic(&path, &bytes)?;
+        }
+        self.state.active_bundles.insert(label.to_owned(), path);
+        Ok(())
     }
 
     pub fn check_rollback(&self, bundle: &Bundle) -> Result<()> {
@@ -150,7 +223,10 @@ impl StateStore {
             for scope in &bundle.manifest.ca_scopes {
                 let ikh = hex::encode(&scope.issuer_key_hash);
                 if let Some(recorded) = self.get_manifest_digest(producer_id, &ikh) {
-                    if *prev_digest != recorded {
+                    let digest: [u8; 32] = Sha256::digest(&bundle.manifest_bytes).into();
+                    let identical = self.get_high_water(producer_id, &ikh) == Some(scope.epoch)
+                        && digest == recorded;
+                    if !identical && *prev_digest != recorded {
                         return Err(CoreError::ForkDetected {
                             scope: format!("{}:{}", producer_id, &ikh[..16.min(ikh.len())]),
                         });
@@ -162,57 +238,53 @@ impl StateStore {
     }
 
     pub fn advance_from_bundle(&mut self, bundle: &Bundle) -> Result<()> {
-        let producer_id = bundle.manifest.producer_id.clone();
-        let manifest_digest: [u8; 32] = Sha256::digest(&bundle.manifest_bytes).into();
-
+        let mut candidate = self.clone();
+        candidate.staged = true;
+        let digest: [u8; 32] = Sha256::digest(&bundle.manifest_bytes).into();
         for scope in &bundle.manifest.ca_scopes {
-            let ikh = hex::encode(&scope.issuer_key_hash);
-            self.advance(&producer_id, &ikh, scope.epoch, manifest_digest)?;
+            candidate.advance(
+                &bundle.manifest.producer_id,
+                &hex::encode(&scope.issuer_key_hash),
+                scope.epoch,
+                digest,
+            )?;
         }
+        if !self.staged {
+            candidate.persist()?;
+        }
+        self.state = candidate.state;
         Ok(())
     }
 
     fn persist(&self) -> Result<()> {
-        use std::io::Write;
-
-        let json = serde_json::to_string_pretty(&self.state)
+        let json = serde_json::to_vec_pretty(&self.state)
             .map_err(|e| CoreError::StateStore(format!("failed to serialize state: {e}")))?;
+        Self::write_atomic(&self.path, &json)
+    }
 
-        let tmp_path = self.path.with_extension("tmp");
-
-        // Write to temp file and fsync before rename — high-water marks
-        // must survive a power cut (spec §6.3).
-        let file = std::fs::File::create(&tmp_path).map_err(|e| {
-            CoreError::StateStore(format!(
-                "failed to create temp state file {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-        let mut writer = std::io::BufWriter::new(file);
-        writer
-            .write_all(json.as_bytes())
-            .map_err(|e| CoreError::StateStore(format!("failed to write state: {e}")))?;
-        let file = writer
-            .into_inner()
-            .map_err(|e| CoreError::StateStore(format!("failed to flush state: {e}")))?;
-        file.sync_all()
-            .map_err(|e| CoreError::StateStore(format!("failed to fsync state file: {e}")))?;
-
-        std::fs::rename(&tmp_path, &self.path).map_err(|e| {
-            CoreError::StateStore(format!(
-                "failed to rename {} → {}: {e}",
-                tmp_path.display(),
-                self.path.display()
-            ))
-        })?;
-
-        // fsync parent directory to ensure the rename is durable.
-        if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+    fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-
-        Ok(())
+        result
     }
 }

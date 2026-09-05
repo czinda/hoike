@@ -1,4 +1,4 @@
-use der::Decode;
+use der::{Decode, DecodePem};
 use tracing::{error, info, warn};
 use x509_cert::Certificate;
 
@@ -11,8 +11,16 @@ pub enum RotationStatus {
     Expired,
 }
 
+pub fn parse_certificate(bytes: &[u8]) -> der::Result<Certificate> {
+    if bytes.starts_with(b"-----BEGIN") {
+        Certificate::from_pem(bytes)
+    } else {
+        Certificate::from_der(bytes)
+    }
+}
+
 pub fn check_rotation_needed(cert_der: &[u8], renew_before_secs: u64) -> Result<RotationStatus> {
-    let cert = Certificate::from_der(cert_der)
+    let cert = parse_certificate(cert_der)
         .map_err(|e| SignError::Config(format!("failed to parse responder certificate: {e}")))?;
 
     let not_after = cert.tbs_certificate.validity.not_after;
@@ -103,7 +111,7 @@ pub fn run_rotation_command(ca_label: &str, command: &str) -> std::result::Resul
 
 pub fn format_cert_info(cert_der: &[u8]) -> std::result::Result<CertInfo, String> {
     let cert =
-        Certificate::from_der(cert_der).map_err(|e| format!("failed to parse certificate: {e}"))?;
+        parse_certificate(cert_der).map_err(|e| format!("failed to parse certificate: {e}"))?;
 
     let tbs = &cert.tbs_certificate;
 
@@ -257,5 +265,30 @@ mod tests {
             matches!(status, RotationStatus::RenewSoon { .. }),
             "cert within huge threshold should be RenewSoon, got {status:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn pem_and_der_have_identical_rotation_status_and_invalid_cert_fails() {
+        let key = crate::SealKey::EcdsaP256(crate::demo_ecdsa_p256_key());
+        let cert = crate::generate_seal_cert_for_key(&key).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&cert);
+        let lines = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n");
+        assert_eq!(
+            check_rotation_needed(&cert, u64::MAX).unwrap(),
+            check_rotation_needed(pem.as_bytes(), u64::MAX).unwrap()
+        );
+        assert!(check_rotation_needed(b"broken", 3600).is_err());
     }
 }

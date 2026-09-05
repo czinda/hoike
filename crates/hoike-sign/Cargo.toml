@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 ahu = { path = "../ahu" }
+hoike-core = { path = "../hoike-core" }
 
 # Use der 0.7 ecosystem to match x509-ocsp 0.2.1
 der = { version = "0.7", features = ["alloc", "derive", "std", "oid"] }
@@ -31,8 +32,20 @@ ml-dsa = { workspace = true }
 # PKCS#11 (optional — requires vendor C library at link time)
 cryptoki = { version = "0.12", optional = true }
 
-# LDAP syncrepl (optional — for Dogtag 389 DS source)
-ldap3 = { version = "0.12", optional = true }
+# LDAP syncrepl (optional — for Dogtag 389 DS source).
+# default-features off: the default `tls` feature is native-tls, which
+# `compile_error!`s when combined with `tls-rustls`. We keep the whole build on
+# one crypto provider (aws-lc-rs, matching hoike-server's `tls` feature) and
+# re-add `sync` explicitly (it provides the blocking `LdapConn`).
+ldap3 = { version = "0.12", default-features = false, features = [
+    "sync",
+    "tls-rustls-aws-lc-rs",
+], optional = true }
+
+# rustls ClientConfig for LDAPS/StartTLS with a custom CA (FTP_ITC.1). Only
+# needed on the dogtag-sync path; gated with it below.
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 
 # CMS seal (uses der 0.8 ecosystem — separate from OCSP's der 0.7)
 cms = { version = "0.3.0-pre.2", features = ["std"] }
@@ -47,11 +60,14 @@ uuid = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 base64 = { workspace = true }
+serde_json = { workspace = true }
+num-bigint = "0.4"
+aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips", "alloc"] }
 
 [features]
 default = []
 pkcs11 = ["dep:cryptoki"]
-dogtag-sync = ["dep:ldap3"]
+dogtag-sync = ["dep:ldap3", "dep:rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 tempfile = "3"

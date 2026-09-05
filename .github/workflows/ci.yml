@@ -69,6 +69,17 @@ jobs:
         run: |
           cargo test --workspace --locked 2>&1 | tee test-output.txt
           exit ${PIPESTATUS[0]}
+      - name: Security feature regressions (stable)
+        if: matrix.toolchain == 'stable'
+        run: cargo test --workspace --locked --features tls,metrics,pkcs11,dogtag-sync
+      - name: Runtime-independent ahu profile (stable)
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo check -p ahu --no-default-features --lib --locked
+          cargo test -p ahu --no-default-features --locked
+      - name: Release-mode malformed bundle regression (stable)
+        if: matrix.toolchain == 'stable'
+        run: cargo test -p ahu --release --locked --test integration overflowing_entry_offsets_never_panic_in_heap_or_mmap
       - name: Test summary
         if: always()
         run: |

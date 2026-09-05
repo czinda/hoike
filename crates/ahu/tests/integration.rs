@@ -271,3 +271,27 @@ fn dual_certid_alias_survives_sort() {
     let r3 = bundle.lookup(&key_between).expect("normal entry not found");
     assert_eq!(r3, b"other-response");
 }
+
+#[test]
+fn overflowing_entry_offsets_never_panic_in_heap_or_mmap() {
+    let original = build_test_bundle(1);
+    for (offset, length) in [(u64::MAX, 2), (u64::MAX - 2, u32::MAX), (100_000, 0)] {
+        let mut bundle = ahu::Bundle::from_bytes(&original).unwrap();
+        bundle.index[0].data_offset = offset;
+        bundle.index[0].data_length = length;
+        let key = bundle.index[0].entry_key;
+        assert!(bundle.entry_at(0).is_none());
+        assert!(bundle.entry_bytes(&bundle.index[0]).is_none());
+        let mut index = Vec::new();
+        bundle.index[0].write_to(&mut index).unwrap();
+        use sha2::{Digest, Sha256};
+        bundle.manifest.integrity.index_digest = Sha256::digest(&index).into();
+        bundle.manifest_bytes = bundle.manifest.to_cbor();
+        assert!(ahu::verify_structure(&bundle).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.ahu");
+        std::fs::write(&path, bundle.to_bytes().unwrap()).unwrap();
+        let mapped = ahu::MmapBundle::open(&path).unwrap();
+        assert!(mapped.lookup(&key).is_none());
+    }
+}

@@ -39,6 +39,13 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace"] }
 hyper = "1"
 
+# TLS (server-side management/trusted channels). aws-lc-rs provider for FIPS
+# alignment (NIAP PPCA / TLS Functional Package). The OCSP data plane stays
+# plaintext — these deps are gated behind the `tls` feature of each crate.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
 # Config
 toml = "0.8"
 

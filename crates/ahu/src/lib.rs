@@ -4,6 +4,7 @@ pub mod header;
 pub mod index;
 pub mod manifest;
 pub mod mmap_bundle;
+pub mod ops;
 pub mod seal;
 pub mod verify;
 
@@ -19,6 +20,7 @@ pub use manifest::{
     Manifest, ResponderId, ResponderIdType, Shard, Window,
 };
 pub use mmap_bundle::MmapBundle;
+pub use ops::{ApplyResult, DeltaStat, DiffResult, EntryRef, apply, diff};
 #[cfg(feature = "seal-verify")]
-pub use seal::{SealVerification, verify_seal};
+pub use seal::{SealVerification, verify_seal, verify_seal_with_anchors, verify_seal_with_pins};
 pub use verify::{VerifyResult, check_epochs, manifest_digest, verify_structure};

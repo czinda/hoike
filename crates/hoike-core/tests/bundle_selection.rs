@@ -100,6 +100,7 @@ state_db = "{dir}/state"
         issuer_name_hash: vec![0xAA; 32],
         issuer_key_hash: vec![0xBB; 32],
         serial_number: vec![0x22],
+        hash_alg_oid: "2.16.840.1.101.3.4.2.1".to_string(),
     };
 
     if state.lookup(&cert_id_22, &[]).is_some() {
@@ -112,6 +113,7 @@ state_db = "{dir}/state"
         issuer_name_hash: vec![0xAA; 32],
         issuer_key_hash: vec![0xBB; 32],
         serial_number: vec![0x11],
+        hash_alg_oid: "2.16.840.1.101.3.4.2.1".to_string(),
     };
 
     // epoch=10 bundle should be loaded, which has key 0x22 but not 0x11

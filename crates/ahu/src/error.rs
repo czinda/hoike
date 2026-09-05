@@ -73,6 +73,9 @@ pub enum AhuError {
 
     #[error("bundle write error: {0}")]
     Write(String),
+
+    #[error("invalid bundle operation: {0}")]
+    InvalidOperation(String),
 }
 
 pub type Result<T> = std::result::Result<T, AhuError>;
