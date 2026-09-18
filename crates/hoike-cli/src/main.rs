@@ -1107,6 +1107,25 @@ fn check_trusted_channels(config: &hoike_core::Config) {
         }
     }
 
+    // archive_cutoff_secs is only effective when the source supplies each
+    // certificate's notAfter — that is 389 DS syncrepl. On a CRL-backed CA it is
+    // a silent no-op (CRLs carry no per-certificate expiry), so warn rather than
+    // let an operator believe pruning is happening.
+    for ca in &config.ca {
+        if ca.archive_cutoff_secs > 0
+            && !matches!(
+                &ca.source,
+                Some(hoike_core::config::SourceConfig::DogtagSync { .. })
+            )
+        {
+            eprintln!(
+                "    WARNING: CA '{}' sets archive_cutoff_secs={} but its source provides no \
+                 per-certificate notAfter (only 389 DS syncrepl does) — pruning has no effect.",
+                ca.label, ca.archive_cutoff_secs
+            );
+        }
+    }
+
     // Gossip message authentication (FPT_ITT.1).
     if let Some(g) = &config.gossip {
         if g.enabled {

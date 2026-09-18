@@ -15,11 +15,16 @@ pub enum CertificateStatus {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StatusSnapshot {
     pub entries: BTreeMap<SerialBytes, CertificateStatus>,
     pub this_update: u64,
     pub next_update: Option<u64>,
+    /// Optional per-serial certificate expiry (`notAfter`, seconds since epoch).
+    /// Only sources that carry certificate validity — the 389 DS syncrepl
+    /// source — populate this; CRL sources leave it empty. Consumed by
+    /// `archive_cutoff_secs` pruning, which never drops a serial absent here.
+    pub not_after: BTreeMap<SerialBytes, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +82,7 @@ mod tests {
             entries: BTreeMap::new(),
             this_update: 10,
             next_update: Some(20),
+            ..Default::default()
         };
         assert_eq!(s.validate_at(10).unwrap(), 20);
         assert!(s.validate_at(9).is_err());

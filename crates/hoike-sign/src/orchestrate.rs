@@ -211,6 +211,7 @@ pub fn sign_ca_scope(
             "partial" => ahu::Completeness::Partial,
             other => return Err(format!("unknown completeness: {other}")),
         },
+        archive_cutoff_secs: ca_config.archive_cutoff_secs,
         ..Default::default()
     };
 

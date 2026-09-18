@@ -255,6 +255,9 @@ impl RevocationSource for CrlSource {
             entries,
             this_update,
             next_update,
+            // CRLs carry no per-certificate notAfter, so archive_cutoff pruning
+            // is a no-op for this source.
+            not_after: std::collections::BTreeMap::new(),
         };
         snapshot.validate_at(crate::source::unix_now()?)?;
         Ok(snapshot)

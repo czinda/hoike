@@ -23,6 +23,11 @@ pub struct GenerationConfig {
     pub jitter_secs: u64,
     pub certid_compat: CertIdCompat,
     pub completeness: Completeness,
+    /// Prune entries for certificates that expired more than this many seconds
+    /// ago. 0 disables pruning. Only effective when the source supplies each
+    /// certificate's `notAfter` (389 DS syncrepl); a no-op for CRL sources,
+    /// which carry no per-certificate expiry.
+    pub archive_cutoff_secs: u64,
     /// Number of SingleResponse elements per signed BasicOCSPResponse.
     /// 1 = one signature per certificate (default).
     /// >1 = batch N certificates under one signature, amortizing signature cost.
@@ -61,6 +66,7 @@ impl Default for GenerationConfig {
             jitter_secs: 7200,
             certid_compat: CertIdCompat::Dual,
             completeness: Completeness::Partial,
+            archive_cutoff_secs: 0,
             bucket_size: 1,
         }
     }
@@ -489,6 +495,19 @@ fn prepare_entries(
 ) -> Result<Vec<PreparedEntry>> {
     let mut prepared = Vec::with_capacity(snapshot.entries.len());
     for (serial, status) in &snapshot.entries {
+        // archive_cutoff: drop long-expired certificates so the bundle does not
+        // grow without bound. Only entries with a KNOWN notAfter are eligible —
+        // an entry whose expiry is unknown (every CRL-sourced entry) is never
+        // pruned, so a still-revoked certificate can never silently degrade to
+        // "unknown". This makes the feature a safe no-op for CRL sources.
+        if config.archive_cutoff_secs > 0 {
+            if let Some(&not_after) = snapshot.not_after.get(serial) {
+                if not_after.saturating_add(config.archive_cutoff_secs) < snapshot.this_update {
+                    continue;
+                }
+            }
+        }
+
         let cert_status = match status {
             CertificateStatus::Good => CertStatus::good(),
             CertificateStatus::Revoked {
@@ -731,6 +750,7 @@ mod tests {
             entries,
             this_update: crate::source::unix_now().unwrap(),
             next_update: Some(crate::source::unix_now().unwrap() + 86400),
+            ..Default::default()
         }
     }
 
@@ -768,6 +788,78 @@ mod tests {
         assert!(result.data_digest_ok);
         assert!(result.sort_order_ok);
         assert_eq!(bundle.manifest.entry_count, 3);
+    }
+
+    #[test]
+    fn archive_cutoff_prunes_only_known_expired_entries() {
+        let ca = test_ca();
+        let now = crate::source::unix_now().unwrap();
+        let mut entries = BTreeMap::new();
+        entries.insert(vec![42u8], CertificateStatus::Good); // long expired -> pruned
+        entries.insert(vec![100u8], CertificateStatus::Good); // no notAfter -> kept
+        entries.insert(vec![0x01, 0x00], CertificateStatus::Good); // recently expired -> kept
+        let mut not_after = BTreeMap::new();
+        not_after.insert(vec![42u8], now - 100_000);
+        not_after.insert(vec![0x01, 0x00], now); // within the cutoff window
+        let snapshot = StatusSnapshot {
+            entries,
+            this_update: now,
+            next_update: Some(now + 86400),
+            not_after,
+        };
+        let config = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only, // one index entry per certificate
+            archive_cutoff_secs: 10,
+            ..Default::default()
+        };
+        let mut key = test_signing_key();
+
+        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &config,
+            &mut key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+            None,
+        )
+        .unwrap();
+
+        let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
+        // Serial 42 (expired 100_000s ago, cutoff 10s) is dropped; the unknown-expiry
+        // entry and the recently-expired entry both survive.
+        assert_eq!(bundle.manifest.entry_count, 2);
+    }
+
+    #[test]
+    fn archive_cutoff_disabled_keeps_all_entries() {
+        let ca = test_ca();
+        let now = crate::source::unix_now().unwrap();
+        let mut entries = BTreeMap::new();
+        entries.insert(vec![42u8], CertificateStatus::Good);
+        let mut not_after = BTreeMap::new();
+        not_after.insert(vec![42u8], now - 100_000);
+        let snapshot = StatusSnapshot {
+            entries,
+            this_update: now,
+            next_update: Some(now + 86400),
+            not_after,
+        };
+        let config = GenerationConfig {
+            certid_compat: CertIdCompat::Sha256Only, // one index entry per certificate
+            ..Default::default()                     // archive_cutoff_secs = 0
+        };
+        let mut key = test_signing_key();
+        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &config,
+            &mut key,
+            |m| Ok(Sha256::digest(m).to_vec()),
+            None,
+        )
+        .unwrap();
+        let bundle = ahu::Bundle::from_bytes(&bundle_bytes).unwrap();
+        assert_eq!(bundle.manifest.entry_count, 1);
     }
 
     #[test]
@@ -861,6 +953,7 @@ mod tests {
             entries,
             this_update: crate::source::unix_now().unwrap(),
             next_update: Some(crate::source::unix_now().unwrap() + 86400),
+            ..Default::default()
         }
     }
 
