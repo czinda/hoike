@@ -411,7 +411,11 @@ fn ocsp_success_response(result: &LookupResult) -> Response {
     let validity_secs = window
         .next_update_min
         .saturating_sub(window.this_update_min);
-    let max_age = (validity_secs / 2).min(window.next_update_min.saturating_sub(now));
+    // Advertise a configurable fraction of the validity window (CaConfig
+    // max_age_fraction, default 0.5), never exceeding the time actually left
+    // until nextUpdate.
+    let scaled = (validity_secs as f64 * result.max_age_fraction) as u64;
+    let max_age = scaled.min(window.next_update_min.saturating_sub(now));
 
     let cache_control = format!("max-age={max_age}, public, no-transform, must-revalidate");
 
