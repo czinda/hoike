@@ -64,6 +64,7 @@ fn build_conformance_bundle() -> Vec<u8> {
         entries,
         this_update: current_time() - 1,
         next_update: Some(current_time() + 86400),
+        ..Default::default()
     };
 
     let config = GenerationConfig {
@@ -73,6 +74,7 @@ fn build_conformance_bundle() -> Vec<u8> {
         jitter_secs: 7200,
         certid_compat: CertIdCompat::Sha256Only,
         completeness: ahu::Completeness::AuthoritativeComplete,
+        archive_cutoff_secs: 0,
         bucket_size: 1,
     };
 

@@ -87,7 +87,14 @@ pub struct DogtagSyncConfig {
 impl DogtagSyncConfig {
     /// Attributes to request from 389 DS.
     fn attrs() -> Vec<&'static str> {
-        vec!["cn", "serialno", "certStatus", "revokedOn", "revReason"]
+        vec![
+            "cn",
+            "serialno",
+            "certStatus",
+            "revokedOn",
+            "revReason",
+            "notAfter",
+        ]
     }
 }
 
@@ -181,6 +188,10 @@ struct StoredRecord {
     revoked: Option<(u64, Option<u32>)>,
     #[serde(default)]
     excluded: bool,
+    /// Certificate `notAfter` as a Unix timestamp, when the directory supplies it.
+    /// Feeds `archive_cutoff_secs` pruning; `None` leaves the entry un-prunable.
+    #[serde(default)]
+    not_after: Option<u64>,
 }
 impl StoredRecord {
     fn status(&self) -> CertificateStatus {
@@ -440,6 +451,12 @@ impl RevocationSource for DogtagSyncSource {
     fn snapshot(&self, ca: &CaIdentity) -> Result<StatusSnapshot> {
         let state = self.refresh(ca)?;
         let now = crate::source::unix_now()?;
+        let not_after = state
+            .records
+            .values()
+            .filter(|r| !r.excluded)
+            .filter_map(|r| r.not_after.map(|ts| (r.serial.clone(), ts)))
+            .collect();
         Ok(StatusSnapshot {
             entries: state
                 .records
@@ -452,6 +469,7 @@ impl RevocationSource for DogtagSyncSource {
                 now.checked_add(86400)
                     .ok_or_else(|| SignError::Config("source clock overflow".into()))?,
             ),
+            not_after,
         })
     }
     fn changes_since(&self, ca: &CaIdentity, _since: Epoch) -> Result<Vec<StatusChange>> {
@@ -505,6 +523,9 @@ fn parse_cert_entry(entry: &SearchEntry) -> Result<Option<StoredRecord>> {
         .ok_or_else(|| SignError::Config("missing or invalid certificate serial".into()))?;
     let status =
         attr("certStatus").ok_or_else(|| SignError::Config("missing certificate status".into()))?;
+    // notAfter is best-effort: an unparsable or absent value leaves the entry
+    // un-prunable rather than failing the whole refresh.
+    let not_after = attr("notAfter").and_then(parse_generalized_time);
     let revoked = match status {
         "VALID" => None,
         "INVALID" | "EXPIRED" => {
@@ -512,6 +533,7 @@ fn parse_cert_entry(entry: &SearchEntry) -> Result<Option<StoredRecord>> {
                 serial,
                 revoked: None,
                 excluded: true,
+                not_after,
             }));
         }
         "REVOKED" | "REVOKED_EXPIRED" => {
@@ -535,7 +557,46 @@ fn parse_cert_entry(entry: &SearchEntry) -> Result<Option<StoredRecord>> {
         serial,
         revoked,
         excluded: false,
+        not_after,
     }))
+}
+
+/// Parse a Dogtag `notAfter` LDAP value into a Unix timestamp.
+///
+/// 389 DS stores the value either as GeneralizedTime (`YYYYMMDDHHMMSS[Z]`) or,
+/// in some Dogtag builds, as epoch milliseconds. Both are accepted; anything
+/// else yields `None` so the entry stays un-prunable rather than failing sync.
+fn parse_generalized_time(s: &str) -> Option<u64> {
+    let s = s.trim();
+    // Epoch-milliseconds form (all digits, 13+ chars) — same encoding as revokedOn.
+    // 13 digits is ~2001 onward; 14 digits is reserved for GeneralizedTime below.
+    if s.len() >= 13 && s.len() != 14 && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse::<u64>().ok().map(|ms| ms / 1000);
+    }
+    // GeneralizedTime: YYYYMMDDHHMMSS with an optional trailing 'Z'.
+    let digits = s.strip_suffix('Z').unwrap_or(s);
+    if digits.len() != 14 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let num = |a: usize, b: usize| digits[a..b].parse::<i64>().ok();
+    let year = num(0, 4)?;
+    let month = num(4, 6)?;
+    let day = num(6, 8)?;
+    let hour = num(8, 10)?;
+    let min = num(10, 12)?;
+    let sec = num(12, 14)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days from the Unix epoch to the civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as i64;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    u64::try_from(secs).ok()
 }
 
 /// Parse a hex serial like `0x2a` or `2a` into bytes.
@@ -645,6 +706,27 @@ mod tests {
     fn parse_hex_serial_with_prefix() {
         assert_eq!(parse_hex_serial("0x2a"), Some(vec![0x2a]));
         assert_eq!(parse_hex_serial("0X2A"), Some(vec![0x2a]));
+    }
+
+    #[test]
+    fn parse_generalized_time_forms() {
+        // GeneralizedTime with and without the trailing Z. 2001-09-09T01:46:40Z.
+        assert_eq!(
+            parse_generalized_time("20010909014640Z"),
+            Some(1_000_000_000)
+        );
+        assert_eq!(
+            parse_generalized_time("20010909014640"),
+            Some(1_000_000_000)
+        );
+        // Epoch-milliseconds form (same encoding Dogtag uses for revokedOn).
+        assert_eq!(parse_generalized_time("1000000000000"), Some(1_000_000_000));
+        // The Unix epoch itself.
+        assert_eq!(parse_generalized_time("19700101000000Z"), Some(0));
+        // Malformed values are rejected so the entry stays un-prunable.
+        assert_eq!(parse_generalized_time("not-a-time"), None);
+        assert_eq!(parse_generalized_time("20011301000000Z"), None); // month 13
+        assert_eq!(parse_generalized_time("2001090901"), None); // too short
     }
 
     #[test]
@@ -763,6 +845,7 @@ mod tests {
                     serial: vec![42],
                     revoked: Some((1, Some(1))),
                     excluded: false,
+                    not_after: None,
                 },
             )]
             .into(),
@@ -787,6 +870,7 @@ mod tests {
             serial: vec![n],
             revoked: None,
             excluded: false,
+            not_after: None,
         };
         let mut initial = Checkpoint::default();
         initial.records.insert(hex::encode([1; 16]), record(1));

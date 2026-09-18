@@ -36,6 +36,7 @@ fn test_snapshot(count: usize) -> StatusSnapshot {
         entries,
         this_update: now,
         next_update: Some(now + 86400),
+        ..Default::default()
     }
 }
 

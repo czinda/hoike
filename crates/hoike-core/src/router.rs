@@ -25,6 +25,9 @@ pub struct ScopeEntry {
     pub nonce_policy: String,
     pub completeness: String,
     pub forward_to: Option<String>,
+    /// Fraction of the validity window advertised as HTTP `max-age` for this
+    /// scope's responses (from `CaConfig.max_age_fraction`).
+    pub max_age_fraction: f64,
 }
 
 /// The loaded working set: bundles indexed by CA scope for routing.
@@ -41,6 +44,7 @@ pub struct LookupResult {
     pub ca_label: String,
     pub nonce_policy: String,
     pub forward_to: Option<String>,
+    pub max_age_fraction: f64,
 }
 
 /// Per-bundle scope detail for diagnostic/admin views. Unlike `scope_info`,
@@ -92,6 +96,7 @@ impl ResponderState {
                         "ignore",
                         "authoritative-complete",
                         None,
+                        0.5,
                         &mut entries,
                     );
                     state_store.commit(candidate)?;
@@ -166,6 +171,7 @@ impl ResponderState {
                 ca_label: entry.ca_label.clone(),
                 nonce_policy: entry.nonce_policy.clone(),
                 forward_to: entry.forward_to.clone(),
+                max_age_fraction: entry.max_age_fraction,
             };
 
         match hits.len() {
@@ -352,6 +358,7 @@ fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Re
             "ignore",
             "authoritative-complete",
             None,
+            0.5,
             &mut entries,
         );
         bundles.push(Arc::new(bundle));
@@ -391,6 +398,7 @@ fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Re
                 &ca_config.nonce_policy,
                 &ca_config.completeness,
                 ca_config.forward_to.as_deref(),
+                ca_config.max_age_fraction,
                 &mut entries,
             );
         }
@@ -417,6 +425,7 @@ fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Re
     Ok(ScopeMap { entries, bundles })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_bundle_scopes(
     bundle: &Bundle,
     bundle_idx: usize,
@@ -424,6 +433,7 @@ fn register_bundle_scopes(
     nonce_policy: &str,
     completeness: &str,
     forward_to: Option<&str>,
+    max_age_fraction: f64,
     entries: &mut HashMap<ScopeKey, Vec<ScopeEntry>>,
 ) {
     for scope in &bundle.manifest.ca_scopes {
@@ -438,6 +448,7 @@ fn register_bundle_scopes(
             nonce_policy: nonce_policy.to_string(),
             completeness: completeness.to_string(),
             forward_to: forward_to.map(|s| s.to_string()),
+            max_age_fraction,
         };
 
         entries.entry(key).or_default().push(entry);

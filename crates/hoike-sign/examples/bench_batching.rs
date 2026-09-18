@@ -25,6 +25,7 @@ fn build_snapshot(n: usize) -> StatusSnapshot {
         entries,
         this_update: 1700000000,
         next_update: Some(1700086400),
+        ..Default::default()
     }
 }
 

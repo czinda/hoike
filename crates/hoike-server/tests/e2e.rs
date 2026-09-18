@@ -794,6 +794,7 @@ async fn live_nonce_signing_returns_nonce_in_response() {
         entries,
         this_update: current_time() - 1,
         next_update: Some(current_time() + 86400),
+        ..Default::default()
     };
     let config = hoike_sign::GenerationConfig {
         producer_id: "live-test".into(),

@@ -4,51 +4,41 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 0.2.x   | Yes       |
+| 0.1.x   | No — upgrade; 0.1 bundles and sync cookies are read by 0.2 with a full refresh |
 
 ## Reporting a vulnerability
 
-Report vulnerabilities via [GitHub Security Advisories](https://github.com/czinda/hoike/security/advisories/new) (preferred) or by email to the maintainer listed in [MAINTAINERS.md](MAINTAINERS.md) if that file exists, otherwise via a private GitHub issue.
+Report vulnerabilities through [GitHub Security Advisories](https://github.com/czinda/hoike/security/advisories/new). Do not open a public issue for a suspected vulnerability.
 
-Please include:
-- Description of the vulnerability
-- Steps to reproduce
-- Affected version(s)
-- Impact assessment
+Include a description, steps to reproduce, affected versions, and your assessment of impact. We acknowledge reports within 48 hours and aim to ship a fix or mitigation within 7 days for critical issues. Coordinated disclosure is appreciated; we will credit reporters in the advisory unless asked not to.
 
-We will acknowledge receipt within 48 hours and aim to provide a fix or
-mitigation within 7 days for critical issues.
+## Security model
 
-## Known security gaps
+hoike is a PKI component. Its security rests on three properties:
 
-The following are known and documented in the README's "Known limitations"
-section. They are not eligible for security advisory reports but are tracked
-for resolution:
+1. **Response integrity.** Every OCSP response carries a signature from the CA or a delegated responder, verified by relying parties. hoike cannot forge a response for a key it does not hold.
+2. **Container integrity.** Every ahu bundle carries a CMS `SignedData` seal. Edge nodes verify the seal against a configured trust policy (certificate pins or CA anchors, optionally restricted per producer and scope) before loading, and enforce monotonic epochs with persisted high-water marks so an older generation cannot be replayed.
+3. **Keyless edge.** Edge nodes hold no signing keys. Compromising an edge cannot produce a false `good`; it can only deny service or replay a still-valid generation until `nextUpdate`.
 
-- **CMS seal is a placeholder** — the bundle seal is currently a SHA-256 hash,
-  not a cryptographic CMS `SignedData` signature. OCSP responses within bundles
-  carry their own valid signatures, but the container's anti-rollback checks
-  operate on unauthenticated manifest data. A party with write access to
-  `bundle_dir` can craft a poisoned epoch.
+The signer tier holds keys and is the asset to protect. Production signing keys belong in an HSM (`signing_key.type = "pkcs11"`).
 
-- **Signing key is ephemeral** — `hoike sign` and combined mode use a hardcoded
-  seed for key generation. There is no key-loading path or HSM integration.
+## Known limitations
 
-- **Gossip messages are unsigned** — the design document (§6.3) specifies that
-  every gossip message must be signed. The current implementation uses foca's
-  postcard codec with no authentication layer.
+These are documented design boundaries, not defects, and are not eligible for advisories:
+
+- **Gossip is authenticated, not encrypted.** Generation and urgent-revocation broadcasts are Ed25519-signed and verified against named peer identities. SWIM liveness traffic (pings and acks) is not authenticated, and no gossip traffic is encrypted. Gossip is never authoritative for certificate status.
+- **Bounded seal trust profile.** Seal verification accepts exact certificate pins or certificates directly issued by a configured CA anchor. General PKIX path building, intermediates, and policy processing are not implemented.
+- **Bounded CRL profile.** Complete, direct CRLs only, signed with ECDSA P-256, RSA PKCS#1 v1.5, or ML-DSA. Delta and indirect CRLs and unknown critical extensions are rejected.
+- **Delta output is unsigned by default.** `ahu apply` produces an unsigned intermediate; use `apply_sealed` or the `--seal-key`/`--seal-cert` options to produce an installable bundle.
+- **Multi-request OCSP.** Only the first `CertID` in a multi-request `OCSPRequest` is answered.
+- **Cryptography is not FIPS-validated.** All cryptographic operations execute in Rust crates outside any validated module. HSM-produced signatures are the exception. See `docs/compliance/` and the FIPS status page on hoike.dev for the migration plan.
+- **Admin authentication is basic.** Per-account lockout, password policy, idle timeout, and operator identity in audit events are not yet implemented. Put the admin listener behind mutual TLS on a management network.
+
+## Verifying releases
+
+Releases and container images currently ship with SHA-256 checksums only. Signed artifacts are planned. Until then, build from source with `cargo build --release --locked` to obtain a binary you can attest to.
 
 ## Scope
 
-hoike is a PKI component. Its security model depends on:
-
-1. **Response integrity** — each OCSP response carries its own signature from
-   the CA or a delegated responder. This is intact and verified by relying
-   parties, not by hoike.
-
-2. **Container integrity** — the ahu bundle seal should ensure that a mirror
-   cannot forge, omit, or replay entries undetected. This is currently a
-   placeholder (see above).
-
-3. **Edge node safety** — an edge node holds no signing keys and cannot produce
-   a false `good` status. This property holds by construction.
+In scope: the `hoike` and `ahu` binaries, the six workspace crates, the web UI, and the container image. Out of scope: the issuing CA, the HSM, the directory server, and the host operating system, whose security hoike depends on but does not control.
