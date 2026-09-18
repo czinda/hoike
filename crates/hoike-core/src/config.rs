@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -11,6 +12,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct GossipConfigSection {
     #[serde(default)]
     pub enabled: bool,
@@ -44,6 +46,7 @@ fn default_gossip_node_name() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -79,6 +82,7 @@ pub struct ServerConfig {
 /// When absent, the listener does server-auth TLS only (FCS_TLSS_EXT.1) and
 /// authentication falls to the existing bcrypt/RBAC login.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Path to the server certificate chain (PEM, leaf first).
     pub cert: PathBuf,
@@ -90,11 +94,13 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WebUiConfig {
     pub static_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     #[serde(default = "default_session_ttl")]
     pub session_ttl_secs: u64,
@@ -103,6 +109,7 @@ pub struct AdminConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorConfig {
     pub name: String,
     pub password_hash: String,
@@ -118,6 +125,7 @@ fn default_operator_role() -> String {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub bundle_dir: PathBuf,
     #[serde(default = "default_state_db")]
@@ -137,6 +145,7 @@ pub struct StorageConfig {
 
 /// Optional restriction of trusted seal certificates to producer and CA scope.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SealAuthorization {
     pub producer_id: String,
     pub issuer_key_hash: String,
@@ -145,6 +154,7 @@ pub struct SealAuthorization {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CaConfig {
     pub label: String,
     pub bundle_file: Option<PathBuf>,
@@ -244,6 +254,7 @@ impl CaConfig {
 
 /// TOML-level key rotation configuration.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct KeyRotationConfigToml {
     /// Days before cert expiry to trigger rotation warning/action (default: 7).
     #[serde(default = "default_renew_before_days")]
