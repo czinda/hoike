@@ -182,6 +182,30 @@ pub struct CaConfig {
     /// OCSP response validity in seconds
     #[serde(default = "default_validity_secs")]
     pub validity_secs: u64,
+    /// Upper bound (seconds) of randomized jitter added to `nextUpdate` so a
+    /// fleet's responses do not all expire simultaneously (thundering-herd
+    /// avoidance). Bounded by the source's own nextUpdate. Default 7200.
+    #[serde(default = "default_jitter_secs")]
+    pub jitter_secs: u64,
+    /// CertID hash coverage baked into produced bundles:
+    /// `"dual"` (both SHA-256 and SHA-1, default), `"sha256"`, or `"sha1"`.
+    #[serde(default = "default_certid_compat")]
+    pub certid_compat: String,
+    /// Fraction of a response's validity window advertised as HTTP
+    /// `Cache-Control: max-age` at the edge. Must be in `(0, 1]`. Default 0.5.
+    #[serde(default = "default_max_age_fraction")]
+    pub max_age_fraction: f64,
+    /// Drop entries for certificates that expired more than this many seconds
+    /// ago, bounding bundle size. Requires per-certificate `notAfter`, which
+    /// only the 389 DS syncrepl source supplies — a no-op for CRL sources.
+    /// `0` (default) disables pruning.
+    #[serde(default)]
+    pub archive_cutoff_secs: u64,
+    /// When true (default), the signer produces an off-cycle bundle immediately
+    /// upon detecting a newly revoked certificate, instead of waiting for the
+    /// next `batch_interval`.
+    #[serde(default = "default_urgent_revocation")]
+    pub urgent_revocation: bool,
     /// DER bytes of the issuer DN (for CertID computation in signer mode).
     /// Base64-encoded in config, decoded on load.
     pub issuer_name_der_b64: Option<String>,
@@ -362,6 +386,18 @@ fn default_batch_interval() -> u64 {
 fn default_validity_secs() -> u64 {
     86400
 }
+fn default_jitter_secs() -> u64 {
+    7200
+}
+fn default_certid_compat() -> String {
+    "dual".into()
+}
+fn default_max_age_fraction() -> f64 {
+    0.5
+}
+fn default_urgent_revocation() -> bool {
+    true
+}
 
 impl Config {
     pub fn from_file(path: &std::path::Path) -> crate::error::Result<Self> {
@@ -446,6 +482,21 @@ impl Config {
                 return Err(crate::error::CoreError::Config(format!(
                     "CA '{}': nonce_policy=live is not yet supported with {} signing",
                     ca.label, ca.sig_alg
+                )));
+            }
+            let valid_certid_compat = ["dual", "sha256", "sha1"];
+            if !valid_certid_compat.contains(&ca.certid_compat.as_str()) {
+                return Err(crate::error::CoreError::Config(format!(
+                    "CA '{}' has invalid certid_compat '{}' — expected one of: {}",
+                    ca.label,
+                    ca.certid_compat,
+                    valid_certid_compat.join(", ")
+                )));
+            }
+            if !(ca.max_age_fraction > 0.0 && ca.max_age_fraction <= 1.0) {
+                return Err(crate::error::CoreError::Config(format!(
+                    "CA '{}' has invalid max_age_fraction {} — must be in the range (0, 1]",
+                    ca.label, ca.max_age_fraction
                 )));
             }
         }

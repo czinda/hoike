@@ -36,6 +36,22 @@ pub enum CertIdCompat {
     Dual,
 }
 
+impl CertIdCompat {
+    /// Parse the config/CLI string form (`dual` | `sha256` | `sha1`).
+    /// Shared by the `hoike sign` CLI and the signer orchestration so the
+    /// accepted values never drift between them.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "dual" => Ok(CertIdCompat::Dual),
+            "sha256" => Ok(CertIdCompat::Sha256Only),
+            "sha1" => Ok(CertIdCompat::Sha1Only),
+            other => Err(format!(
+                "unknown certid_compat '{other}' (expected: dual, sha256, sha1)"
+            )),
+        }
+    }
+}
+
 impl Default for GenerationConfig {
     fn default() -> Self {
         GenerationConfig {

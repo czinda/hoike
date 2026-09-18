@@ -1180,15 +1180,10 @@ fn run_sign(
         std::process::exit(1);
     }
 
-    let compat = match certid_compat.as_str() {
-        "dual" => CertIdCompat::Dual,
-        "sha256" => CertIdCompat::Sha256Only,
-        "sha1" => CertIdCompat::Sha1Only,
-        other => {
-            eprintln!("Unknown certid_compat: {other} (expected: dual, sha256, sha1)");
-            std::process::exit(1);
-        }
-    };
+    let compat = CertIdCompat::parse(&certid_compat).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
 
     let crl_data = std::fs::read(&crl_path).unwrap_or_else(|e| {
         eprintln!("Failed to read CRL from {}: {e}", crl_path.display());

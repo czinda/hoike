@@ -196,7 +196,8 @@ pub fn sign_ca_scope(
         producer_id: COMBINED_PRODUCER_ID.into(),
         epoch,
         validity_secs: ca_config.validity_secs,
-        certid_compat: crate::CertIdCompat::Dual,
+        jitter_secs: ca_config.jitter_secs,
+        certid_compat: crate::CertIdCompat::parse(&ca_config.certid_compat)?,
         completeness: match ca_config.completeness.as_str() {
             "authoritative-complete" if source.is_authoritative_complete() => {
                 ahu::Completeness::AuthoritativeComplete
