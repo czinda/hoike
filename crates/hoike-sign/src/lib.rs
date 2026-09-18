@@ -29,7 +29,8 @@ pub use ml_dsa_bridge::{
 };
 pub use orchestrate::{
     COMBINED_PRODUCER_ID, PersistentSources, SignedScope, create_persistent_sources,
-    sign_and_write_all, sign_and_write_scope, sign_ca_scope, write_bundle,
+    decode_issuer_key, revoked_serials_for_scope, sign_and_write_all, sign_and_write_scope,
+    sign_ca_scope, write_bundle,
 };
 #[cfg(feature = "pkcs11")]
 pub use pkcs11::{

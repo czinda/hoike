@@ -511,6 +511,12 @@ async fn prepare_signer_material(ca: &hoike_core::config::CaConfig) -> Result<()
     Ok(())
 }
 
+/// Off-cycle urgent-revocation poll cadence (seconds). When any CA enables
+/// `urgent_revocation`, the loop wakes at `min(batch_interval, URGENT_POLL_SECS)`
+/// and, on the wakes between full passes, checks for newly-revoked serials so a
+/// fresh revocation does not wait a whole batch interval to propagate.
+const URGENT_POLL_SECS: u64 = 300;
+
 async fn run_signer_loop(
     state: hoike_server::AppState,
     config: hoike_core::Config,
@@ -524,14 +530,61 @@ async fn run_signer_loop(
         .min()
         .unwrap_or(3600);
 
+    let any_urgent = config
+        .ca
+        .iter()
+        .any(|c| c.urgent_revocation && c.source.is_some());
+    let poll_interval = if any_urgent {
+        min_interval.min(URGENT_POLL_SECS)
+    } else {
+        min_interval
+    };
+
     info!(
         interval_secs = min_interval,
+        poll_secs = poll_interval,
+        urgent = any_urgent,
         mode = config.server.mode,
         "signer loop starting"
     );
 
+    // Seed the per-CA known-revoked sets so certificates already revoked at
+    // startup do not trigger an off-cycle pass on the first wake.
+    let mut known_revoked: std::collections::HashMap<String, std::collections::BTreeSet<Vec<u8>>> =
+        std::collections::HashMap::new();
+    if any_urgent {
+        let sources = ctx.sources.lock().await;
+        for ca in &config.ca {
+            if ca.urgent_revocation && ca.source.is_some() {
+                match hoike_sign::revoked_serials_for_scope(ca, &sources) {
+                    Ok(set) => {
+                        known_revoked.insert(ca.label.clone(), set);
+                    }
+                    Err(e) => {
+                        warn!(ca = ca.label, error = %e, "urgent-revocation seed snapshot failed")
+                    }
+                }
+            }
+        }
+    }
+
+    let mut elapsed_since_full = 0u64;
+
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(min_interval)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+        elapsed_since_full = elapsed_since_full.saturating_add(poll_interval);
+        let do_full = elapsed_since_full >= min_interval;
+
+        // Off-cycle urgent-revocation check on the wakes between full passes.
+        // A full pass covers new revocations anyway, so it is skipped there.
+        if any_urgent && !do_full {
+            urgent_revocation_pass(&state, &config, &ctx, &gossip, &mut known_revoked).await;
+            continue;
+        }
+        if !do_full {
+            continue;
+        }
+        elapsed_since_full = 0;
 
         // Serialize key rotation and generation against on-demand management.
         let sources = ctx.sources.lock().await;
@@ -604,6 +657,117 @@ async fn run_signer_loop(
                     "scheduled production failed"
                 );
                 error!(error = %e, "signer loop: production failed");
+            }
+        }
+
+        // Re-baseline the urgent-revocation sets against the state just produced,
+        // so the next off-cycle check only fires on revocations newer than this
+        // scheduled pass.
+        if any_urgent {
+            for ca in &config.ca {
+                if ca.urgent_revocation && ca.source.is_some() {
+                    if let Ok(set) = hoike_sign::revoked_serials_for_scope(ca, &sources) {
+                        known_revoked.insert(ca.label.clone(), set);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One off-cycle urgent-revocation pass: for each opted-in CA, snapshot the
+/// source, diff against the last-known revoked set, and — if new revocations
+/// appeared — produce and reload an off-cycle bundle for just that scope, then
+/// announce it (generation + explicit urgent notice) over gossip.
+async fn urgent_revocation_pass(
+    state: &hoike_server::AppState,
+    config: &hoike_core::Config,
+    ctx: &Arc<hoike_server::SignerContext>,
+    gossip: &Option<Arc<hoike_gossip::GossipNode>>,
+    known_revoked: &mut std::collections::HashMap<String, std::collections::BTreeSet<Vec<u8>>>,
+) {
+    let sources = ctx.sources.lock().await;
+    for ca in &config.ca {
+        if !(ca.urgent_revocation && ca.source.is_some()) {
+            continue;
+        }
+        let current = match hoike_sign::revoked_serials_for_scope(ca, &sources) {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(ca = ca.label, error = %e, "urgent-revocation snapshot failed");
+                continue;
+            }
+        };
+        let previous = known_revoked.entry(ca.label.clone()).or_default();
+        let new_count = current.difference(previous).count();
+        if new_count == 0 {
+            continue;
+        }
+
+        // Newly-revoked serials detected — produce an off-cycle bundle for this
+        // scope. Prepare and reload its signing material first, mirroring the
+        // scheduled path, so a bad key/cert preserves the active generation.
+        if let Err(e) = prepare_signer_material(ca).await {
+            error!(ca = ca.label, error = %e, "urgent: signing material rejected");
+            continue;
+        }
+        if let Err(e) = state.reload_live_signer(ca) {
+            error!(ca = ca.label, error = %e, "urgent: live material reload failed");
+            continue;
+        }
+
+        let gen_start = std::time::Instant::now();
+        match hoike_sign::sign_and_write_scope(config, &sources, ca) {
+            Ok(signed) => {
+                hoike_server::obs::record_signer_generation(
+                    &signed.label,
+                    gen_start.elapsed().as_secs_f64(),
+                );
+                hoike_server::obs::audit!(
+                    event = "signer_generation",
+                    ca = %signed.label,
+                    trigger = "urgent",
+                    epoch = signed.epoch,
+                    entry_count = signed.entry_count,
+                    new_revocations = new_count,
+                    "produced off-cycle bundle on new revocation"
+                );
+                // Commit the new baseline only after a successful production.
+                *previous = current;
+                if let Err(e) = state.responder.reload() {
+                    error!(ca = ca.label, error = %e, "urgent: reload failed after production");
+                } else if let Some(g) = gossip.as_ref() {
+                    hoike_server::announce_bundle_scopes(g, &signed.bytes).await;
+                    match hoike_sign::decode_issuer_key(ca) {
+                        Ok(key_bytes) => {
+                            use sha2::Digest as _;
+                            let ikh = sha2::Sha256::digest(&key_bytes).to_vec();
+                            if let Err(e) = g
+                                .announce_urgent_revocation(
+                                    hoike_sign::COMBINED_PRODUCER_ID.to_string(),
+                                    ikh,
+                                    signed.epoch,
+                                )
+                                .await
+                            {
+                                warn!(ca = ca.label, error = %e, "urgent: gossip broadcast failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(ca = ca.label, error = %e, "urgent: issuer key hash unavailable")
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                hoike_server::obs::audit!(
+                    event = "signer_generation_failed",
+                    ca = %ca.label,
+                    trigger = "urgent",
+                    error = %e,
+                    "off-cycle production failed"
+                );
+                error!(ca = ca.label, error = %e, "urgent: production failed");
             }
         }
     }

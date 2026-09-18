@@ -240,6 +240,33 @@ pub fn sign_ca_scope(
     })
 }
 
+/// Snapshot a CA scope and return the set of currently-revoked serials, without
+/// signing or writing anything. Used by the signer loop's urgent-revocation
+/// detector to diff against the previously-known revoked set between scheduled
+/// passes. Reuses the shared persistent source so a syncrepl cookie is not reset.
+pub fn revoked_serials_for_scope(
+    ca_config: &CaConfig,
+    persistent_sources: &PersistentSources,
+) -> std::result::Result<std::collections::BTreeSet<crate::source::SerialBytes>, String> {
+    let ca = CaIdentity {
+        label: ca_config.label.clone(),
+        issuer_name_der: decode_issuer_name(ca_config)?,
+        issuer_key_bytes: decode_issuer_key(ca_config)?,
+    };
+    let mut fresh_holder: Option<Box<dyn RevocationSource>> = None;
+    let source = resolve_source(ca_config, persistent_sources, &mut fresh_holder)?;
+    let snapshot = source
+        .snapshot(&ca)
+        .map_err(|e| format!("snapshot failed for {}: {e}", ca_config.label))?;
+    Ok(snapshot
+        .entries
+        .into_iter()
+        .filter_map(|(serial, status)| {
+            matches!(status, crate::CertificateStatus::Revoked { .. }).then_some(serial)
+        })
+        .collect())
+}
+
 /// Sign one CA scope by label, resolving its source, and write the resulting
 /// `.ahu` to the configured bundle directory. Used by the on-demand admin API.
 pub fn sign_and_write_scope(
@@ -796,5 +823,88 @@ bundle_file = "{}"
                 .to_string_lossy()
                 .ends_with(".tmp"))
         );
+    }
+}
+
+#[cfg(test)]
+mod urgent_tests {
+    use super::*;
+    use crate::source::{
+        CaIdentity, CertificateStatus, Epoch, RevocationSource, StatusChange, StatusSnapshot,
+    };
+
+    /// A revocation source with a fixed set of entries, for exercising the
+    /// urgent-revocation detector without a live directory or CRL.
+    struct MockSource(Vec<(Vec<u8>, CertificateStatus)>);
+    impl RevocationSource for MockSource {
+        fn snapshot(&self, _ca: &CaIdentity) -> crate::Result<StatusSnapshot> {
+            let now = crate::source::unix_now()?;
+            Ok(StatusSnapshot {
+                entries: self.0.iter().cloned().collect(),
+                this_update: now,
+                next_update: Some(now + 86400),
+                ..Default::default()
+            })
+        }
+        fn changes_since(
+            &self,
+            _ca: &CaIdentity,
+            _since: Epoch,
+        ) -> crate::Result<Vec<StatusChange>> {
+            Ok(vec![])
+        }
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+        fn is_authoritative_complete(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn revoked_serials_for_scope_returns_only_revoked() {
+        // issuer_name_der_b64 = base64("name"), issuer_key_bytes_b64 = base64("key")
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            r#"
+[server]
+[storage]
+bundle_dir = "{}/bundles"
+[[ca]]
+label = "test"
+issuer_name_der_b64 = "bmFtZQ=="
+issuer_key_bytes_b64 = "a2V5"
+"#,
+            dir.path().display()
+        );
+        let config_path = dir.path().join("hoike.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        let config = Config::from_file(&config_path).unwrap();
+
+        let source = MockSource(vec![
+            (vec![0x01], CertificateStatus::Good),
+            (
+                vec![0x02],
+                CertificateStatus::Revoked {
+                    revocation_time: 1_700_000_000,
+                    reason: None,
+                },
+            ),
+            (
+                vec![0x03],
+                CertificateStatus::Revoked {
+                    revocation_time: 1_700_000_100,
+                    reason: None,
+                },
+            ),
+        ]);
+        let mut sources = PersistentSources::new();
+        sources.insert("test".to_string(), Box::new(source));
+
+        let revoked = revoked_serials_for_scope(&config.ca[0], &sources).unwrap();
+        assert_eq!(revoked.len(), 2);
+        assert!(revoked.contains(&vec![0x02]));
+        assert!(revoked.contains(&vec![0x03]));
+        assert!(!revoked.contains(&vec![0x01]));
     }
 }
