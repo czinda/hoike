@@ -1,0 +1,15 @@
+[server]
+mode = "edge"
+listen = "127.0.0.1:12560"
+max_request = 8192
+
+[storage]
+bundle_dir = "/Users/czinda/git/hoike/demo/bundles"
+state_db = "/Users/czinda/git/hoike/demo/test-state"
+max_chain = 24
+
+[[ca]]
+label = "demo-ca"
+bundle_file = "/Users/czinda/git/hoike/demo/bundles/test-ecdsa-epoch1.ahu"
+nonce_policy = "ignore"
+completeness = "partial"

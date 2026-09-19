@@ -1,0 +1,13 @@
+{
+  "high_water_marks": {
+    "hoike-cli:942ed9ca26d9c8eb999581fe28c44ecb809bddccf21e4153e05a02711aa324b5": 1,
+    "hoike-cli:a716e7f080596621e28f1b7c1ebc3093fff73934": 1
+  },
+  "manifest_digests": {
+    "hoike-cli:942ed9ca26d9c8eb999581fe28c44ecb809bddccf21e4153e05a02711aa324b5": "f3dde5a2802774a7c1c1f631f18f884e9d8d3a6c9c9ae0ee0e5a0de6e470a8c0",
+    "hoike-cli:a716e7f080596621e28f1b7c1ebc3093fff73934": "f3dde5a2802774a7c1c1f631f18f884e9d8d3a6c9c9ae0ee0e5a0de6e470a8c0"
+  },
+  "active_bundles": {
+    "demo-ca": "/Users/czinda/git/hoike/demo/test-state/generations/efeca076eb4bcc729a7a8f4710c5f0f77ec2e6f662c2ec125fec3d594b9beddd.ahu"
+  }
+}

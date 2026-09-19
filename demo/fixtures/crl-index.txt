@@ -1,0 +1,1 @@
+R	270918140823Z	260918140823Z,keyCompromise	0A	unknown	/CN=demo-cert-REVOKED/O=hoike Demo/C=US

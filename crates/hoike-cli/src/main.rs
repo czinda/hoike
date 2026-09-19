@@ -923,6 +923,21 @@ fn run_query(
                                 println!("  Signature:   {sig_len} bytes");
                                 let resp_count = basic.tbs_response_data.responses.len();
                                 println!("  Responses:   {resp_count}");
+
+                                // Print cert status for each single response
+                                for (idx, single_resp) in basic.tbs_response_data.responses.iter().enumerate() {
+                                    print!("    [{idx}] ");
+                                    match &single_resp.cert_status {
+                                        x509_ocsp::CertStatus::Good(_) => println!("Status: GOOD"),
+                                        x509_ocsp::CertStatus::Revoked(info) => {
+                                            println!("Status: REVOKED");
+                                            if let Some(reason) = &info.revocation_reason {
+                                                println!("        Reason: {:?}", reason);
+                                            }
+                                        }
+                                        x509_ocsp::CertStatus::Unknown(_) => println!("Status: UNKNOWN"),
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!("  Failed to parse BasicOcspResponse: {e}");

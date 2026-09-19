@@ -1,0 +1,7 @@
+# Known-good certificate serials (hex, one per line)
+# Used by hoike sign --good-serials to produce authoritative-complete bundles
+01
+02
+03
+04
+05

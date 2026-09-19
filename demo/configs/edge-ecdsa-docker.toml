@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Edge configuration for Docker Compose (ECDSA bundle)
+
+[server]
+mode = "edge"
+listen = "0.0.0.0:2560"
+max_request = 8192
+
+[storage]
+bundle_dir = "/demo/bundles"
+state_db = "/demo/state-ecdsa"
+max_chain = 24
+# Permissive seal admission for demo; production should set seal_signer_pins
+
+[[ca]]
+label = "demo-ca"
+bundle_file = "/demo/bundles/demo-ecdsa-epoch1.ahu"
+nonce_policy = "ignore"
+completeness = "partial"

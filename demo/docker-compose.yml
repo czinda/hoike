@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# hoike Executive Showcase — Docker Compose orchestration
+#
+# Services:
+#   - fixture-gen: Generates test CA, certs, and CRL
+#   - signer: Produces .ahu bundles (ECDSA + ML-DSA)
+#   - edge-ecdsa: Keyless edge serving ECDSA bundle
+#   - edge-mldsa: Keyless edge serving ML-DSA bundle
+#   - client: Runs queries and prints results
+#
+# Usage:
+#   docker compose up
+#   docker compose logs -f client
+
+version: '3.8'
+
+services:
+  # ── Fixture generation (runs once, exits) ──
+  fixture-gen:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+      target: builder
+    volumes:
+      - ./fixtures:/demo/fixtures
+      - ./scripts:/demo/scripts:ro
+    command: /demo/scripts/generate-fixtures.sh
+    networks:
+      - hoike-demo
+
+  # ── Signer tier (batch signing) ──
+  signer:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+      target: runtime
+    depends_on:
+      - fixture-gen
+    volumes:
+      - ./fixtures:/demo/fixtures:ro
+      - ./bundles:/demo/bundles
+    environment:
+      - RUST_LOG=info
+    command: >
+      sh -c '
+        echo "=== Signing ECDSA bundle (epoch 1) ===" &&
+        /usr/local/bin/hoike sign
+          --ca demo-ca
+          --crl /demo/fixtures/crl.pem
+          --issuer /demo/fixtures/issuer.der
+          --good-serials /demo/fixtures/good-serials.txt
+          --sig-alg ecdsa-p256
+          --demo-key
+          --epoch 1
+          -o /demo/bundles/demo-ecdsa-epoch1.ahu &&
+        echo "=== Signing ML-DSA-65 bundle (epoch 1) ===" &&
+        /usr/local/bin/hoike sign
+          --ca demo-ca
+          --crl /demo/fixtures/crl.pem
+          --issuer /demo/fixtures/issuer.der
+          --good-serials /demo/fixtures/good-serials.txt
+          --sig-alg ml-dsa-65
+          --demo-key
+          --epoch 1
+          -o /demo/bundles/demo-mldsa-epoch1.ahu &&
+        echo "=== Bundle inspection ===" &&
+        /usr/local/bin/ahu inspect /demo/bundles/demo-ecdsa-epoch1.ahu &&
+        echo "Bundles signed. Signer exiting."
+      '
+    networks:
+      - hoike-demo
+
+  # ── Keyless Edge: ECDSA bundle ──
+  edge-ecdsa:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+      target: runtime
+    depends_on:
+      - signer
+    ports:
+      - "2560:2560"
+    volumes:
+      - ./bundles:/demo/bundles:ro
+      - ./configs:/demo/configs:ro
+      - ./state-ecdsa:/demo/state-ecdsa
+    environment:
+      - RUST_LOG=info,tower_http=debug
+    command: /usr/local/bin/hoike serve --config /demo/configs/edge-ecdsa-docker.toml
+    networks:
+      - hoike-demo
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2560"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  # ── Keyless Edge: ML-DSA bundle ──
+  edge-mldsa:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+      target: runtime
+    depends_on:
+      - signer
+    ports:
+      - "2561:2561"
+    volumes:
+      - ./bundles:/demo/bundles:ro
+      - ./configs:/demo/configs:ro
+      - ./state-mldsa:/demo/state-mldsa
+    environment:
+      - RUST_LOG=info,tower_http=debug
+    command: /usr/local/bin/hoike serve --config /demo/configs/edge-mldsa-docker.toml
+    networks:
+      - hoike-demo
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2561"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  # ── Client: Query both edges ──
+  client:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+      target: runtime
+    depends_on:
+      edge-ecdsa:
+        condition: service_healthy
+      edge-mldsa:
+        condition: service_healthy
+    volumes:
+      - ./fixtures:/demo/fixtures:ro
+      - ./scripts:/demo/scripts:ro
+    command: >
+      sh -c '
+        echo "=== Demo Client: Querying hoike OCSP responders ===" &&
+        echo "" &&
+        ISSUER_NAME_B64=$$(openssl x509 -in /demo/fixtures/ca-cert.pem -outform DER | openssl asn1parse -inform DER -strparse 12 2>/dev/null | grep SEQUENCE | head -1 | awk "{print \$$NF}" | base64 -w0) &&
+        ISSUER_KEY_B64=$$(openssl x509 -in /demo/fixtures/ca-cert.pem -pubkey -noout | openssl ec -pubin -outform DER 2>/dev/null | tail -c +27 | base64 -w0) &&
+        echo "Issuer name (b64): $$ISSUER_NAME_B64" &&
+        echo "Issuer key (b64):  $$ISSUER_KEY_B64" &&
+        echo "" &&
+        echo "=== Query 1: GOOD certificate (serial 01) from ECDSA edge ===" &&
+        /usr/local/bin/hoike query
+          --url http://edge-ecdsa:2560
+          --serial 01
+          --issuer-name-b64 "$$ISSUER_NAME_B64"
+          --issuer-key-b64 "$$ISSUER_KEY_B64" &&
+        echo "" &&
+        echo "=== Query 2: REVOKED certificate (serial 0A) from ECDSA edge ===" &&
+        /usr/local/bin/hoike query
+          --url http://edge-ecdsa:2560
+          --serial 0A
+          --issuer-name-b64 "$$ISSUER_NAME_B64"
+          --issuer-key-b64 "$$ISSUER_KEY_B64" &&
+        echo "" &&
+        echo "=== Query 3: UNKNOWN certificate (serial FF) from ECDSA edge ===" &&
+        /usr/local/bin/hoike query
+          --url http://edge-ecdsa:2560
+          --serial FF
+          --issuer-name-b64 "$$ISSUER_NAME_B64"
+          --issuer-key-b64 "$$ISSUER_KEY_B64" || true &&
+        echo "" &&
+        echo "=== Query 4: GOOD certificate from ML-DSA edge with PQ preference ===" &&
+        /usr/local/bin/hoike query
+          --url http://edge-mldsa:2561
+          --serial 01
+          --issuer-name-b64 "$$ISSUER_NAME_B64"
+          --issuer-key-b64 "$$ISSUER_KEY_B64"
+          --prefer ml-dsa-65,ecdsa-p256 &&
+        echo "" &&
+        echo "=== Demo complete! ===" &&
+        echo "Notice: Edge nodes hold NO signing keys — only sealed .ahu bundles." &&
+        echo "A compromise cannot forge GOOD for a revoked certificate."
+      '
+    networks:
+      - hoike-demo
+
+networks:
+  hoike-demo:
+    driver: bridge
