@@ -1,0 +1,19 @@
+# Regenerated on every `./run.sh` — never commit (a committed CRL is the
+# "time-bomb": its thisUpdate goes stale and pre-signed responses are born
+# expired). The stable identity fixtures (CA cert/key, cert-*.pem, issuer.der,
+# good-serials.txt) ARE committed so the demo has a fixed CertID across runs.
+fixtures/crl.pem
+fixtures/crl-index.txt*
+fixtures/crl-serial.txt*
+
+# Runtime outputs
+bundles/
+state-ecdsa/
+state-mldsa/
+.issuer-name-b64
+.issuer-key-b64
+
+# Configs synthesized by run.sh (create_edge_config); the *-docker.toml and
+# test-edge.toml variants are hand-maintained and stay tracked.
+configs/edge-ecdsa.toml
+configs/edge-mldsa.toml

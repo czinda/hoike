@@ -13,9 +13,33 @@ FIXTURES_DIR="$DEMO_DIR/fixtures"
 mkdir -p "$FIXTURES_DIR"
 cd "$FIXTURES_DIR"
 
+# --crl-only: regenerate just the CRL from the existing CA/certs, leaving the CA
+# and end-entity keys untouched. run.sh calls this on every run so the CRL's
+# thisUpdate is always current — otherwise pre-signed OCSP responses inherit a
+# stale source window and hoike refuses to emit them ("generated response would
+# already be expired"). Keeping the CA stable also preserves the cached CertID
+# params (.issuer-*-b64) derived from the issuer key.
+CRL_ONLY=0
+if [[ "${1:-}" == "--crl-only" ]]; then
+    CRL_ONLY=1
+fi
+
 echo "──────────────────────────────────────────────────"
-echo "Generating test CA and fixtures for hoike demo"
+if [[ "$CRL_ONLY" == "1" ]]; then
+    echo "Refreshing CRL only (reusing existing CA and certs)"
+else
+    echo "Generating test CA and fixtures for hoike demo"
+fi
 echo "──────────────────────────────────────────────────"
+
+if [[ "$CRL_ONLY" == "1" ]]; then
+    if [[ ! -f ca-cert.pem || ! -f issuer.der || ! -f cert-0A.pem ]]; then
+        echo "ERROR: --crl-only requires an existing CA (ca-cert.pem, issuer.der, cert-0A.pem)." >&2
+        echo "       Run without --crl-only first to generate the full fixture set." >&2
+        exit 1
+    fi
+    echo "[crl-only] Reusing existing CA and certificates."
+else
 
 # ── Step 1: Generate CA private key and self-signed certificate ──
 if [[ ! -f ca-key.pem ]]; then
@@ -70,7 +94,9 @@ fi
 echo "       → cert-01.pem through cert-05.pem (good)"
 echo "       → cert-0A.pem (will be revoked)"
 
-# ── Step 4: Create CRL with revoked certificate ──
+fi  # end CA/cert generation (skipped in --crl-only mode)
+
+# ── Step 4: Create CRL with revoked certificate ── (always runs — fresh thisUpdate)
 echo "[5/6] Generating CRL with revoked certificate (serial 0A)..."
 
 # OpenSSL needs a database and serial file for CRL generation

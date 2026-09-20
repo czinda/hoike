@@ -88,9 +88,14 @@ check_prereqs() {
 generate_fixtures() {
     banner "STAGE 1: Generate Test CA and Fixtures"
 
-    if [[ -f "$FIXTURES_DIR/ca-cert.pem" && -f "$FIXTURES_DIR/crl.pem" ]]; then
-        warn "Fixtures already exist, skipping generation"
-        warn "To regenerate: rm -rf $FIXTURES_DIR"
+    # Self-refreshing: the CA and end-entity certs are long-lived and stable, so
+    # we reuse them when present. But the CRL's thisUpdate is what pre-signed OCSP
+    # responses anchor their nextUpdate to (see hoike-sign/src/generate.rs) — a
+    # stale CRL yields responses that are "born expired" and hoike refuses to sign
+    # them. So we always re-stamp the CRL with a fresh thisUpdate on every run.
+    if [[ -f "$FIXTURES_DIR/ca-cert.pem" && -f "$FIXTURES_DIR/issuer.der" && -f "$FIXTURES_DIR/cert-0A.pem" ]]; then
+        pass "Reusing existing CA and certificates"
+        "$SCRIPT_DIR/scripts/generate-fixtures.sh" --crl-only
     else
         "$SCRIPT_DIR/scripts/generate-fixtures.sh"
     fi
