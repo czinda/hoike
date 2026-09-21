@@ -4,3 +4,20 @@ target/
 *.ahu
 testdata/
 .claude/
+
+# Demo runtime artifacts — regenerated inside containers, never part of the
+# build context. The Dockerfile only copies Cargo.*, rust-toolchain.toml and
+# crates/, so none of these are needed; excluding them keeps the context small
+# and prevents host-side state from leaking into an image layer.
+demo/bundles/
+demo/state-ecdsa/
+demo/state-mldsa/
+demo/fixtures/crl.pem
+demo/fixtures/crl-index.txt*
+demo/fixtures/crl-serial.txt*
+demo/.issuer-name-b64
+demo/.issuer-key-b64
+
+# Editor / OS cruft
+.DS_Store
+*.swp

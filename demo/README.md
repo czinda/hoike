@@ -18,17 +18,56 @@ This demo shows hoike's three key differentiators in action:
 - **Rust toolchain** + **OpenSSL** (for scripted demo)
 - **curl** or **hoike query** CLI for testing
 
-## Quick Start (Docker)
+## Quick Start (Docker / Podman)
+
+**Docker Compose v2:**
 
 ```bash
 cd demo
-docker compose up
+docker compose up --build
+```
+
+**Podman — use detached mode** (`up -d`), then read the client log:
+
+```bash
+cd demo
+podman compose up -d --build
+podman compose logs client        # the four query results
 ```
 
 Watch the logs — you'll see:
-1. **Signer** tier produces `.ahu` bundles (ECDSA and ML-DSA)
-2. **Edge** nodes (keyless) load and serve them
-3. **Client** queries return `good`, `revoked`, and `unauthorized` responses
+1. **fixture-gen** generates the CA, certs, and a fresh CRL (runs once, exits)
+2. **Signer** tier produces `.ahu` bundles (ECDSA and ML-DSA), then exits
+3. **Edge** nodes (keyless) load and serve them
+4. **Client** queries return `good`, `revoked`, and `unauthorized` responses
+
+The one-shot services (`fixture-gen`, `signer`, `client`) use
+`depends_on: { condition: service_completed_successfully }` so the chain advances
+in order; the edges are gated on `service_healthy`.
+
+> **Why `-d` under Podman?** The Python `podman-compose` provider (1.6.0)
+> serializes on log attachment in *foreground* `up` and stalls on this stack's
+> diamond dependency (the client waits on **both** edges), starting only one edge.
+> Detached `up -d` hands health-condition resolution to Podman itself and starts
+> every branch reliably. Docker Compose v2 (Go) handles both modes. If you ever
+> see one edge stuck in `Created`, `podman compose up -d` (or
+> `podman start demo_edge-mldsa_1`) unblocks it.
+
+### Resetting the containerized demo
+
+Container state (the anti-rollback high-water marks and the signed bundles) lives
+in **named volumes**, never bind-mounted from the host. This is deliberate: hoike's
+anti-rollback store records *absolute* bundle paths for committed generations, so
+sharing a state directory between a host `./run.sh` run and the containers would
+poison it (host paths don't resolve inside the container) and edges would fail to
+start. To wipe all container state and start completely fresh:
+
+```bash
+podman compose down -v          # -v also removes the named volumes
+```
+
+Omit `-v` to stop the stack but keep the epoch high-water marks (a later `up` then
+reloads the same epoch, which is allowed; an *older* epoch is still rejected).
 
 ## Quick Start (Script)
 
@@ -313,12 +352,27 @@ This is a technical proof-of-concept, not a production qualification. Missing fr
 ## Docker Compose Architecture
 
 The `docker-compose.yml` orchestrates:
-- **signer** service: Runs `hoike sign` to produce bundles
+- **fixture-gen** service: Runs `generate-fixtures.sh` to produce the CA, certs, and a fresh CRL (one-shot)
+- **signer** service: Runs `hoike sign` to produce bundles (one-shot)
 - **edge-ecdsa** service: Keyless edge serving the ECDSA bundle
 - **edge-mldsa** service: Keyless edge serving the ML-DSA bundle
-- **client** service: Runs `hoike query` and prints results
+- **client** service: Runs `hoike query` and prints results (one-shot)
 
-**Key point:** The `edge-*` services do NOT have the signing keys mounted. They only see the sealed `.ahu` bundles. A `docker exec` into an edge container and `find / -name "*.p8"` returns nothing — no keys on disk, no keys in memory.
+**Key point:** The `edge-*` services do NOT have the signing keys mounted. They only see the sealed `.ahu` bundles. A `podman exec` into an edge container and `find / -name "*.p8"` returns nothing — no keys on disk, no keys in memory.
+
+**Volumes:** `fixtures/`, `scripts/`, and `configs/` are bind-mounted from the host
+(they are inputs). The signed **`bundles`** and the two **`state-*`** stores are
+**named volumes** shared only among the containers — see [Resetting the
+containerized demo](#resetting-the-containerized-demo) for why, and how to wipe them.
+
+**Client CertID extraction:** `hoike query` needs the byte-exact issuer name and
+key that the signer hashed into each CertID. The runtime image has `openssl` but
+not Python, so the client derives them with `openssl` alone: the subject Name is
+the second-to-last bare `d=2` SEQUENCE in the certificate (offset-free — extensions
+sit under a tagged `[3]` wrapper), and the key is the trailing 65-byte X9.62
+uncompressed point of the P-256 SPKI. The native `./run.sh` path instead uses
+`scripts/extract-certid-params.py` (Python `cryptography`), which is the reference
+implementation both methods are validated against.
 
 ## Troubleshooting
 
@@ -342,6 +396,22 @@ OCSP status: Unauthorized
 HTTP request failed: Connection refused
 ```
 → The edge isn't running or is bound to a different port. Check `hoike serve` logs and `server.listen` in the config.
+
+**Containerized build/up fails with `exit status 101`, or an edge exits with
+`Failed to initialize responder` / `No such file or directory`:**
+→ Poisoned anti-rollback state. This happens if a `state_db` was bind-mounted
+from the host and a native `./run.sh` wrote committed-generation pointers with
+*absolute host paths* that don't exist inside the container. The current
+`docker-compose.yml` avoids this by using **named volumes** for state, but if you
+have an older checkout or hand-edited the compose file, reset with:
+```bash
+podman compose down -v          # drop containers AND the state named volumes
+podman compose up -d --build
+```
+
+**One edge stuck in `Created` under Podman:**
+→ `podman-compose` foreground `up` can stall on the diamond dependency. Use
+`podman compose up -d` (detached), or nudge it with `podman start demo_edge-mldsa_1`.
 
 ## Next Steps
 
@@ -371,10 +441,15 @@ demo/
 │   ├── edge-ecdsa.toml       # generated by run.sh (not committed)
 │   ├── edge-mldsa.toml       # generated by run.sh (not committed)
 │   └── *-docker.toml         # committed (hand-maintained)
-├── bundles/                  # .ahu bundles written here (not committed)
-└── state-ecdsa/              # Edge anti-rollback high-water marks (not committed)
-    └── state.json
+├── bundles/                  # .ahu bundles from ./run.sh (not committed; containers use a named volume)
+└── state-ecdsa/              # Edge anti-rollback high-water marks from ./run.sh
+    └── state.json            #   (not committed; containers use the state-ecdsa named volume)
 ```
+
+> The `bundles/`, `state-ecdsa/`, and `state-mldsa/` directories are created by the
+> **native `./run.sh`** path. The **containerized** path keeps the equivalent state
+> in named volumes (`bundles`, `state-ecdsa`, `state-mldsa`) so host and container
+> runs never share — and never poison — the same anti-rollback store.
 
 ## License
 
