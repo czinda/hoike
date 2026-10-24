@@ -17,12 +17,19 @@ enum Commands {
         /// Path to the .ahu bundle file
         file: PathBuf,
     },
-    /// Verify seal, digests, sort order; optionally verify individual entries
+    /// Authenticate a bundle against explicit trust, or check structure only
+    #[command(group(clap::ArgGroup::new("mode").required(true).args(["config", "structure_only"])))]
     Verify {
         /// Path to the .ahu bundle file
         file: PathBuf,
-        /// Also verify each stored OCSP response signature
-        #[arg(long)]
+        /// Config containing seal trust and scope authorizations (no implicit discovery)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Check structure and digests only; authenticity is not checked
+        #[arg(long, conflicts_with_all = ["config", "entries"])]
+        structure_only: bool,
+        /// Also check OCSP signatures with embedded keys, not responder-chain trust
+        #[arg(long, requires = "config")]
         entries: bool,
     },
     /// Extract a single response by CertID hex
@@ -70,7 +77,12 @@ fn main() {
 
     let result = match cli.command {
         Commands::Inspect { file } => ahu_commands::inspect(&file),
-        Commands::Verify { file, entries } => ahu_commands::verify(&file, entries),
+        Commands::Verify {
+            file,
+            config,
+            structure_only,
+            entries,
+        } => ahu_commands::verify(&file, config.as_deref(), structure_only, entries),
         Commands::Extract {
             file,
             certid,

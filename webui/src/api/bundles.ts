@@ -63,6 +63,9 @@ export interface VerifyResult {
   seal_present: boolean;
   entry_count_matches: boolean;
   warnings: string[];
+  trust_status: 'authenticated' | 'failed';
+  trust_error: string | null;
+  signer_sha256: string | null;
   overall_ok: boolean;
 }
 

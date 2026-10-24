@@ -108,37 +108,68 @@ pub async fn inspect_bundle(auth: Authenticated, body: axum::body::Bytes) -> imp
     }
 }
 
-pub async fn verify_bundle(auth: Authenticated, body: axum::body::Bytes) -> impl IntoResponse {
+pub async fn verify_bundle(
+    State(state): State<AppState>,
+    auth: Authenticated,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
     if let Err(e) = auth.require_role(OperatorRole::Operator) {
         return e;
     }
-    match ahu::Bundle::from_bytes(&body) {
-        Ok(bundle) => match ahu::verify::verify_structure(&bundle) {
-            Ok(result) => Json(serde_json::json!({
-                "header_ok": result.header_ok,
-                "manifest_ok": result.manifest_ok,
-                "index_digest_ok": result.index_digest_ok,
-                "data_digest_ok": result.data_digest_ok,
-                "sort_order_ok": result.sort_order_ok,
-                "entry_bounds_ok": result.entry_bounds_ok,
-                "seal_present": result.seal_present,
-                "entry_count_matches": result.entry_count_matches,
-                "warnings": result.warnings,
-                "overall_ok": result.header_ok && result.manifest_ok && result.index_digest_ok && result.data_digest_ok && result.sort_order_ok && result.entry_bounds_ok && result.entry_count_matches,
-            }))
-            .into_response(),
-            Err(e) => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"detail": format!("verification error: {e}")})),
+    let bundle = match ahu::Bundle::from_bytes(&body) {
+        Ok(bundle) => bundle,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"detail": format!("failed to parse bundle: {e}")})),
             )
-                .into_response(),
-        },
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"detail": format!("failed to parse bundle: {e}")})),
-        )
-            .into_response(),
-    }
+                .into_response();
+        }
+    };
+    let result = match ahu::verify_structure(&bundle) {
+        Ok(result) => result,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"detail": format!("invalid bundle structure: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(now) => now.as_secs(),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"detail": format!("cannot determine verification time: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    // Verification always requires trust, even on a demo-mode server. This
+    // read-only path never installs an upload or opens the rollback state store.
+    let (trust_status, trust_error, signer_sha256) =
+        match hoike_core::admission::authenticate_bundle(&bundle, &state.admin.config.storage, now)
+        {
+            Ok(seal) => ("authenticated", None, Some(seal.signer_sha256)),
+            Err(e) => ("failed", Some(e.to_string()), None),
+        };
+    Json(serde_json::json!({
+        "header_ok": result.header_ok,
+        "manifest_ok": result.manifest_ok,
+        "index_digest_ok": result.index_digest_ok,
+        "data_digest_ok": result.data_digest_ok,
+        "sort_order_ok": result.sort_order_ok,
+        "entry_bounds_ok": result.entry_bounds_ok,
+        "seal_present": result.seal_present,
+        "entry_count_matches": result.entry_count_matches,
+        "warnings": result.warnings,
+        "trust_status": trust_status,
+        "trust_error": trust_error,
+        "signer_sha256": signer_sha256,
+        "overall_ok": trust_status == "authenticated" && result.header_ok && result.manifest_ok && result.index_digest_ok && result.data_digest_ok && result.sort_order_ok && result.entry_bounds_ok && result.entry_count_matches,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]

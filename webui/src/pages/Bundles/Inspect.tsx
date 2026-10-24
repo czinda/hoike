@@ -81,10 +81,10 @@ export default function BundleInspect() {
                 <DescriptionListDescription>{result.index_records}</DescriptionListDescription>
               </DescriptionListGroup>
               <DescriptionListGroup>
-                <DescriptionListTerm>Seal Present</DescriptionListTerm>
+                <DescriptionListTerm>Seal</DescriptionListTerm>
                 <DescriptionListDescription>
-                  <Label color={result.seal_present ? 'green' : 'red'}>
-                    {result.seal_present ? 'Yes' : 'No'}
+                  <Label color="grey">
+                    {result.seal_present ? 'Seal present (not verified)' : 'No seal'}
                   </Label>
                 </DescriptionListDescription>
               </DescriptionListGroup>

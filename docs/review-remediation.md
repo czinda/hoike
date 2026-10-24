@@ -52,7 +52,40 @@ Sources must provide a fresh, ordered thisUpdate/nextUpdate interval. Configured
 
 `storage.seal_trust_anchors` remains a distinct CA-anchor policy. The implemented profile accepts a configured CA itself or a signer directly issued by it, with ECDSA P-256 or ML-DSA signatures. It requires CA basic constraints on anchors, applicable key usage, valid times, and only the supported extension profile. Intermediate-chain building, general policy processing, and arbitrary certificate extensions are not supported. Provision compatible dedicated seal certificates or use explicit pins; do not relabel an arbitrary signer certificate as a CA trust anchor.
 
-Configure `[[storage.seal_authorizations]]` to restrict each signer to `producer_id`, `issuer_key_hash` (hex of the manifest scope hash), and `signer_sha256` (SHA-256 of the **DER certificate**, hex). When configured, every scope needs a matching authorization; dual SHA-1/SHA-256 issuer scopes need matching entries for each hash. Without authorization entries, a trusted seal signer is allowed across configured scopes. Without anchors or pins, authenticated seal enforcement remains disabled; that mode is unsuitable when bundle input is not already trusted. A successful `ahu verify` alone does not establish your deployment's signer authorization policy.
+Configure `[[storage.seal_authorizations]]` to restrict each signer to `producer_id`, `issuer_key_hash` (hex of the manifest scope hash), and `signer_sha256` (SHA-256 of the **DER certificate**, hex). When configured, every scope needs a matching authorization; dual SHA-1/SHA-256 issuer scopes need matching entries for each hash. Without authorization entries, a trusted seal signer is allowed across configured scopes. Normal admission requires anchors or pins. Only explicit `storage.allow_unauthenticated_bundles = true` with no trust or authorization configuration enables unauthenticated demo admission; configured trust failures never fall back to that mode.
+
+### Read-only verification (October audit F01)
+
+Migrate bare `ahu verify FILE` invocations to one of these explicit modes:
+
+- `ahu verify FILE --config PATH [--entries]` authenticates the seal with the
+  supplied trust/profile and producer/CA authorization policy. Missing trust,
+  corrupt seals, expired seal certificates, and unauthorized scopes fail.
+- `ahu verify FILE --structure-only` checks structure and digests, and prints
+  `Structure valid; authenticity not checked.` This mode conflicts with
+  `--config` and `--entries`; no configuration is discovered implicitly.
+
+`--entries` uses embedded responder keys, not general responder-chain PKIX
+validation. Successful responses without certificates fail as incomplete;
+protocol-defined unsigned errors are counted separately. Authenticated success
+states `Installation eligibility not checked.` Freshness and rollback eligibility
+remain installation checks.
+
+The admin verify route uses the running configuration, preserving structural
+fields and adding `trust_status`, `trust_error`, and `signer_sha256`. Structurally
+valid but untrusted input returns HTTP 200 with `trust_status: "failed"` and
+`overall_ok: false`; malformed input returns HTTP 400. Inspection reports only
+seal presence. `hoike check` uses the same admission policy without opening or
+writing rollback state or installing snapshots; demo admission is explicitly
+reported as unauthenticated.
+
+Entry-point regressions: CLI `verify_rejects_corrupt_or_untrusted_cms`,
+`verify_requires_an_explicit_mode`, `structure_only_never_claims_authentication`,
+`entries_rejects_unchecked_successful_responses`, and
+`check_authenticates_without_creating_or_changing_state`; admin HTTP
+`admin_verify_uses_running_trust_policy`. These cover fresh synthetic inputs,
+expired certificates, scope failures, and read-only state preservation. They do
+not qualify a deployment or extend the supported certificate profile.
 
 ### Directory checkpoints and durable state
 

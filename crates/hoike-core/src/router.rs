@@ -340,14 +340,14 @@ fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<Scope
 }
 
 fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
-    validate_nonce_config(config)?;
+    let bundle_paths = configured_bundle_paths(config)?;
 
     let mut bundles: Vec<Arc<Bundle>> = Vec::new();
     let mut entries: HashMap<ScopeKey, Vec<ScopeEntry>> = HashMap::new();
     let mut loaded_paths: HashMap<std::path::PathBuf, usize> = HashMap::new();
 
     if config.ca.is_empty() {
-        let bundle = load_single_bundle(&config.storage.bundle_dir, None, config)?;
+        let bundle = load_and_verify_bundle(&bundle_paths[0], config)?;
         state_store.check_rollback(&bundle)?;
         state_store.check_continuity(&bundle)?;
         state_store.advance_from_bundle(&bundle)?;
@@ -364,19 +364,7 @@ fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Re
         );
         bundles.push(Arc::new(bundle));
     } else {
-        for ca_config in &config.ca {
-            let bundle_path = if let Some(bf) = &ca_config.bundle_file {
-                bf.clone()
-            } else {
-                // Configured scopes must read the same per-label destination
-                // used by the signer; newest-file discovery is only for the
-                // legacy configuration with no explicit CA scopes.
-                config
-                    .storage
-                    .bundle_dir
-                    .join(format!("{}.ahu", ca_config.label))
-            };
-
+        for (ca_config, bundle_path) in config.ca.iter().zip(bundle_paths) {
             let canonical = bundle_path.canonicalize().unwrap_or(bundle_path.clone());
 
             let bundle_idx = if let Some(&idx) = loaded_paths.get(&canonical) {
@@ -464,17 +452,26 @@ fn register_bundle_scopes(
     }
 }
 
-fn load_single_bundle(
-    bundle_dir: &Path,
-    bundle_file: Option<&Path>,
-    config: &Config,
-) -> Result<Bundle> {
-    let path = if let Some(bf) = bundle_file {
-        bf.to_path_buf()
+/// Select configured bundle paths without opening or modifying rollback state.
+///
+/// Paths follow CA configuration order (and may repeat). With no explicit CAs,
+/// preserve legacy highest-epoch discovery. Both serving and read-only checks
+/// use the same selection and nonce-policy validation.
+pub fn configured_bundle_paths(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    validate_nonce_config(config)?;
+    if config.ca.is_empty() {
+        Ok(vec![find_newest_bundle(&config.storage.bundle_dir)?])
     } else {
-        find_newest_bundle(bundle_dir)?
-    };
-    load_and_verify_bundle(&path, config)
+        Ok(config
+            .ca
+            .iter()
+            .map(|ca| {
+                ca.bundle_file
+                    .clone()
+                    .unwrap_or_else(|| config.storage.bundle_dir.join(format!("{}.ahu", ca.label)))
+            })
+            .collect())
+    }
 }
 
 fn load_and_verify_bundle(path: &Path, config: &Config) -> Result<Bundle> {

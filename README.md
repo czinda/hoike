@@ -102,8 +102,11 @@ hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --sig-alg ml-dsa-65 
 # Inspect the bundle
 ahu inspect bundle.ahu
 
-# Inspect structural integrity; trusted admission also needs configured seal trust
-ahu verify bundle.ahu
+# Check structural integrity only (does not authenticate the bundle)
+ahu verify bundle.ahu --structure-only
+
+# Authenticate after provisioning seal trust in hoike.toml
+ahu verify bundle.ahu --config hoike.toml
 
 # Start the responder
 hoike serve --config hoike.toml
@@ -125,7 +128,7 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 | Command | Description |
 |---------|-------------|
 | `hoike serve --config PATH` | Start the OCSP responder |
-| `hoike check --config PATH` | Validate config, bundle, cert expiry |
+| `hoike check --config PATH` | Read-only config and bundle trust checks; report cert expiry |
 | `hoike sign --ca LABEL --crl FILE [OPTIONS]` | Produce a signed ahu bundle from a CRL |
 | `hoike import --bundle PATH [--config PATH] [--force]` | Import a bundle for enclave/air-gap deployments |
 | `hoike query --url URL --serial HEX [OPTIONS]` | Query a running OCSP responder |
@@ -149,10 +152,40 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 | Command | Description |
 |---------|-------------|
 | `ahu inspect FILE` | Display manifest, scopes, epochs, counts |
-| `ahu verify FILE [--entries]` | Verify CMS seal, digests, sort order; optionally verify each OCSP response signature |
+| `ahu verify FILE --config PATH [--entries]` | Authenticate the CMS seal and scope authorization; check structure and optionally OCSP signatures |
+| `ahu verify FILE --structure-only` | Check structure and digests without authenticating the bundle |
 | `ahu extract FILE --certid HEX` | Extract a single response by entry key |
 | `ahu diff A B` | Show differences between two generations |
 | `ahu apply BASE DELTAS... -o OUT` | Apply delta bundles to a base, producing a materialized full bundle |
+
+Verification requires an explicit mode. Bare `ahu verify FILE` fails; it does not
+discover configuration. `--structure-only` conflicts with `--config` and
+`--entries`, and prints `Structure valid; authenticity not checked.` on success.
+
+Authenticated verification requires `storage.seal_signer_pins` or
+`storage.seal_trust_anchors`. It checks the seal certificate's current validity
+and supported profile, plus any configured `seal_authorizations`. The demo
+admission flag never bypasses these checks for `ahu verify --config`.
+Successful output states `Installation eligibility not checked.`: verification
+does not establish freshness or rollback eligibility and does not install a bundle.
+
+`--entries` checks signatures using embedded responder keys, not general
+responder-chain PKIX validation. Successful OCSP responses without embedded
+certificates make the command fail as incomplete. Protocol-defined unsigned OCSP
+error responses are counted separately from verified signatures.
+
+`hoike check` checks the configured bundle candidates with the same admission
+trust policy, without creating state, changing rollback marks, or installing
+snapshots. Explicit demo mode reports `Unauthenticated demo admission; authenticity
+not checked.` It does not substitute a committed snapshot for a failing candidate.
+
+The admin `POST /api/admin/bundles/verify` route uses the running server's trust
+policy. A structurally valid but untrusted upload returns HTTP 200 with
+`overall_ok: false`, `trust_status: "failed"`, a `trust_error`, and a null
+`signer_sha256`. Authenticated results report `trust_status: "authenticated"`,
+a null `trust_error`, and the signer's DER certificate SHA-256 fingerprint.
+`overall_ok` also requires all structural checks to pass. Malformed input returns
+HTTP 400. Inspection only reports seal presence; it does not authenticate a seal.
 
 ## Configuration
 

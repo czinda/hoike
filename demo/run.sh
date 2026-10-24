@@ -139,6 +139,9 @@ sign_bundles() {
     section "Inspecting ECDSA bundle"
     "$AHU_BIN" inspect "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | head -20
 
+    section "Checking ECDSA bundle structure (unauthenticated demo)"
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" --structure-only
+
     section "Signing ML-DSA-65 bundle (epoch 1)"
     "$HOIKE_BIN" sign \
         --ca demo-ca \
@@ -151,6 +154,9 @@ sign_bundles() {
         -o "$BUNDLES_DIR/demo-mldsa-epoch1.ahu"
 
     pass "ML-DSA bundle created: $(du -h "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" | cut -f1)"
+
+    section "Checking ML-DSA bundle structure (unauthenticated demo)"
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" --structure-only
 
     section "Size comparison"
     echo "  ECDSA:  $(du -h "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | cut -f1)"
@@ -208,6 +214,9 @@ start_edge() {
     banner "STAGE 3: Start Keyless Edge Server (ECDSA)"
 
     create_edge_config
+
+    section "Read-only configuration check (unauthenticated demo)"
+    "$HOIKE_BIN" check --config "$CONFIG_DIR/edge-ecdsa.toml"
 
     section "Starting edge on http://127.0.0.1:2560"
     "$HOIKE_BIN" serve --config "$CONFIG_DIR/edge-ecdsa.toml" &
@@ -381,6 +390,7 @@ main() {
     echo "  ✓ ECDSA and ML-DSA bundles both worked (same code path)"
     echo "  ✓ Anti-rollback rejected older-epoch bundle"
     echo "  ✓ Client received good, revoked, and unauthorized responses"
+    echo "  • Demo bundle structure was checked; seal authenticity was not checked"
     echo ""
     echo -e "${CYAN}Next steps:${NC}"
     echo "  • Inspect bundles: $AHU_BIN inspect $BUNDLES_DIR/*.ahu"

@@ -1,5 +1,44 @@
 # Demo Verification Report
 
+## Current verification commands
+
+The stage output below is a historical demo record, not evidence of authenticated
+bundle admission. Current demo configurations explicitly enable
+`storage.allow_unauthenticated_bundles` for ephemeral keys. Use structural mode
+for those bundles:
+
+```bash
+ahu verify bundles/test-ecdsa-epoch1.ahu --structure-only
+ahu verify bundles/test-mldsa-epoch1.ahu --structure-only
+```
+
+Successful structural verification prints exactly:
+
+```text
+Structure valid; authenticity not checked.
+```
+
+For authenticated verification, independently provision signer certificate pins
+or supported CA anchors in the configuration, plus any scope authorizations:
+
+```bash
+ahu verify bundles/test-ecdsa-epoch1.ahu --config configs/trusted-edge.toml
+```
+
+Bare `ahu verify FILE` fails. `--structure-only` cannot be combined with `--config`
+or `--entries`. Add `--entries` to authenticated mode to check OCSP signatures
+with embedded keys; the demo sign commands below omit responder certificates,
+so their successful OCSP responses cannot pass that extra check. Unsigned OCSP
+errors are reported separately. Embedded-key checking is not responder-chain
+PKIX validation.
+
+`hoike check --config configs/edge-ecdsa.toml` is read-only and reports
+`Unauthenticated demo admission; authenticity not checked.` for the current local
+demo configuration. Authenticated verification and checks explicitly report that
+installation eligibility was not checked; they do not install bundles or advance
+rollback marks. `run.sh` now exercises the structural modes and read-only check.
+These command updates do not assert that the full demo was rerun.
+
 ## What Was Built
 
 A complete, runnable technical demonstration of hoike's architecture in `/Users/czinda/git/hoike/demo/`.
@@ -106,7 +145,8 @@ Bundle size: 3961 bytes
 
 **Evidence:** Bundle file created, size matches expected ECDSA overhead.
 
-**Verified:** ✓ CRL ingestion, OCSP response generation, CMS sealing all work.
+**Observed:** CRL ingestion and bundle production completed. This historical run
+did not authenticate the CMS seal against independently configured trust.
 
 ---
 
@@ -131,6 +171,8 @@ ahu inspect bundles/test-ecdsa-epoch1.ahu
 ```
 
 **Verified:** ✓ Dual-CertID indexing (SHA-1 + SHA-256) works. Two scopes for one CA is correct.
+
+Inspection displays parsed metadata and seal presence, not an authentication verdict.
 
 ---
 
@@ -170,7 +212,7 @@ Bundle size: 23403 bytes
 hoike serve --config demo/test-edge.toml
 ```
 
-**Logs:**
+**Historical logs (before strict seal admission):**
 ```
 INFO hoike_core::state: no existing state file — initializing fresh state
 INFO hoike_core::router: loading bundle path=/Users/czinda/git/hoike/demo/bundles/test-ecdsa-epoch1.ahu
@@ -184,6 +226,10 @@ INFO hoike: hoike OCSP responder starting listen=127.0.0.1:12560 mode="edge"
 - Edge loaded bundles ✓
 - Edge has NO `signing_key` in config ✓
 - Edge mode = "edge" (not combined) ✓
+
+The old `bundle loaded and verified` log did not prove seal authentication.
+Current normal admission requires configured pins or anchors. The explicit demo
+mode instead logs `trust="unauthenticated_demo"` and does not authenticate seals.
 
 **Verified:** ✓ Keyless edge architecture proven. The edge holds no keys and cannot sign responses.
 
@@ -239,7 +285,7 @@ Sending OCSP request to http://127.0.0.1:12560
 **What this proves:** 
 - The edge serves pre-signed responses for both good and revoked certificates ✓
 - CertID hash matching works correctly (SHA-256) ✓
-- A keyless edge cannot forge status — it only serves what the signer sealed ✓
+- The keyless edge served stored responses without a signing key ✓
 
 **Verified:** ✓ Request path works. HTTP serving works. GOOD/REVOKED responses work. Keyless architecture is intact.
 
@@ -271,7 +317,10 @@ Not executed in this verification. The `run.sh` script includes a stage that:
 ## What the Demo Proves
 
 ### 1. Keyless Edge Architecture ✓
-The edge node holds **no signing keys**. It loads sealed `.ahu` bundles and serves pre-signed responses verbatim. A compromise of the edge cannot forge a `good` status for a revoked certificate.
+The edge node holds **no signing keys** and serves stored responses verbatim.
+This demo does not establish seal trust. Authenticity requires configured bundle
+trust and relying-party OCSP signature validation; displaying a status is not
+evidence that a client validated it.
 
 ### 2. Post-Quantum Ready ✓
 ML-DSA-65 and ECDSA are both **first-class signing algorithms**. The same signer, same edge code, same bundle format. PQ is not a future migration — it's a configuration choice today.

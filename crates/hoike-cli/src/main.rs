@@ -22,7 +22,7 @@ enum Commands {
         #[arg(long, default_value = "hoike.toml")]
         config: PathBuf,
     },
-    /// Validate configuration, bundle, and connectivity
+    /// Check configuration and bundle trust without installing or changing state
     Check {
         /// Config file path
         #[arg(long, default_value = "hoike.toml")]
@@ -925,7 +925,9 @@ fn run_query(
                                 println!("  Responses:   {resp_count}");
 
                                 // Print cert status for each single response
-                                for (idx, single_resp) in basic.tbs_response_data.responses.iter().enumerate() {
+                                for (idx, single_resp) in
+                                    basic.tbs_response_data.responses.iter().enumerate()
+                                {
                                     print!("    [{idx}] ");
                                     match &single_resp.cert_status {
                                         x509_ocsp::CertStatus::Good(_) => println!("Status: GOOD"),
@@ -935,7 +937,9 @@ fn run_query(
                                                 println!("        Reason: {:?}", reason);
                                             }
                                         }
-                                        x509_ocsp::CertStatus::Unknown(_) => println!("Status: UNKNOWN"),
+                                        x509_ocsp::CertStatus::Unknown(_) => {
+                                            println!("Status: UNKNOWN")
+                                        }
                                     }
                                 }
                             }
@@ -1157,21 +1161,64 @@ fn run_check(config_path: PathBuf) {
     // CMS/signature-authenticated) and is not flagged here.
     check_trusted_channels(&config);
 
-    match hoike_core::ResponderState::load(config) {
-        Ok(state) => {
-            println!("  Bundles:   {}", state.bundle_count());
-            println!("  Scopes:    {}", state.scope_count());
-            println!("  Entries:   {}", state.total_entries());
-            for (label, epoch, completeness) in state.scope_info() {
-                println!("    [{label}] epoch={epoch} completeness={completeness}");
-            }
-            println!("\n  All checks passed.");
+    if let Err(e) = check_bundles(&config) {
+        eprintln!("  Bundle:    FAIL — {e}");
+        std::process::exit(1);
+    }
+}
+
+fn check_bundles(config: &hoike_core::Config) -> hoike_core::error::Result<()> {
+    use hoike_core::admission::{AdmissionTrust, admit_bundle};
+    use std::collections::HashSet;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| hoike_core::CoreError::Config(e.to_string()))?
+        .as_secs();
+    let mut checked = HashSet::new();
+    let mut scopes = HashSet::new();
+    let mut entries = 0;
+    let mut demo = false;
+    for path in hoike_core::router::configured_bundle_paths(config)? {
+        if !checked.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+            continue;
         }
-        Err(e) => {
-            eprintln!("  Bundle:    FAIL — {e}");
-            std::process::exit(1);
+        let bundle = ahu::Bundle::from_file(&path)?;
+        let trust = admit_bundle(&bundle, &config.storage, now)?;
+        println!("\n  Bundle:    {}", path.display());
+        match trust {
+            AdmissionTrust::Authenticated { signer_sha256 } => {
+                println!("    Seal: authenticated (signer SHA-256: {signer_sha256})");
+            }
+            AdmissionTrust::UnauthenticatedDemo => {
+                println!("    Unauthenticated demo admission; authenticity not checked.");
+                demo = true;
+            }
+        }
+        entries += bundle.manifest.entry_count;
+        for scope in &bundle.manifest.ca_scopes {
+            scopes.insert((
+                scope.issuer_name_hash.clone(),
+                scope.issuer_key_hash.clone(),
+            ));
+            println!(
+                "    Scope: {} epoch={} completeness={:?}",
+                hex::encode(&scope.issuer_key_hash),
+                scope.epoch,
+                scope.completeness,
+            );
         }
     }
+    println!("\n  Bundles:   {}", checked.len());
+    println!("  Scopes:    {}", scopes.len());
+    println!("  Entries:   {entries}");
+    if demo {
+        println!("\n  Read-only demo checks passed; bundle authenticity not checked.");
+    } else {
+        println!("\n  Read-only configuration and bundle authentication checks passed.");
+    }
+    println!("  Installation eligibility not checked.");
+    Ok(())
 }
 
 /// Validate transport-security posture for the management and inter-component

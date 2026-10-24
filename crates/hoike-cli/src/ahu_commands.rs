@@ -154,7 +154,22 @@ pub fn inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
+pub fn verify(
+    path: &Path,
+    config_path: Option<&Path>,
+    structure_only: bool,
+    verify_entries: bool,
+) -> Result<()> {
+    let config = match (config_path, structure_only, verify_entries) {
+        (Some(path), false, _) => Some(hoike_core::Config::from_file(path)?),
+        (None, true, false) => None,
+        _ => {
+            return Err(
+                "select --config PATH [--entries] or --structure-only; these modes are mutually exclusive"
+                    .into(),
+            );
+        }
+    };
     let bundle = Bundle::from_file(path)?;
 
     println!("Verifying {}...", path.display());
@@ -199,25 +214,60 @@ pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
     for warning in &result.warnings {
         println!("  WARNING: {warning}");
     }
+    if !result.entry_count_matches {
+        return Err("bundle entry count does not match index record count".into());
+    }
 
     let manifest_hash = ahu::manifest_digest(&bundle.manifest_bytes);
     println!("\n  Manifest digest: {}", hex::encode(manifest_hash));
 
+    if let Some(config) = &config {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let seal = hoike_core::admission::authenticate_bundle(&bundle, &config.storage, now)
+            .map_err(|e| format!("bundle authentication failed: {e}"))?;
+        println!("  CMS seal:         authenticated");
+        println!("  Signer SHA-256:   {}", seal.signer_sha256);
+    }
+
     if verify_entries {
+        use der::Decode;
+        use x509_ocsp::{OcspResponse, OcspResponseStatus};
+
         println!("\n── Entry signature verification ──");
+        println!("  Embedded keys only; responder-chain trust not checked.");
         let mut verified = 0usize;
         let mut failed = 0usize;
-        let mut skipped = 0usize;
+        let mut unchecked = 0usize;
+        let mut unsigned_errors = 0usize;
         let mut missing = 0usize;
         for record in &bundle.index {
             if record.is_tombstone() {
                 continue;
             }
             if let Some(entry_bytes) = bundle.entry_bytes(record) {
-                match hoike_sign::verify_ocsp_response_signature(entry_bytes) {
+                // The signature helper accepts unsigned OCSP errors. Classify
+                // them first so they are never counted as verified signatures.
+                let verification = match OcspResponse::from_der(entry_bytes) {
+                    Ok(response) if response.response_status != OcspResponseStatus::Successful => {
+                        if response.response_bytes.is_none() {
+                            unsigned_errors += 1;
+                            continue;
+                        }
+                        Err(hoike_sign::SignError::Verify(
+                            "OCSP error response must not contain responseBytes".into(),
+                        ))
+                    }
+                    Ok(_) => hoike_sign::verify_ocsp_response_signature(entry_bytes),
+                    Err(e) => Err(hoike_sign::SignError::Verify(format!(
+                        "parse OcspResponse: {e}"
+                    ))),
+                };
+                match verification {
                     Ok(()) => verified += 1,
                     Err(hoike_sign::SignError::NoCert) => {
-                        skipped += 1;
+                        unchecked += 1;
                     }
                     Err(e) => {
                         eprintln!("  FAIL: {} — {e}", hex::encode(&record.entry_key[..8]));
@@ -229,11 +279,12 @@ pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
                 missing += 1;
             }
         }
-        let total = verified + failed + skipped + missing;
+        let total = verified + failed + unchecked + unsigned_errors + missing;
         println!("  Total entries:    {total}");
         println!("  Verified:         {verified}");
-        if skipped > 0 {
-            println!("  Skipped:          {skipped} (no embedded responder cert)");
+        println!("  Unsigned errors:  {unsigned_errors} (no signature required)");
+        if unchecked > 0 {
+            println!("  Unchecked:        {unchecked} (no embedded responder cert)");
         }
         if missing > 0 {
             println!("  Missing data:     {missing}");
@@ -242,8 +293,10 @@ pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
             println!("  FAILED:           {failed}");
             return Err("entry signature verification failed".into());
         }
-        if verified == 0 && total > 0 {
-            println!("\n  WARNING: no entries had embedded certs — zero signatures verified");
+        if unchecked > 0 {
+            return Err(
+                "entry signature verification incomplete: missing responder certificates".into(),
+            );
         }
     }
 
@@ -266,7 +319,11 @@ pub fn verify(path: &Path, verify_entries: bool) -> Result<()> {
         }
     }
 
-    println!("\nVerification passed.");
+    if structure_only {
+        println!("\nStructure valid; authenticity not checked.");
+    } else {
+        println!("\nBundle authenticated. Installation eligibility not checked.");
+    }
     Ok(())
 }
 

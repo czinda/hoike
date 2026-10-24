@@ -478,11 +478,12 @@ forward_to     = "https://signer-a.pki.example:2560"
 ```
 hoike serve [--config PATH]
 hoike sign      --ca LABEL [--full|--delta]     # signer tier: produce a generation
-hoike check     --config PATH                   # validate config, HSM, sources
+hoike check     --config PATH                   # read-only config and bundle trust checks
 hoike query     URL --cert FILE --issuer FILE   # diagnostic client
 
 ahu inspect  FILE                  # manifest, scopes, epochs, counts
-ahu verify   FILE [--entries]      # seal, digests, sort order, optional per-entry
+ahu verify   FILE --config PATH [--entries]  # authenticate seal/scope; optional embedded-key checks
+ahu verify   FILE --structure-only          # structure/digests; authenticity not checked
 ahu extract  FILE --certid HEX     # pull one response out
 ahu diff     A B                   # what changed between generations
 ahu apply    BASE DELTA... -o OUT  # materialize a working set offline
