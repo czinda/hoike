@@ -132,8 +132,7 @@ pub struct StorageConfig {
     pub state_db: PathBuf,
     #[serde(default = "default_max_chain")]
     pub max_chain: u32,
-    /// DER or PEM certificates trusted as seal signers.
-    /// When set, bundles without a valid CMS seal are rejected on load.
+    /// DER or PEM CA certificates for the bounded direct-issuer seal profile.
     #[serde(default)]
     pub seal_trust_anchors: Option<Vec<PathBuf>>,
     #[serde(default)]
@@ -141,6 +140,10 @@ pub struct StorageConfig {
     /// Explicitly trusted signer certificates, distinct from CA trust anchors.
     #[serde(default)]
     pub seal_signer_pins: Vec<PathBuf>,
+    /// Permit structure-only demo admission when no seal trust or scope
+    /// authorizations are configured. Never bypasses configured trust checks.
+    #[serde(default)]
+    pub allow_unauthenticated_bundles: bool,
 }
 
 /// Optional restriction of trusted seal certificates to producer and CA scope.

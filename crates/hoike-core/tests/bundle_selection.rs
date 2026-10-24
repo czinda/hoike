@@ -78,6 +78,8 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+# Mocked seals exercise epoch selection, not authenticated admission.
+allow_unauthenticated_bundles = true
 "#,
         dir = dir.path().display(),
     );

@@ -150,7 +150,11 @@ hoike sign \
 - Entry count (matching the good + revoked certificate count)
 - Epoch number (1 — this is generation 1 for this CA)
 
-**Why the seal matters:** The seal proves this specific producer assembled this specific set at this epoch. A mirror loading it will verify the seal before serving any responses.
+**Why the seal matters:** With configured trust, the seal authenticates the
+producer and binds the bundle contents to its epoch. This demo uses ephemeral
+keys and explicitly opts into unauthenticated admission. For authenticated
+serving, provision signer certificate pins or CA anchors as shown in the
+[configuration guide](../README.md#configuration).
 
 ### Stage 3: Bundle Signing (Post-Quantum)
 
@@ -185,6 +189,7 @@ listen = "127.0.0.1:2560"
 bundle_dir = "demo/bundles"
 state_db = "demo/state-ecdsa"
 max_chain = 24
+allow_unauthenticated_bundles = true # Demo only; no seal trust is provisioned
 
 [[ca]]
 label = "demo-ca"
@@ -199,13 +204,13 @@ hoike serve --config edge-ecdsa.toml
 ```
 
 **What happens:**
-1. Edge loads the bundle and verifies the CMS seal
+1. Edge checks bundle structure and digests, then logs unauthenticated demo admission
 2. Builds an in-memory index (mmap + binary search)
 3. Starts HTTP listener on port 2560
 4. Serves pre-signed responses verbatim — no parsing, no re-encoding, no signing
 
 **What to look for:**
-- Log line: `bundle loaded: epoch=1, entries=N`
+- Audit warning: `UNAUTHENTICATED DEMO bundle admitted; CMS seal not verified`
 - Log line: `hoike OCSP responder starting` (mode=edge)
 - **No signing key mentioned** — the edge holds none
 
@@ -344,6 +349,7 @@ Anti-rollback: REJECTED — epoch 0 <= high-water mark 1
 This is a technical proof-of-concept, not a production qualification. Missing from this demo:
 
 - **PKCS#11 HSM signing** — The signer uses `--demo-key` (ephemeral software keys). Production should use `signing_key.type = "pkcs11"` with a hardware security module.
+- **Authenticated bundle admission** — Demo configs explicitly set `allow_unauthenticated_bundles = true` with empty trust lists. Production requires independently provisioned signer pins or CA anchors.
 - **Real CA integration** — Fixtures are OpenSSL-generated. Production reads from Dogtag PKI, Red Hat Certificate System, or 389 DS syncrepl.
 - **TLS** — The demo runs plaintext HTTP. Production should use TLS for the admin/management channel (`server.admin_tls`) and gossip over an authenticated/encrypted channel.
 - **Gossip** — Fleet membership and generation propagation are implemented but not shown in this single-node demo. Multi-node demos would show `GenerationAnnouncement` broadcasts and automatic bundle pull-on-announce.
@@ -380,7 +386,11 @@ implementation both methods are validated against.
 ```
 Failed to initialize responder: seal verification failed
 ```
-→ The edge's `seal_signer_pins` config does not match the seal certificate embedded in the bundle. For demo use, leave `seal_signer_pins` empty (permissive admission). For production, pin the exact signer certificate.
+→ Check that the seal is valid and that `seal_signer_pins` or `seal_trust_anchors`
+authorizes its signer. Normal admission rejects missing trust. The supplied demo
+configs use `allow_unauthenticated_bundles = true` with no pins, anchors, or
+authorizations. That flag never bypasses a configured trust policy or a
+verification error. For production, provision the correct trust material.
 
 **Unauthorized on a known-good serial:**
 ```

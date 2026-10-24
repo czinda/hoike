@@ -366,3 +366,13 @@ label = "test"
     );
     assert_eq!(config.ca[0].completeness, "partial");
 }
+
+#[test]
+fn unauthenticated_bundle_admission_requires_explicit_opt_in() {
+    let config = parse_config("[server]\n[storage]\nbundle_dir='bundles'\n");
+    assert!(!config.storage.allow_unauthenticated_bundles);
+    let demo = parse_config(
+        "[server]\n[storage]\nbundle_dir='bundles'\nallow_unauthenticated_bundles=true\n",
+    );
+    assert!(demo.storage.allow_unauthenticated_bundles);
+}

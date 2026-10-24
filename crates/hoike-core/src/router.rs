@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
+use crate::admission::admit_bundle;
 use crate::config::Config;
 use crate::error::{CoreError, Result};
 use crate::request::ParsedCertId;
@@ -479,119 +480,21 @@ fn load_single_bundle(
 fn load_and_verify_bundle(path: &Path, config: &Config) -> Result<Bundle> {
     info!(path = %path.display(), "loading bundle");
     let bundle = Bundle::from_file(path)?;
-
-    let result = ahu::verify_structure(&bundle)?;
-    if !result.warnings.is_empty() {
-        for w in &result.warnings {
-            warn!(warning = w, "bundle verification warning");
-        }
-    }
-
-    // CMS seal verification
-    verify_bundle_seal(&bundle, config)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| CoreError::Config(e.to_string()))?
+        .as_secs();
+    let trust = admit_bundle(&bundle, &config.storage, now)?;
 
     info!(
         entry_count = bundle.manifest.entry_count,
         producer = %bundle.manifest.producer_id,
         scopes = bundle.manifest.ca_scopes.len(),
-        "bundle loaded and verified"
+        ?trust,
+        "bundle admitted"
     );
 
     Ok(bundle)
-}
-
-fn verify_bundle_seal(bundle: &Bundle, config: &Config) -> Result<()> {
-    let has_trust_anchors = config
-        .storage
-        .seal_trust_anchors
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-
-    let has_pins = !config.storage.seal_signer_pins.is_empty();
-    if !has_trust_anchors && !has_pins && !config.storage.seal_authorizations.is_empty() {
-        return Err(CoreError::Config(
-            "seal_authorizations requires trust anchors or explicit signer pins".into(),
-        ));
-    }
-    if has_trust_anchors || has_pins {
-        if bundle.seal_bytes.is_empty() {
-            return Err(CoreError::Config(
-                "seal_trust_anchors configured but bundle has no seal".into(),
-            ));
-        }
-
-        use der::{Decode, DecodePem, Encode};
-        let read_certs = |paths: &[std::path::PathBuf]| -> Result<Vec<Vec<u8>>> {
-            let mut anchors = Vec::new();
-            for path in paths {
-                let bytes = std::fs::read(path).map_err(|e| {
-                    CoreError::Config(format!(
-                        "cannot read seal trust anchor {}: {e}",
-                        path.display()
-                    ))
-                })?;
-                let cert = if bytes.starts_with(b"-----BEGIN") {
-                    x509_cert::Certificate::from_pem(&bytes)
-                } else {
-                    x509_cert::Certificate::from_der(&bytes)
-                }
-                .map_err(|e| {
-                    CoreError::Config(format!("invalid seal trust anchor {}: {e}", path.display()))
-                })?;
-                anchors.push(
-                    cert.to_der()
-                        .map_err(|e| CoreError::Config(e.to_string()))?,
-                );
-            }
-            Ok(anchors)
-        };
-        let anchors = read_certs(config.storage.seal_trust_anchors.as_deref().unwrap_or(&[]))?;
-        let pins = read_certs(&config.storage.seal_signer_pins)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| CoreError::Config(e.to_string()))?
-            .as_secs();
-        let verification = if has_pins {
-            ahu::verify_seal_with_pins(&bundle.manifest_bytes, &bundle.seal_bytes, &pins, now)
-                .or_else(|pin_error| {
-                    if has_trust_anchors {
-                        ahu::verify_seal_with_anchors(
-                            &bundle.manifest_bytes,
-                            &bundle.seal_bytes,
-                            &anchors,
-                            now,
-                        )
-                    } else {
-                        Err(pin_error)
-                    }
-                })
-        } else {
-            ahu::verify_seal_with_anchors(&bundle.manifest_bytes, &bundle.seal_bytes, &anchors, now)
-        }
-        .map_err(|e| CoreError::Config(format!("seal verification failed: {e}")))?;
-        if !config.storage.seal_authorizations.is_empty() {
-            for scope in &bundle.manifest.ca_scopes {
-                if !config.storage.seal_authorizations.iter().any(|auth| {
-                    auth.producer_id == bundle.manifest.producer_id
-                        && auth
-                            .issuer_key_hash
-                            .eq_ignore_ascii_case(&hex::encode(&scope.issuer_key_hash))
-                        && auth
-                            .signer_sha256
-                            .eq_ignore_ascii_case(&verification.signer_sha256)
-                }) {
-                    return Err(CoreError::Config(
-                        "seal signer is not authorized for producer/CA scope".into(),
-                    ));
-                }
-            }
-        }
-        info!(signer = %verification.signer_sha256, "CMS seal authenticated against configured trust policy");
-    } else if !bundle.seal_bytes.is_empty() {
-        warn!("bundle has a CMS seal but no seal_trust_anchors configured — seal not verified");
-    }
-
-    Ok(())
 }
 
 fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {

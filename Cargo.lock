@@ -1344,6 +1344,8 @@ dependencies = [
  "der 0.7.10",
  "digest 0.11.3",
  "hex",
+ "hoike-sign",
+ "p256 0.13.2",
  "percent-encoding",
  "serde",
  "serde_json",

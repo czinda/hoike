@@ -249,6 +249,8 @@ mode = "edge"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+# Mocked seals exercise state transactions, not authenticated admission.
+allow_unauthenticated_bundles = true
 [[ca]]
 label = "a"
 bundle_file = "{dir}/a.ahu"

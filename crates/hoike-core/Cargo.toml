@@ -27,5 +27,7 @@ arc-swap = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+hoike-sign = { path = "../hoike-sign" }
+p256 = { version = "0.13", features = ["ecdsa"] }
 tempfile = "3"
 uuid = { workspace = true }

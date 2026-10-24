@@ -7,6 +7,8 @@ max_request = 8192
 bundle_dir = "/Users/czinda/git/hoike/demo/bundles"
 state_db = "/Users/czinda/git/hoike/demo/test-state"
 max_chain = 24
+# Explicit local demo; provision seal_signer_pins for authenticated admission.
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "demo-ca"

@@ -172,6 +172,7 @@ fn build_test_bundle_with_real_certids(entries: &[(u64, &[u8])]) -> Vec<u8> {
         .expect("build failed")
 }
 
+// These transport tests deliberately serve mocked response bytes and seals.
 async fn start_test_server(bundle_bytes: Vec<u8>) -> (u16, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("test.ahu");
@@ -187,6 +188,7 @@ max_request = 8192
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "test"
@@ -342,6 +344,8 @@ max_request = 8192
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+# Mocked responses and seals for routing tests.
+allow_unauthenticated_bundles = true
 {ca_blocks}
 "#,
         dir = dir.path().display(),
@@ -551,6 +555,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "bad-forward"
@@ -591,6 +596,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "bad-live"
@@ -631,6 +637,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "bad-policy"
@@ -806,15 +813,14 @@ async fn live_nonce_signing_returns_nonce_in_response() {
         ..Default::default()
     };
     let mut key = hoike_sign::demo_ecdsa_p256_key();
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
     let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
         &ca,
         &snapshot,
         &config,
         &mut key,
-        |m| {
-            use sha2_v010::Digest as _;
-            Ok(sha2_v010::Sha256::digest(m).to_vec())
-        },
+        |m| hoike_sign::create_cms_seal(m, &hoike_sign::SealKey::EcdsaP256(seal_key), &seal_cert),
         None,
     )
     .unwrap();
@@ -822,6 +828,7 @@ async fn live_nonce_signing_returns_nonce_in_response() {
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("test.ahu");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+    std::fs::write(dir.path().join("seal-signer.der"), &seal_cert).unwrap();
 
     // Config with nonce_policy = "live" in combined mode
     let config_toml = format!(
@@ -833,6 +840,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.der"]
 
 [[ca]]
 label = "live-test"
@@ -1024,6 +1032,7 @@ async fn sign_endpoint_round_trip_signs_reloads_and_advances_epoch() {
     let crl_path = dir.path().join("test.crl");
     use base64::Engine;
     use der::Decode;
+    use p256::pkcs8::EncodePrivateKey;
     let (crl_der, cert_der) = build_round_trip_crl_der();
     std::fs::write(&crl_path, crl_der).unwrap();
     std::fs::write(dir.path().join("issuer.der"), &cert_der).unwrap();
@@ -1037,6 +1046,15 @@ async fn sign_endpoint_round_trip_signs_reloads_and_advances_epoch() {
             .raw_bytes(),
     );
     let bundle_path = dir.path().join("round-trip-test.ahu");
+    // Persist distinct seal material so every signing pass uses the same pin.
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
+    std::fs::write(
+        dir.path().join("seal-key.der"),
+        seal_key.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("seal-signer.der"), seal_cert).unwrap();
 
     // `password_hash` below is a bcrypt hash of "test-password" (cost 4) — a
     // synthetic, test-only credential, never a real secret.
@@ -1057,12 +1075,15 @@ role = "operator"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.der"]
 
 [[ca]]
 label = "round-trip-test"
 issuer_name_der_b64 = "{issuer_name}"
 issuer_key_bytes_b64 = "{issuer_key}"
 bundle_file = "{bundle}"
+seal_key = "{dir}/seal-key.der"
+seal_cert = "{dir}/seal-signer.der"
 
 [ca.source]
 type = "crl"
@@ -1205,7 +1226,7 @@ async fn expired_first_ca_does_not_block_fresh_second_ca() {
     std::fs::write(dir.path().join("a.ahu"), first).unwrap();
     std::fs::write(dir.path().join("b.ahu"), second).unwrap();
     let conf = format!(
-        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n[[ca]]\nlabel='a'\nbundle_file='{0}/a.ahu'\n[[ca]]\nlabel='b'\nbundle_file='{0}/b.ahu'\n",
+        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n[[ca]]\nlabel='a'\nbundle_file='{0}/a.ahu'\n[[ca]]\nlabel='b'\nbundle_file='{0}/b.ahu'\n",
         dir.path().display()
     );
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
@@ -1241,7 +1262,7 @@ async fn cache_lifetime_is_capped_by_remaining_validity() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ahu"), bytes).unwrap();
     let conf = format!(
-        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n",
+        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n",
         dir.path().display()
     );
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
@@ -1381,13 +1402,17 @@ fn synthetic_issued_certificate(
     cert.tbs_certificate.issuer = issuer_cert.tbs_certificate.subject;
     // CMS's X.509 codec emits UTCTime for years before 2050. Sign the same
     // canonical representation that will be embedded in SignedData.
-    let validity = &mut cert.tbs_certificate.validity;
-    validity.not_before = x509_cert::time::Time::UtcTime(
-        der::asn1::UtcTime::from_unix_duration(validity.not_before.to_unix_duration()).unwrap(),
-    );
-    validity.not_after = x509_cert::time::Time::UtcTime(
-        der::asn1::UtcTime::from_unix_duration(validity.not_after.to_unix_duration()).unwrap(),
-    );
+    let now = current_time();
+    let time = |seconds| {
+        x509_cert::time::Time::UtcTime(
+            der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(seconds))
+                .unwrap(),
+        )
+    };
+    cert.tbs_certificate.validity = x509_cert::time::Validity {
+        not_before: time(now - 60),
+        not_after: time(now + 86400),
+    };
     if ca {
         cert.tbs_certificate.extensions = Some(vec![x509_cert::ext::Extension {
             extn_id: const_oid::ObjectIdentifier::new_unwrap("2.5.29.19"),
@@ -1415,6 +1440,34 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
     let anchor = synthetic_issued_certificate(&root, &root, true);
     let cert = synthetic_issued_certificate(&leaf, &root, false);
     let wrong_anchor = synthetic_issued_certificate(&wrong, &wrong, true);
+    let mut ocsp_key = p256::ecdsa::SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+    let ca = hoike_sign::CaIdentity {
+        label: "test-ca".into(),
+        issuer_name_der: "CN=Test CA,O=Hoike Test"
+            .parse::<x509_cert::name::Name>()
+            .unwrap()
+            .to_der()
+            .unwrap(),
+        issuer_key_bytes: ocsp_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+    };
+    let now = current_time();
+    let snapshot = hoike_sign::StatusSnapshot {
+        entries: [(vec![42], hoike_sign::CertificateStatus::Good)].into(),
+        this_update: now - 1,
+        next_update: Some(now + 3600),
+        ..Default::default()
+    };
+    let generation = hoike_sign::GenerationConfig {
+        producer_id: "e2e-test".into(),
+        certid_compat: hoike_sign::CertIdCompat::Sha256Only,
+        validity_secs: 3600,
+        jitter_secs: 0,
+        ..Default::default()
+    };
     for case in [
         "valid",
         "invalid-signature",
@@ -1423,21 +1476,20 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
         "wrong-scope",
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let parsed =
-            ahu::Bundle::from_bytes(&build_test_bundle_with_real_certids(&[(42, b"R")])).unwrap();
-        let mut builder = BundleBuilder::new(parsed.manifest.clone());
-        builder.add_entry(parsed.index[0].entry_key, b"R".to_vec());
         let key = hoike_sign::SealKey::EcdsaP256(if case == "invalid-signature" {
             wrong.clone()
         } else {
             leaf.clone()
         });
-        let bytes = builder
-            .build(|m| {
-                hoike_sign::create_cms_seal(m, &key, &cert)
-                    .map_err(|e| ahu::AhuError::Write(e.to_string()))
-            })
-            .unwrap();
+        let bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &generation,
+            &mut ocsp_key,
+            |m| hoike_sign::create_cms_seal(m, &key, &cert),
+            None,
+        )
+        .unwrap();
         std::fs::write(dir.path().join("test.ahu"), bytes).unwrap();
         if case != "missing-anchor" {
             std::fs::write(
@@ -1458,7 +1510,7 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
             } else {
                 "e2e-test"
             },
-            hex::encode(Sha256::digest(b"test-ca-public-key")),
+            hex::encode(Sha256::digest(&ca.issuer_key_bytes)),
             hex::encode(Sha256::digest(&cert))
         );
         let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
@@ -1489,6 +1541,10 @@ async fn check_live_signers_by_ca(default_paths: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut blocks = String::new();
     let mut identities = Vec::new();
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
+    let seal_key = hoike_sign::SealKey::EcdsaP256(seal_key);
+    std::fs::write(dir.path().join("seal-signer.der"), &seal_cert).unwrap();
     for n in 1..=2u8 {
         let key = p256::ecdsa::SigningKey::from_bytes((&[n; 32]).into()).unwrap();
         let name = format!("CA-{n}").into_bytes();
@@ -1509,9 +1565,14 @@ async fn check_live_signers_by_ca(default_paths: bool) {
             None,
         )
         .unwrap();
+        let mut bundle =
+            ahu::Bundle::from_bytes(&build_bundle_for_ca(&name, &public, &[(42, &source)]))
+                .unwrap();
+        bundle.seal_bytes =
+            hoike_sign::create_cms_seal(&bundle.manifest_bytes, &seal_key, &seal_cert).unwrap();
         std::fs::write(
             dir.path().join(format!("ca-{n}.ahu")),
-            build_bundle_for_ca(&name, &public, &[(42, &source)]),
+            bundle.to_bytes().unwrap(),
         )
         .unwrap();
         let bundle_setting = if default_paths {
@@ -1523,7 +1584,7 @@ async fn check_live_signers_by_ca(default_paths: bool) {
         identities.push((key, public, cid));
     }
     let config: hoike_core::Config = toml::from_str(&format!(
-        "[server]\nmode='combined'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n{blocks}",
+        "[server]\nmode='combined'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nseal_signer_pins=['{0}/seal-signer.der']\n{blocks}",
         dir.path().display()
     ))
     .unwrap();
@@ -1623,6 +1684,6 @@ fn missing_configured_default_bundle_never_uses_another_cas_file() {
         build_test_bundle_with_real_certids(&[(42, b"other-ca")]),
     )
     .unwrap();
-    let config:hoike_core::Config=toml::from_str(&format!("[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n[[ca]]\nlabel='missing'\n",dir.path().display())).unwrap();
+    let config:hoike_core::Config=toml::from_str(&format!("[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n[[ca]]\nlabel='missing'\n",dir.path().display())).unwrap();
     assert!(hoike_core::ResponderState::load(config).is_err());
 }

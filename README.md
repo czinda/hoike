@@ -62,7 +62,7 @@ v1.1, including the transport-hardening trusted-path/trusted-channel SFRs — se
 The **ahu** (Hawaiian: a cairn, a trail marker) format is a portable container of
 pre-signed OCSP responses. Bundles are sealed with CMS `SignedData`, designed
 for zero-copy serving via `mmap` + binary search, and verified against
-configured trust anchors on load.
+configured signer certificate pins or CA anchors on load.
 
 See [`ahu-format-spec.md`](ahu-format-spec.md) for the full specification.
 
@@ -170,6 +170,7 @@ max_request = 8192
 bundle_dir = "/var/lib/hoike/bundles"
 state_db = "/var/lib/hoike/state"
 max_chain = 24
+allow_unauthenticated_bundles = false
 # Exact signer certificate pins (PEM or DER), not SPKI hashes:
 seal_signer_pins = ["/etc/hoike/seal-signer.pem"]
 # Alternative: dedicated CA anchors for the supported direct-issuer profile.
@@ -195,6 +196,21 @@ node_name = "edge-01"
 # edge-01 = "/etc/hoike/gossip/edge-01.pub.pem"
 # edge-02 = "/etc/hoike/gossip/edge-02.pub.pem"
 ```
+
+Bundle admission requires configured seal trust by default, including startup,
+hot reload, and recovery from committed snapshots. Existing deployments with no
+trust policy must provision `seal_signer_pins` or `seal_trust_anchors` before
+upgrading. Embedded signer certificates do not establish trust by themselves.
+An empty `seal_authorizations` list leaves trusted signers unrestricted by scope;
+when configured, it must authorize every scope, including both SHA-1 and SHA-256
+scopes in dual-CertID bundles.
+
+For local demos only, set `storage.allow_unauthenticated_bundles = true` with no
+pins, anchors, or authorizations. This mode checks structure and digests but does
+not authenticate the seal. Each demo admission emits an `audit` warning with
+`trust = "unauthenticated_demo"`. Any configured trust still applies, even with
+the flag enabled: invalid seals, unreadable trust files, and unauthorized scopes
+are rejected. Authorizations without pins or anchors are also rejected.
 
 For a signer or combined process, configure the CA's signing key,
 `responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.
