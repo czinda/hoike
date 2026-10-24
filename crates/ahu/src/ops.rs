@@ -356,6 +356,14 @@ mod tests {
         Ok(Sha256::digest(m).to_vec())
     }
 
+    // Keep mutated test manifests consistent so operation-specific checks,
+    // rather than a representation mismatch, determine their outcomes.
+    fn reseal(bundle: &mut Bundle) {
+        bundle.manifest_bytes = bundle.manifest.to_cbor();
+        bundle.seal_bytes = seal(&bundle.manifest_bytes).unwrap();
+        *bundle = Bundle::from_bytes(&bundle.to_bytes().unwrap()).unwrap();
+    }
+
     fn key(byte: u8) -> [u8; 32] {
         [byte; 32]
     }
@@ -506,7 +514,11 @@ mod tests {
         let mut second = delta_from(&first, &base, 3, 2, &[], &[]);
         second.manifest.continuity.base_manifest_digest = Some([0xff; 32]);
         second.manifest.continuity.prev_manifest_digest = None;
-        assert!(apply(&base, &[first, second]).is_err());
+        reseal(&mut second);
+        assert!(matches!(
+            apply(&base, &[first, second]),
+            Err(AhuError::InvalidOperation(_))
+        ));
     }
 
     #[test]
@@ -516,6 +528,7 @@ mod tests {
         let expiry = base.manifest.window.produced_at + 10;
         delta.manifest.window.next_update_min = expiry;
         delta.manifest.window.next_update_max = expiry;
+        reseal(&mut delta);
         let output = apply(&base, &[delta]).unwrap();
         let materialized = Bundle::from_bytes(&output.bytes).unwrap();
         assert_eq!(materialized.manifest.window.next_update_max, expiry);
@@ -527,9 +540,17 @@ mod tests {
         let base = full_bundle(1, &[(1, b"one")]);
         let mut delta = delta_from(&base, &base, 2, 1, &[], &[]);
         delta.manifest.producer_id = "other".into();
-        assert!(apply(&base, &[delta]).is_err());
+        reseal(&mut delta);
+        assert!(matches!(
+            apply(&base, &[delta]),
+            Err(AhuError::InvalidOperation(_))
+        ));
         let mut delta = delta_from(&base, &base, 2, 1, &[], &[]);
         delta.manifest.ca_scopes[0].issuer_key_hash = vec![0xff; 32];
-        assert!(apply(&base, &[delta]).is_err());
+        reseal(&mut delta);
+        assert!(matches!(
+            apply(&base, &[delta]),
+            Err(AhuError::InvalidOperation(_))
+        ));
     }
 }

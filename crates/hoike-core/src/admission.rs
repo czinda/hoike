@@ -18,6 +18,9 @@ pub enum AdmissionTrust {
 
 /// Verify structure, digests, the CMS seal, and configured scope restrictions.
 ///
+/// Decoded manifest fields must match the encoded manifest used for CMS
+/// verification; structural verification binds them before policy checks.
+///
 /// Requires explicit signer pins or CA anchors, even when demo admission is
 /// enabled. Certificate validity is checked at `now` (Unix seconds). Empty scope
 /// authorizations impose no additional restriction on trusted signers.

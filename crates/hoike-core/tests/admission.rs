@@ -406,6 +406,133 @@ fn authenticated_and_demo_admission_both_verify_digests() {
     }
 }
 
+#[test]
+fn decoded_digests_cannot_authenticate_modified_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let valid = signed_bundle(&key, &cert, now, CertIdCompat::Sha256Only);
+    let mut storage = pinned_storage(dir.path(), &cert);
+    storage.allow_unauthenticated_bundles = true;
+    authenticate_bundle(&valid, &storage, now).unwrap();
+
+    for section in ["data", "index"] {
+        let mut bundle = Bundle::from_bytes(&valid.to_bytes().unwrap()).unwrap();
+        match section {
+            "data" => {
+                bundle.data[0] ^= 1;
+                bundle.manifest.integrity.data_digest = Sha256::digest(&bundle.data).into();
+            }
+            "index" => {
+                bundle.index[0].entry_key[0] ^= 1;
+                let mut index = Vec::new();
+                for record in &bundle.index {
+                    record.write_to(&mut index).unwrap();
+                }
+                bundle.manifest.integrity.index_digest = Sha256::digest(&index).into();
+            }
+            _ => unreachable!(),
+        }
+        // The attacker updates only the decoded digest, not the signed bytes.
+        assert_eq!(bundle.manifest_bytes, valid.manifest_bytes);
+        assert_eq!(bundle.seal_bytes, valid.seal_bytes);
+        let authenticated = authenticate_bundle(&bundle, &storage, now);
+        let admitted = admit_bundle(&bundle, &storage, now);
+        assert!(
+            authenticated.is_err() && admitted.is_err(),
+            "modified {section}: authenticate={authenticated:?}, admit={admitted:?}"
+        );
+    }
+}
+
+#[test]
+fn decoded_authorization_metadata_cannot_override_signed_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let valid = signed_bundle(&key, &cert, now, CertIdCompat::Sha256Only);
+    let mut storage = pinned_storage(dir.path(), &cert);
+    storage.allow_unauthenticated_bundles = true;
+
+    for field in ["producer", "scope"] {
+        let mut bundle = Bundle::from_bytes(&valid.to_bytes().unwrap()).unwrap();
+        match field {
+            "producer" => bundle.manifest.producer_id = "authorized-producer".into(),
+            "scope" => bundle.manifest.ca_scopes[0].issuer_key_hash = vec![0xEE; 32],
+            _ => unreachable!(),
+        }
+        // The policy allows only the forged identity, not the signed one.
+        storage.seal_authorizations = vec![authorization(&bundle, &cert, 0)];
+        assert!(authenticate_bundle(&valid, &storage, now).is_err());
+        assert_eq!(bundle.manifest_bytes, valid.manifest_bytes);
+        assert_eq!(bundle.seal_bytes, valid.seal_bytes);
+        let authenticated = authenticate_bundle(&bundle, &storage, now);
+        let admitted = admit_bundle(&bundle, &storage, now);
+        assert!(
+            authenticated.is_err() && admitted.is_err(),
+            "forged {field}: authenticate={authenticated:?}, admit={admitted:?}"
+        );
+    }
+}
+
+#[test]
+fn decoded_scope_removal_cannot_bypass_all_scope_authorization() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let valid = signed_bundle(&key, &cert, now, CertIdCompat::Dual);
+    let mut storage = pinned_storage(dir.path(), &cert);
+    storage.seal_authorizations = vec![authorization(&valid, &cert, 0)];
+    assert!(authenticate_bundle(&valid, &storage, now).is_err());
+
+    let mut bundle = Bundle::from_bytes(&valid.to_bytes().unwrap()).unwrap();
+    bundle.manifest.ca_scopes.truncate(1);
+    assert_eq!(bundle.manifest_bytes, valid.manifest_bytes);
+    assert_eq!(bundle.seal_bytes, valid.seal_bytes);
+    let authenticated = authenticate_bundle(&bundle, &storage, now);
+    let admitted = admit_bundle(&bundle, &storage, now);
+    assert!(
+        authenticated.is_err() && admitted.is_err(),
+        "omitted scope: authenticate={authenticated:?}, admit={admitted:?}"
+    );
+}
+
+#[test]
+fn authentication_preserves_accepted_manifest_encodings() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let mut bundle = signed_bundle(&key, &cert, now, CertIdCompat::Sha256Only);
+    let mut storage = pinned_storage(dir.path(), &cert);
+    storage.seal_authorizations = vec![authorization(&bundle, &cert, 0)];
+
+    // Encode the same ten-field CBOR map with an indefinite length. The parser
+    // already accepts this form; authentication must verify these exact bytes,
+    // not a normalized re-encoding of the manifest.
+    assert_eq!(bundle.manifest_bytes[0], 0xAA);
+    bundle.manifest_bytes[0] = 0xBF;
+    bundle.manifest_bytes.push(0xFF);
+    bundle.seal_bytes =
+        hoike_sign::create_cms_seal(&bundle.manifest_bytes, &SealKey::EcdsaP256(key), &cert)
+            .unwrap();
+    let parsed = Bundle::from_bytes(&bundle.to_bytes().unwrap()).unwrap();
+    assert_eq!(parsed.manifest, bundle.manifest);
+    assert_ne!(parsed.manifest_bytes, parsed.manifest.to_cbor());
+    assert!(
+        authenticate_bundle(&parsed, &storage, now)
+            .unwrap()
+            .signature_valid
+    );
+    assert!(matches!(
+        admit_bundle(&parsed, &storage, now),
+        Ok(AdmissionTrust::Authenticated { .. })
+    ));
+}
+
 fn responder_config(dir: &std::path::Path, explicit_ca: bool) -> Config {
     let mut config: Config = toml::from_str(&format!(
         "[server]\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n",
