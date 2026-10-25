@@ -153,7 +153,7 @@ Status legend as in the [package README](README.md#cross-pp-sfr-index).
 |-----|-------------|--------|----------|
 | **FIA_UAU.* / FIA_UID.*** | Admin I&A | **Met** | bcrypt password hashes + role (`config.rs:103-116`); `bcrypt::verify` in spawn_blocking with a constant DUMMY_HASH timing defense against user enumeration (`auth.rs:10-14,50-68`); 256-bit session tokens, 3600 s TTL (`auth.rs:128-133`, `config.rs:111-113`). Over TLS once FTP_TRP.1 configured. |
 | **FMT_SMR.* / FMT_MOF.* / FMT_SMF.1** | Roles & functions | **Met** | Ranked RBAC Administrator(3) > Operator(2) > Viewer(1) (`state.rs:49-69`), enforced by `require_role`/`has_at_least` (`rbac.rs:20-22`): read = Viewer, mutation/signing = Operator, `rotate_ca` = Administrator (`signing.rs:210`). Management surface = admin API + UI. |
-| **FMT_MTD.*** | Management of TSF data | **Met** | Bundle production/reload share the signer mutex so epoch derivation + `.ahu` writes never race (`orchestrate.rs`); `import --force` anti-rollback override for air-gap (`main.rs:18-110`). |
+| **FMT_MTD.*** | Management of TSF data | **Met** | Bundle production/reload share the signer mutex so epoch derivation + `.ahu` writes never race (`orchestrate.rs`); offline `hoike import --ca LABEL` authenticates and installs through the same admission policy, state descriptor commit, and exclusive writer lock (`install.rs`, `main.rs`). |
 
 ### 5.5 Security audit
 

@@ -107,6 +107,7 @@ impl ResponderState {
                         .ok_or(original)?;
                     let path = path.clone();
                     let mut candidate = state_store.transaction();
+                    candidate.clear_active_bundles();
                     let bundle = load_and_verify_bundle(&path, &config)?;
                     candidate.check_rollback(&bundle)?;
                     candidate.check_continuity(&bundle)?;
@@ -358,7 +359,11 @@ fn validate_nonce_config(config: &Config) -> Result<()> {
 }
 
 fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
+    // A full reload explicitly builds a replacement working set: the
+    // candidate starts from the committed snapshots of every configured
+    // label, not a merge with whatever was committed before.
     let mut candidate = state_store.transaction();
+    candidate.clear_active_bundles();
     let map = load_scope_map_candidate(config, &mut candidate)?;
     state_store.commit(candidate)?;
     Ok(map)

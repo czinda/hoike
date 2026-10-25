@@ -172,11 +172,23 @@ impl StateStore {
         Ok(())
     }
 
+    /// Stage a transaction candidate against this store (design §S5).
+    ///
+    /// A single-label installation stages into the candidate while
+    /// **preserving** other labels' committed snapshots. Callers performing
+    /// a full working-set reload must call [`Self::clear_active_bundles`]
+    /// explicitly, so the reload builds a replacement working set instead of
+    /// merging into whatever was committed before.
     pub(crate) fn transaction(&self) -> Self {
         let mut candidate = self.clone();
         candidate.staged = true;
-        candidate.state.active_bundles.clear();
         candidate
+    }
+
+    /// Drop all committed snapshot references: a full reload replaces the
+    /// whole working set rather than merging into it.
+    pub(crate) fn clear_active_bundles(&mut self) {
+        self.state.active_bundles.clear();
     }
 
     pub(crate) fn commit(&mut self, candidate: Self) -> Result<()> {
@@ -230,7 +242,7 @@ impl StateStore {
         let path = dir.join(format!("{digest}.ahu"));
         // Existing blobs are verified, never trusted solely by their filename.
         if !path.exists() || std::fs::read(&path)? != bytes {
-            Self::write_atomic(&path, &bytes)?;
+            crate::storage::write_atomic(&path, &bytes)?;
         }
         self.state.active_bundles.insert(label.to_owned(), path);
         Ok(())
@@ -320,33 +332,7 @@ impl StateStore {
     fn persist(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&self.state)
             .map_err(|e| CoreError::StateStore(format!("failed to serialize state: {e}")))?;
-        Self::write_atomic(&self.path, &json)
-    }
-
-    fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let tmp = path.with_extension(format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)?;
-            std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        crate::storage::write_atomic(&self.path, &json)
     }
 }
 

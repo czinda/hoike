@@ -305,50 +305,32 @@ pub fn sign_and_write_all(
     Ok(out)
 }
 
-/// Write bundle bytes to `{bundle_dir}/{label}.ahu`, creating the directory if
-/// needed. Returns the written path.
+/// Write bundle bytes to the configured destination for `label`, creating
+/// the directory if needed. Returns the written path. Signer and importer
+/// share the same `Config::bundle_destination` resolution and the same
+/// durable `write_atomic` publication primitive (design §S5).
 pub fn write_bundle(
     config: &Config,
     label: &str,
     bytes: &[u8],
 ) -> std::result::Result<PathBuf, String> {
     let path = config
-        .ca
-        .iter()
-        .find(|ca| ca.label == label)
-        .and_then(|ca| ca.bundle_file.clone())
-        .unwrap_or_else(|| config.storage.bundle_dir.join(format!("{label}.ahu")));
+        .bundle_destination(label)
+        .map_err(|e| e.to_string())?;
     write_bundle_atomic(&path, bytes)?;
     Ok(path)
 }
 
-/// Durable replacement: readers see either complete old or complete new bytes.
+/// Durable replacement: readers see either complete old or complete new
+/// bytes. Delegates to the consolidated `hoike-core` implementation; a
+/// directory-fsync failure after the rename surfaces as the typed
+/// `DurabilityUncertain` error text.
 pub fn write_bundle_atomic(
     path: &std::path::Path,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|e| format!("create bundle directory: {e}"))?;
-    let tmp = parent.join(format!(".hoike-{}.tmp", uuid::Uuid::now_v7()));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map_err(|e| format!("publish {}: {e}", path.display()))
+    hoike_core::storage::write_atomic(path, bytes)
+        .map_err(|e| format!("publish {}: {e}", path.display()))
 }
 
 /// Dispatch bundle production over the CA's configured signing-key source and

@@ -418,6 +418,66 @@ impl Config {
         self.server.mode == "combined"
     }
 
+    /// Resolve the configured bundle destination for a CA label (design
+    /// §S5). The selected `bundle_file` wins; otherwise use
+    /// `bundle_dir/<label>.ahu`. Never infer a destination from an uploaded
+    /// filename.
+    ///
+    /// Rejects unknown labels, legacy unscoped configuration (no `[[ca]]`
+    /// entries — there is no per-CA destination to select), unsafe label
+    /// file-name components, and a destination shared with another
+    /// configured CA label: replacing it would ambiguously serve multiple
+    /// labels from one file.
+    pub fn bundle_destination(&self, label: &str) -> crate::error::Result<std::path::PathBuf> {
+        if self.ca.is_empty() {
+            return Err(crate::error::CoreError::Config(
+                "no [[ca]] entries are configured — legacy unscoped configuration has no \
+                 per-CA bundle destination; configure a labeled CA before producing or \
+                 importing bundles"
+                    .into(),
+            ));
+        }
+        if label.is_empty() || label == "." || label == ".." || label.contains(['/', '\\']) {
+            return Err(crate::error::CoreError::Config(format!(
+                "CA label '{label}' is not a safe bundle file name"
+            )));
+        }
+        let selected = self.ca.iter().find(|ca| ca.label == label).ok_or_else(|| {
+            crate::error::CoreError::Config(format!(
+                "unknown CA label '{label}' — configured labels: {}",
+                self.ca
+                    .iter()
+                    .map(|ca| ca.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        let destination = selected
+            .bundle_file
+            .clone()
+            .unwrap_or_else(|| self.storage.bundle_dir.join(format!("{label}.ahu")));
+        let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mine = canonical(&destination);
+        for ca in &self.ca {
+            if ca.label == label {
+                continue;
+            }
+            let other = ca
+                .bundle_file
+                .clone()
+                .unwrap_or_else(|| self.storage.bundle_dir.join(format!("{}.ahu", ca.label)));
+            if canonical(&other) == mine {
+                return Err(crate::error::CoreError::Config(format!(
+                    "CA label '{label}' destination {} is also configured for CA '{}' — give \
+                     each label a distinct destination",
+                    destination.display(),
+                    ca.label
+                )));
+            }
+        }
+        Ok(destination)
+    }
+
     pub fn is_signer(&self) -> bool {
         self.server.mode == "signer"
     }

@@ -101,17 +101,18 @@ enum Commands {
         #[arg(long)]
         prefer: Option<String>,
     },
-    /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
+    /// Install an authenticated bundle into a configured CA destination
+    /// (offline; enclave/air-gap deployments)
     Import {
-        /// Path to the .ahu bundle to import
+        /// Path to the .ahu bundle to install
         #[arg(long)]
         bundle: PathBuf,
-        /// Config file (to determine bundle_dir)
+        /// Configured CA label whose destination to install into
+        #[arg(long)]
+        ca: String,
+        /// Config file (to determine the CA destination and state directory)
         #[arg(long, default_value = "hoike.toml")]
         config: PathBuf,
-        /// Skip anti-rollback check (for first import into a fresh enclave)
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -180,12 +181,8 @@ fn main() {
         } => {
             run_query(url, serial, issuer_name_b64, issuer_key_b64, prefer);
         }
-        Commands::Import {
-            bundle,
-            config,
-            force,
-        } => {
-            run_import(bundle, config, force);
+        Commands::Import { bundle, ca, config } => {
+            run_import(bundle, ca, config);
         }
     }
 }
@@ -1051,7 +1048,15 @@ fn build_preferred_sig_algs_extension(prefer_str: &str) -> Vec<u8> {
     })
 }
 
-fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
+/// Offline, recoverable authenticated installation (design §S5, audit
+/// remediation F05).
+///
+/// The source is read exactly once; everything published comes from those
+/// checked bytes. The writer guard is acquired (and validated by
+/// installation) so a running server — which holds the same exclusive lock —
+/// makes this fail promptly. There is no `--force` escape hatch and no
+/// SIGHUP suggestion: completion instructs the operator to start the server.
+fn run_import(bundle_path: PathBuf, ca_label: String, config_path: PathBuf) {
     let config = match hoike_core::Config::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1061,103 +1066,51 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     };
 
     println!("Loading bundle: {}", bundle_path.display());
-    let bundle = match ahu::Bundle::from_file(&bundle_path) {
+    let bytes = match std::fs::read(&bundle_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Failed to load bundle: {e}");
+            eprintln!("Failed to read bundle {}: {e}", bundle_path.display());
             std::process::exit(1);
         }
     };
 
-    println!("Verifying structure...");
-    match ahu::verify_structure(&bundle) {
-        Ok(result) => {
-            if !result.warnings.is_empty() {
-                for w in &result.warnings {
-                    eprintln!("  WARNING: {w}");
-                }
-            }
-            println!("  Structure:  OK");
-        }
-        Err(e) => {
-            eprintln!("  Structure:  FAIL — {e}");
-            std::process::exit(1);
-        }
-    }
-
-    if let Err(e) = hoike_core::admission::validate_serving_profile(&bundle) {
-        eprintln!("  Serving profile: FAIL — {e}");
-        eprintln!(
-            "  Materialize the bundle into a full, uncompressed bundle first (see `ahu apply`)."
-        );
-        std::process::exit(1);
-    }
-    println!("  Serving profile: OK (full, uncompressed)");
-
-    // F04: offline import mutates the deployment — hold the exclusive writer
-    // lock for the full lifetime of the import.
-    let _guard = match hoike_core::StateDirectoryLock::acquire(&config.storage.state_db) {
+    // Offline operation: hold the exclusive writer lock on the state
+    // directory for the full lifetime of the installation. A running server
+    // holds the same lock, so import fails promptly instead of racing it.
+    let guard = match hoike_core::StateDirectoryLock::acquire(&config.storage.state_db) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("  Writer lock:  FAIL — {e}");
+            eprintln!("  Import is offline: stop the writer process holding the state directory.");
             std::process::exit(1);
         }
     };
 
-    if !force {
-        let state_store =
-            match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("  Anti-rollback: FAIL — cannot open state store: {e}");
-                    std::process::exit(1);
+    println!("Authenticating and installing for CA \'{ca_label}\'...");
+    match hoike_core::install_bundle(&config, &ca_label, &bytes, &guard) {
+        Ok(result) => {
+            if let Ok(bundle) = ahu::Bundle::from_bytes(&bytes) {
+                println!("  Producer:  {}", bundle.manifest.producer_id);
+                println!("  Entries:   {}", bundle.manifest.entry_count);
+                for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
+                    println!("    [{i}] epoch={}", scope.epoch);
                 }
-            };
-        if let Err(e) = state_store.check_rollback(&bundle) {
-            eprintln!("  Anti-rollback: REJECTED — {e}");
-            eprintln!("  Use --force to skip this check (e.g., first import into an enclave)");
+            }
+            println!("\n  Installed → {}", result.destination.display());
+            if let Some(warning) = &result.publication_warning {
+                eprintln!("\n  WARNING: {warning}");
+            }
+            println!(
+                "\n  To serve: hoike serve --config {}",
+                config_path.display()
+            );
+            println!("  Import is offline by design; start the server to serve this generation.");
+        }
+        Err(e) => {
+            eprintln!("Import failed: {e}");
             std::process::exit(1);
         }
-        println!("  Anti-rollback: OK");
-    } else {
-        println!("  Anti-rollback: SKIPPED (--force)");
     }
-
-    let bundle_dir = &config.storage.bundle_dir;
-    if let Err(e) = std::fs::create_dir_all(bundle_dir) {
-        eprintln!(
-            "Failed to create bundle directory {}: {e}",
-            bundle_dir.display()
-        );
-        std::process::exit(1);
-    }
-
-    let dest_filename = bundle_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("imported.ahu"));
-    let dest_path = bundle_dir.join(dest_filename);
-
-    if let Err(e) = std::fs::copy(&bundle_path, &dest_path) {
-        eprintln!("Failed to copy bundle to {}: {e}", dest_path.display());
-        std::process::exit(1);
-    }
-
-    println!(
-        "\n  Imported {} → {}",
-        bundle_path.display(),
-        dest_path.display()
-    );
-    println!("  Producer:  {}", bundle.manifest.producer_id);
-    println!("  Entries:   {}", bundle.manifest.entry_count);
-    println!("  Scopes:    {}", bundle.manifest.ca_scopes.len());
-    for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
-        println!("    [{}] epoch={}", i, scope.epoch);
-    }
-    println!(
-        "\n  To serve: hoike serve --config {}",
-        config_path.display()
-    );
-    println!("  To reload a running server: send SIGHUP (not yet implemented)");
 }
 
 /// Explicitly initialize a fresh state directory (F04). Initialization is the

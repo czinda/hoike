@@ -132,7 +132,7 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 | `hoike init-state --config PATH` | Explicitly initialize a fresh state directory (refuses existing state) |
 | `hoike check --config PATH` | Read-only config and bundle trust checks; report cert expiry |
 | `hoike sign --ca LABEL --crl FILE [OPTIONS]` | Produce a signed ahu bundle from a CRL |
-| `hoike import --bundle PATH [--config PATH] [--force]` | Import a bundle for enclave/air-gap deployments |
+| `hoike import --bundle PATH --ca LABEL --config PATH` | Offline authenticated installation into the selected CA destination (fails while a server holds the writer lock) |
 | `hoike query --url URL --serial HEX [OPTIONS]` | Query a running OCSP responder |
 
 **`hoike sign` options:**
@@ -261,6 +261,28 @@ satisfy predecessor continuity against the actual destination). The obsolete
 `storage.max_chain` setting was removed: accepting a chain-limit promise that
 was never implemented is misleading. Configurations that still set it fail to
 parse with an unknown-field error; remove the line when upgrading.
+
+`hoike import --bundle PATH --ca LABEL --config PATH` is an offline,
+recoverable authenticated installation, not a staging copy. The label is
+required: it selects the configured destination (the CA's `bundle_file`, or
+`bundle_dir/<label>.ahu`); unknown labels, legacy unscoped configuration, and
+destinations shared by another configured label are rejected. The input is
+always authenticated under the configured seal trust and serving profile —
+the `allow_unauthenticated_bundles` demo flag never relaxes import — and
+rollback/predecessor checks run against the committed state, which must have
+been initialized with `hoike init-state`. The commit order is: immutable
+snapshot write+fsync, then the atomic state-descriptor commit (the
+installation commit point), then publication of the configured bundle path.
+A failure before the descriptor commit leaves the previous generation
+untouched; if the descriptor's directory fsync fails after its rename, the
+error is `DurabilityUncertain` and the operator must stop and reopen state;
+if the post-commit path publication fails, the import still reports success
+with a warning, startup recovers from the committed snapshot, and retrying
+the identical import repairs the path. Import is offline by design — a
+running server holds the exclusive writer lock and makes it fail promptly —
+and completion tells the operator to start the server (there is no SIGHUP
+path and no `--force` override). The authenticated admin reload endpoint is
+unaffected.
 
 For a signer or combined process, configure the CA's signing key,
 `responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.

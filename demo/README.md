@@ -332,20 +332,21 @@ hoike sign \
 
 **Try to load it on the running edge:**
 ```bash
-# Option 1: hoike import (if available)
-hoike import --bundle bundles/demo-ecdsa-epoch0.ahu --config edge-ecdsa.toml
+# Option 1: hoike import (offline — stop the edge first, then run)
+# hoike stop / kill <hoike-pid>
+hoike import --bundle bundles/demo-ecdsa-epoch0.ahu --ca demo-ca --config edge-ecdsa.toml
 
 # Option 2: Replace the bundle file and reload (future feature)
 # cp bundles/demo-ecdsa-epoch0.ahu bundles/demo-ecdsa-epoch1.ahu
-# kill -HUP <hoike-pid>
+# (restart the server; there is no SIGHUP reload)
 ```
 
 **Expected result:**
 ```
-Anti-rollback: REJECTED — epoch 0 <= high-water mark 1
+Import failed: epoch rollback: scope <producer>:<issuer-key-hash> epoch 0 <= high-water 1
 ```
 
-**Why this matters:** An attacker with write access to the bundle directory (or the ability to inject a stale bundle via gossip) cannot replay an old generation. The edge persists a high-water mark per `(producer_id, CA)` tuple in `state_db`. Any bundle with epoch ≤ high-water is rejected at load, before it ever reaches the serving path.
+**Why this matters:** An attacker with write access to the bundle directory (or the ability to inject a stale bundle via gossip) cannot replay an old generation. The edge persists a high-water mark per `(producer_id, CA)` tuple in `state_db`. Any bundle with epoch ≤ high-water is rejected at load, before it ever reaches the serving path. (Import also authenticates the CMS seal and refuses to run while the edge holds the writer lock — run it offline. Demo configs with `allow_unauthenticated_bundles = true` still require explicit trust for import.)
 
 **Fork detection:** If two bundles claim the same epoch but have different `prev_manifest_digest` values, the edge detects a fork and refuses both. This prevents a malicious producer (or a split-brain signer) from publishing conflicting generations.
 
