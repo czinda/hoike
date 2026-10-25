@@ -1231,6 +1231,175 @@ type = "demo"
     );
 }
 
+fn to_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\r\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push_str("\r\n");
+    }
+    pem.push_str("-----END CERTIFICATE-----\r\n");
+    pem
+}
+
+/// F08: the documented `seal_cert = "/etc/hoike/seal-signer.pem"` signer
+/// example must actually work. The configured PEM certificate is normalized,
+/// the seal key/certificate pair is preflight-validated, and the resulting
+/// bundle is admitted by the pinned loader — through the real on-demand
+/// signing endpoint, which must revalidate rather than trust a startup
+/// verdict. (The DER-encoded twin of this flow is covered by the round-trip
+/// test above and `hoike-sign`'s `seal_materials` suite.)
+#[tokio::test]
+async fn on_demand_signing_accepts_configured_pem_seal_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let crl_path = dir.path().join("test.crl");
+    use base64::Engine;
+    use der::Decode;
+    use p256::pkcs8::EncodePrivateKey;
+    let (crl_der, cert_der) = build_round_trip_crl_der();
+    std::fs::write(&crl_path, crl_der).unwrap();
+    std::fs::write(dir.path().join("issuer.der"), &cert_der).unwrap();
+    let cert = x509_cert::Certificate::from_der(&cert_der).unwrap();
+    let issuer_name = base64::engine::general_purpose::STANDARD
+        .encode(cert.tbs_certificate.subject.to_der().unwrap());
+    let issuer_key = base64::engine::general_purpose::STANDARD.encode(
+        cert.tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes(),
+    );
+    let bundle_path = dir.path().join("pem-seal-test.ahu");
+    // Distinct seal material, persisted as the documented PEM pair. The pin
+    // is also PEM: the serving side loads the same encoding.
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
+    std::fs::write(
+        dir.path().join("seal-key.p8"),
+        seal_key.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("seal-signer.pem"), to_pem(&seal_cert)).unwrap();
+
+    // `password_hash` below is a bcrypt hash of "test-password" (cost 4) — a
+    // synthetic, test-only credential, never a real secret.
+    let config_toml = format!(
+        r#"
+[server]
+mode = "combined"
+listen = "127.0.0.1:0"
+
+[server.admin]
+session_ttl_secs = 3600
+
+[[server.admin.operators]]
+name = "op"
+password_hash = "$2y$04$DM3Fnh2MyUkSAP1Q5Rk4/eyX2w.VlF4vWTGcTvhex.StxDFv7HzWq"
+role = "operator"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.pem"]
+
+[[ca]]
+label = "pem-seal-test"
+issuer_name_der_b64 = "{issuer_name}"
+issuer_key_bytes_b64 = "{issuer_key}"
+bundle_file = "{bundle}"
+seal_key = "{dir}/seal-key.p8"
+seal_cert = "{dir}/seal-signer.pem"
+
+[ca.source]
+type = "crl"
+path = "{crl}"
+issuer_cert = "{dir}/issuer.der"
+
+[ca.signing_key]
+type = "demo"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+        crl = crl_path.display(),
+    );
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    init_state(&config);
+
+    let sources = hoike_sign::create_persistent_sources(&config).unwrap();
+
+    // Initial signer pass with the PEM-configured seal certificate.
+    let initial = hoike_sign::sign_and_write_all(&config, &sources).unwrap();
+    assert_eq!(initial.len(), 1, "one CA has a source");
+    assert_eq!(initial[0].epoch, 1);
+
+    // The pinned loader must admit the PEM-sealed bundle at startup.
+    let state = load(&config);
+
+    let ctx = hoike_server::SignerContext {
+        sources: tokio::sync::Mutex::new(sources),
+    };
+    let app_state = hoike_server::AppState::new(state, config).with_signer_context(ctx);
+    let app = hoike_server::build_router(app_state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    let login_resp = client
+        .post(format!("http://127.0.0.1:{port}/api/admin/session"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"name":"op","password":"test-password"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), 200, "login should succeed");
+    let login_json: serde_json::Value =
+        serde_json::from_str(&login_resp.text().await.unwrap()).unwrap();
+    let token = login_json["session_token"]
+        .as_str()
+        .expect("login response should carry a session_token")
+        .to_string();
+
+    // On-demand signing re-loads the seal material and must revalidate the
+    // PEM certificate against the configured seal key before publishing.
+    let sign_resp = client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/admin/sign/pem-seal-test"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sign_resp.status(),
+        200,
+        "on-demand signing with a PEM seal certificate should succeed"
+    );
+    let sign_json: serde_json::Value =
+        serde_json::from_str(&sign_resp.text().await.unwrap()).unwrap();
+    assert_eq!(sign_json["status"], "ok");
+    assert_eq!(sign_json["epoch"].as_u64().unwrap(), 2);
+
+    // The freshly written bundle's seal verifies under the pinned
+    // certificate derived from the same PEM file.
+    let bundle_after = ahu::Bundle::from_file(&bundle_path).unwrap();
+    ahu::verify_seal_with_pins(
+        &bundle_after.manifest_bytes,
+        &bundle_after.seal_bytes,
+        &[seal_cert],
+        current_time(),
+    )
+    .expect("PEM-configured seal must verify under its pin");
+}
+
 fn review_rewindow(bytes: &[u8], this: u64, next: u64) -> Vec<u8> {
     let bundle = ahu::Bundle::from_bytes(bytes).unwrap();
     let mut manifest = bundle.manifest.clone();

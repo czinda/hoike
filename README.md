@@ -286,8 +286,13 @@ unaffected.
 
 For a signer or combined process, configure the CA's signing key,
 `responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.
-CRL sources require an independently authorized issuer certificate; its identity
-is used when explicit issuer-name/key bytes are not configured:
+`seal_cert` may be PEM or DER; it is normalized to DER and the seal
+key/certificate pair is proven with a real CMS preflight seal before anything
+is published — and re-proven on every signing pass (background loop, on-demand
+signing, post-rotation material reload), so a mismatched or expired
+replacement certificate fails closed and leaves the previous generation in
+place. CRL sources require an independently authorized issuer certificate;
+its identity is used when explicit issuer-name/key bytes are not configured:
 
 ```toml
 # Add to the relevant [[ca]] table, before its nested source/signing tables:

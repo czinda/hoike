@@ -41,7 +41,10 @@ pub use rotation::{
     CertInfo, RotationStatus, check_and_log_rotation, check_rotation_needed, format_cert_info,
     run_rotation_command,
 };
-pub use seal::{SealKey, create_cms_seal, generate_seal_cert, generate_seal_cert_for_key};
+pub use seal::{
+    SealKey, create_cms_seal, generate_seal_cert, generate_seal_cert_for_key,
+    load_seal_certificate, validate_seal_materials,
+};
 pub use source::{
     CaIdentity, CertificateStatus, Epoch, RevocationSource, StatusChange, StatusSnapshot,
 };

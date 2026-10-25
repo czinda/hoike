@@ -208,6 +208,73 @@ fn build_message_digest_attr(digest: &[u8]) -> Result<Attribute> {
     })
 }
 
+/// Synthetic payload for the seal material preflight. Domain-separated so a
+/// preflight seal can never be confused with a manifest seal.
+const SEAL_PREFLIGHT_PAYLOAD: &[u8] = b"hoike:seal-preflight:v1";
+
+/// Load a configured seal certificate, normalizing PEM or DER input to DER.
+///
+/// PEM input may carry ordinary line endings and whitespace; the label must
+/// be a CERTIFICATE. The result must parse as an X.509 certificate (same
+/// der 0.8 codec CMS seal creation uses) before it is returned, so malformed
+/// input fails here instead of at bundle publication.
+pub fn load_seal_certificate(path: &std::path::Path) -> Result<Vec<u8>> {
+    let data = std::fs::read(path)
+        .map_err(|e| SignError::Seal(format!("read seal certificate {}: {e}", path.display())))?;
+    let der = if data.starts_with(b"-----BEGIN") {
+        let pem = String::from_utf8(data).map_err(|e| {
+            SignError::Seal(format!(
+                "seal certificate {} PEM is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
+        // Validate the PEM label — reject non-certificate files.
+        let first_line = pem.lines().next().unwrap_or("");
+        if !first_line.contains("CERTIFICATE") {
+            return Err(SignError::Seal(format!(
+                "seal certificate {} has unexpected PEM label: {} — expected CERTIFICATE",
+                path.display(),
+                first_line.trim()
+            )));
+        }
+        let mut b64 = String::new();
+        for line in pem.lines() {
+            if line.starts_with("-----") {
+                continue;
+            }
+            b64.push_str(line.trim());
+        }
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| {
+                SignError::Seal(format!(
+                    "seal certificate {} PEM base64 decode: {e}",
+                    path.display()
+                ))
+            })?
+    } else {
+        data
+    };
+    Certificate::from_der(&der)
+        .map_err(|e| SignError::Seal(format!("parse seal certificate {}: {e}", path.display())))?;
+    Ok(der)
+}
+
+/// Prove the seal key/certificate pair before publication.
+///
+/// Creates a real CMS seal over the domain-separated preflight payload and
+/// verifies it with `ahu::verify_seal_with_pins` using the configured
+/// certificate as an exact pin at `now`. This exercises the actual signing
+/// algorithm, the key/certificate binding, validity, and the supported
+/// certificate profile.
+pub fn validate_seal_materials(key: &SealKey, cert_der: &[u8], now: u64) -> Result<()> {
+    let seal = create_cms_seal(SEAL_PREFLIGHT_PAYLOAD, key, cert_der)?;
+    ahu::verify_seal_with_pins(SEAL_PREFLIGHT_PAYLOAD, &seal, &[cert_der.to_vec()], now)
+        .map_err(|e| SignError::Seal(format!("seal material preflight: {e}")))?;
+    Ok(())
+}
+
 /// Convert raw ECDSA P-256 signature (r || s, 64 bytes) to DER encoding.
 fn ecdsa_raw_to_der(raw: &[u8]) -> Vec<u8> {
     if raw.len() != 64 {

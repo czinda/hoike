@@ -1663,6 +1663,20 @@ fn run_sign(
         eprintln!("Failed to generate seal cert: {e}");
         std::process::exit(1);
     });
+    // F08: prove the seal pair before producing anything — the same preflight
+    // the configured orchestration path runs on every signing pass.
+    let preflight_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|e| {
+            eprintln!("Clock error: {e}");
+            std::process::exit(1);
+        })
+        .as_secs();
+    hoike_sign::validate_seal_materials(&cli_seal_key, &cli_seal_cert, preflight_now)
+        .unwrap_or_else(|e| {
+            eprintln!("Seal material preflight failed: {e}");
+            std::process::exit(1);
+        });
     let seal_fn = move |m: &[u8]| -> hoike_sign::Result<Vec<u8>> {
         hoike_sign::create_cms_seal(m, &cli_seal_key, &cli_seal_cert)
     };

@@ -656,11 +656,20 @@ pub fn load_seal_materials(
     };
 
     let seal_cert_der = if let Some(path) = &ca_config.seal_cert {
-        std::fs::read(path).map_err(|e| format!("read seal cert: {e}"))?
+        crate::load_seal_certificate(path).map_err(|e| format!("CA '{}': {e}", ca_config.label))?
     } else {
         crate::generate_seal_cert_for_key(&seal_key)
             .map_err(|e| format!("generate seal cert: {e}"))?
     };
+
+    // Preflight the pair on every load — this function runs per signing pass
+    // (background loop, on-demand signing, post-rotation material reload), so
+    // the verdict is never a startup-only cache. Failures propagate before
+    // any bundle is produced or published.
+    let now =
+        crate::source::unix_now().map_err(|e| format!("CA '{}': clock: {e}", ca_config.label))?;
+    crate::validate_seal_materials(&seal_key, &seal_cert_der, now)
+        .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
 
     Ok((seal_key, seal_cert_der))
 }
