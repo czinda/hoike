@@ -166,7 +166,6 @@ pub fn validate_serving_profile(bundle: &Bundle) -> Result<()> {
 /// mode: a correctly sealed delta or compressed bundle is inspectable but not
 /// servable.
 pub fn admit_bundle(bundle: &Bundle, storage: &StorageConfig, now: u64) -> Result<AdmissionTrust> {
-    verify_structure(bundle)?;
     validate_serving_profile(bundle)?;
     if storage.allow_unauthenticated_bundles
         && storage.seal_signer_pins.is_empty()
@@ -176,6 +175,7 @@ pub fn admit_bundle(bundle: &Bundle, storage: &StorageConfig, now: u64) -> Resul
             .is_none_or(|v| v.is_empty())
         && storage.seal_authorizations.is_empty()
     {
+        verify_structure(bundle)?;
         warn!(
             target: "audit",
             event = "bundle_admission",
