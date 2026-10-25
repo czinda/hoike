@@ -188,7 +188,6 @@ listen = "127.0.0.1:2560"
 [storage]
 bundle_dir = "demo/bundles"
 state_db = "demo/state-ecdsa"
-max_chain = 24
 allow_unauthenticated_bundles = true # Demo only; no seal trust is provisioned
 
 [[ca]]

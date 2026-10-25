@@ -1687,3 +1687,142 @@ fn missing_configured_default_bundle_never_uses_another_cas_file() {
     let config:hoike_core::Config=toml::from_str(&format!("[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n[[ca]]\nlabel='missing'\n",dir.path().display())).unwrap();
     assert!(hoike_core::ResponderState::load(config).is_err());
 }
+
+/// A structurally valid delta that names a base nobody loaded, with an
+/// out-of-line chain length. Its epoch advances past the committed
+/// generation so a rejected reload can only be explained by the serving
+/// profile, not by rollback protection.
+fn build_orphan_delta_bundle(serial: u64, response_bytes: &[u8]) -> Vec<u8> {
+    let manifest = Manifest {
+        format_version: 1,
+        bundle_id: Uuid::nil(),
+        producer_id: "e2e-test".into(),
+        created_at: current_time() - 1,
+        bundle_type: BundleType::Delta,
+        ca_scopes: vec![CaScope {
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
+            issuer_name_hash: Sha256::digest(b"CN=Test CA,O=Hoike Test").to_vec(),
+            issuer_key_hash: Sha256::digest(b"test-ca-public-key").to_vec(),
+            epoch: 2,
+            responder_id: ResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: vec![0xCC; 20],
+            },
+            responder_chain: None,
+            signature_algorithm: vec![0x02],
+            completeness: Completeness::AuthoritativeComplete,
+        }],
+        window: Window {
+            produced_at: current_time() - 1,
+            this_update_min: current_time() - 1,
+            next_update_min: current_time() + 86400,
+            next_update_max: current_time() + 93600,
+        },
+        integrity: Integrity {
+            index_digest: [0; 32],
+            data_digest: [0; 32],
+        },
+        entry_count: 0,
+        continuity: Continuity {
+            prev_manifest_digest: None,
+            base_manifest_digest: Some([0x77; 32]),
+            chain_length: 100,
+        },
+        shard: None,
+        compression: None,
+        extensions: None,
+    };
+
+    let mut builder = BundleBuilder::new(manifest);
+    let cert_id = build_certid(serial);
+    let entry_key: [u8; 32] = Sha256::digest(cert_id.to_der().unwrap()).into();
+    builder.add_entry(entry_key, response_bytes.to_vec());
+
+    builder
+        .build(|m| Ok(Sha256::digest(m).to_vec()))
+        .expect("build failed")
+}
+
+#[tokio::test]
+async fn rejected_profile_reload_keeps_serving_the_committed_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("test.ahu");
+    let response_bytes = b"MOCK-OCSP-RESPONSE-FOR-SERIAL-42";
+    std::fs::write(
+        &bundle_path,
+        build_test_bundle_with_real_certids(&[(42, response_bytes)]),
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[server]
+mode = "edge"
+listen = "127.0.0.1:0"
+max_request = 8192
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
+
+[[ca]]
+label = "test"
+bundle_file = "{bundle}"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+    );
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    let app_state = hoike_server::AppState::new(state, config);
+    let responder = std::sync::Arc::clone(&app_state.responder);
+    let app = hoike_server::build_router(app_state);
+
+    let state_path = dir.path().join("state").join("state.json");
+    let original_state = std::fs::read(&state_path).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    async fn query(client: &reqwest::Client, port: u16) -> reqwest::Response {
+        client
+            .post(format!("http://127.0.0.1:{port}/"))
+            .header("Content-Type", "application/ocsp-request")
+            .body(build_ocsp_request(&build_certid(42)))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    let client = reqwest::Client::new();
+    let resp = query(&client, port).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&resp.bytes().await.unwrap()[..], response_bytes);
+
+    // Demo admission would accept the delta's structure; the serving profile
+    // must reject it before any durable state changes.
+    std::fs::write(
+        &bundle_path,
+        build_orphan_delta_bundle(43, b"MOCK-OCSP-RESPONSE-FOR-SERIAL-43"),
+    )
+    .unwrap();
+    let err = responder.reload().unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported serving profile"),
+        "{err}"
+    );
+
+    // The committed generation stays queryable and durable state is untouched.
+    assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+    let resp = query(&client, port).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&resp.bytes().await.unwrap()[..], response_bytes);
+}

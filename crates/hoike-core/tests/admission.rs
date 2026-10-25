@@ -1,9 +1,11 @@
 use ahu::{
-    Bundle, BundleBuilder, BundleType, CaScope, Completeness, Continuity, Integrity, Manifest,
-    ResponderId, ResponderIdType, Window,
+    Bundle, BundleBuilder, BundleType, CaScope, Compression, CompressionAlgorithm, Completeness,
+    Continuity, Integrity, Manifest, ResponderId, ResponderIdType, Window,
 };
 use der::{Decode, Encode, EncodePem};
-use hoike_core::admission::{AdmissionTrust, admit_bundle, authenticate_bundle};
+use hoike_core::admission::{
+    AdmissionTrust, admit_bundle, authenticate_bundle, validate_serving_profile,
+};
 use hoike_core::config::{SealAuthorization, StorageConfig};
 use hoike_core::{Config, CoreError, ResponderState};
 use hoike_sign::{CertIdCompat, SealKey};
@@ -27,8 +29,8 @@ fn storage(dir: &std::path::Path) -> StorageConfig {
     .unwrap()
 }
 
-fn unsigned_bundle(now: u64) -> Bundle {
-    let manifest = Manifest {
+fn manifest_template(now: u64) -> Manifest {
+    Manifest {
         format_version: 1,
         bundle_id: Uuid::nil(),
         producer_id: "admission-test".into(),
@@ -66,10 +68,30 @@ fn unsigned_bundle(now: u64) -> Bundle {
         shard: None,
         compression: None,
         extensions: None,
-    };
-    let mut builder = BundleBuilder::new(manifest);
+    }
+}
+
+fn unsigned_bundle(now: u64) -> Bundle {
+    let mut builder = BundleBuilder::new(manifest_template(now));
     builder.add_entry([1; 32], b"demo-response".to_vec());
     Bundle::from_bytes(&builder.build(|_| Ok(Vec::new())).unwrap()).unwrap()
+}
+
+/// Build a bundle from `manifest` with a real CMS seal over the exact encoded
+/// manifest bytes, mirroring an authenticated producer.
+fn sealed_bundle<F>(manifest: Manifest, seal_key: &SigningKey, cert: &[u8], entries: F) -> Bundle
+where
+    F: FnOnce(&mut BundleBuilder),
+{
+    let mut builder = BundleBuilder::new(manifest);
+    entries(&mut builder);
+    let bytes = builder
+        .build(|m| {
+            hoike_sign::create_cms_seal(m, &SealKey::EcdsaP256(seal_key.clone()), cert)
+                .map_err(|e| ahu::AhuError::SealInvalid(e.to_string()))
+        })
+        .unwrap();
+    Bundle::from_bytes(&bytes).unwrap()
 }
 
 #[test]
@@ -608,5 +630,178 @@ fn failed_authentication_keeps_committed_state_and_recovery_rechecks_trust() {
         std::fs::write(&config.storage.seal_signer_pins[0], wrong_cert).unwrap();
         assert!(ResponderState::load(config).is_err());
         assert_eq!(std::fs::read(&state_path).unwrap(), committed);
+    }
+}
+
+#[test]
+fn signed_orphan_delta_is_not_a_working_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let storage = pinned_storage(dir.path(), &cert);
+
+    // A correctly pinned, correctly sealed delta naming a base nobody has,
+    // with an out-of-line chain length. Authentication is not the issue.
+    let mut delta_manifest = manifest_template(now);
+    delta_manifest.bundle_type = BundleType::Delta;
+    delta_manifest.continuity = Continuity {
+        prev_manifest_digest: None,
+        base_manifest_digest: Some([0x44; 32]),
+        chain_length: 100,
+    };
+    let delta = sealed_bundle(delta_manifest, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"delta-response".to_vec());
+    });
+    let full = signed_bundle(&key, &cert, now, CertIdCompat::Sha256Only);
+
+    // The seal is authentic and the structure valid, so the delta remains
+    // inspectable — but admission must refuse to serve it.
+    authenticate_bundle(&delta, &storage, now).unwrap();
+    assert!(validate_serving_profile(&delta).is_err());
+    let err = admit_bundle(&delta, &storage, now).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported serving profile"),
+        "{err}"
+    );
+
+    // A live responder keeps its committed generation and durable state.
+    let path = dir.path().join("test.ahu");
+    std::fs::write(&path, full.to_bytes().unwrap()).unwrap();
+    let mut config = responder_config(dir.path(), true);
+    config.storage = storage;
+    let responder = ResponderState::load(config.clone()).unwrap();
+    assert_eq!(responder.total_entries(), 1);
+    let state_path = config.storage.state_db.join("state.json");
+    let original_state = std::fs::read(&state_path).unwrap();
+
+    std::fs::write(&path, delta.to_bytes().unwrap()).unwrap();
+    assert!(responder.reload().is_err());
+    assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+    assert_eq!(responder.total_entries(), 1);
+}
+
+#[test]
+fn compressed_bundle_is_rejected_before_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let storage = pinned_storage(dir.path(), &cert);
+
+    let mut zstd_manifest = manifest_template(now);
+    zstd_manifest.compression = Some(Compression {
+        algorithm: CompressionAlgorithm::Zstd,
+        dictionary_digest: None,
+    });
+    // Payloads stay plain bytes: the profile decision must not depend on
+    // attempting decompression in the serving path.
+    let zstd_bundle = sealed_bundle(zstd_manifest, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"would-be-zstd-response".to_vec());
+    });
+
+    let mut dict_manifest = manifest_template(now);
+    dict_manifest.compression = Some(Compression {
+        algorithm: CompressionAlgorithm::Zstd,
+        dictionary_digest: Some([0xEE; 32]),
+    });
+    let dict_bundle = sealed_bundle(dict_manifest, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"dictionary-response".to_vec());
+    });
+
+    let mut plain_dict_manifest = manifest_template(now);
+    plain_dict_manifest.compression = Some(Compression {
+        algorithm: CompressionAlgorithm::None,
+        dictionary_digest: Some([0xEE; 32]),
+    });
+    let plain_dict_bundle = sealed_bundle(plain_dict_manifest, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"plain-dictionary-response".to_vec());
+    });
+
+    for bundle in [&zstd_bundle, &dict_bundle, &plain_dict_bundle] {
+        // Seals stay verifiable; serving them is a separate decision.
+        authenticate_bundle(bundle, &storage, now).unwrap();
+        assert!(validate_serving_profile(bundle).is_err());
+        let err = admit_bundle(bundle, &storage, now).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported serving profile"),
+            "{err}"
+        );
+    }
+
+    // Committed state is untouched by every rejected activation.
+    let path = dir.path().join("test.ahu");
+    std::fs::write(
+        &path,
+        signed_bundle(&key, &cert, now, CertIdCompat::Sha256Only)
+            .to_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut config = responder_config(dir.path(), true);
+    config.storage = storage.clone();
+    let responder = ResponderState::load(config.clone()).unwrap();
+    let state_path = config.storage.state_db.join("state.json");
+    let original_state = std::fs::read(&state_path).unwrap();
+
+    for bundle in [&zstd_bundle, &dict_bundle, &plain_dict_bundle] {
+        std::fs::write(&path, bundle.to_bytes().unwrap()).unwrap();
+        assert!(responder.reload().is_err());
+        assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+    }
+    assert_eq!(responder.total_entries(), 1);
+}
+
+#[test]
+fn full_bundle_profile_is_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = current_time();
+    let key = signing_key(7);
+    let cert = issued_certificate(&key, &key, false, now);
+    let storage = pinned_storage(dir.path(), &cert);
+
+    // An ordinary full bundle with no compression map, and one with an
+    // explicit `none` and no dictionary, are both servable.
+    let full_uncompressed = signed_bundle(&key, &cert, now, CertIdCompat::Sha256Only);
+    let mut none_manifest = manifest_template(now);
+    none_manifest.compression = Some(Compression {
+        algorithm: CompressionAlgorithm::None,
+        dictionary_digest: None,
+    });
+    let explicit_none = sealed_bundle(none_manifest, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"explicit-none-response".to_vec());
+    });
+    for bundle in [&full_uncompressed, &explicit_none] {
+        assert!(validate_serving_profile(bundle).is_ok());
+        assert!(matches!(
+            admit_bundle(bundle, &storage, now),
+            Ok(AdmissionTrust::Authenticated { .. })
+        ));
+    }
+
+    // Tombstones, a base reference, or chain metadata on a full bundle each
+    // describe a different profile than the one this responder serves.
+    let tombstone = sealed_bundle(manifest_template(now), &key, &cert, |builder| {
+        builder.add_tombstone([1; 32], 0);
+    });
+    let mut with_base = manifest_template(now);
+    with_base.continuity.base_manifest_digest = Some([0x55; 32]);
+    let base_referencing = sealed_bundle(with_base, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"base-referencing-response".to_vec());
+    });
+    let mut chained = manifest_template(now);
+    chained.continuity.chain_length = 3;
+    let nonzero_chain = sealed_bundle(chained, &key, &cert, |builder| {
+        builder.add_entry([1; 32], b"chained-response".to_vec());
+    });
+
+    for bundle in [&tombstone, &base_referencing, &nonzero_chain] {
+        authenticate_bundle(bundle, &storage, now).unwrap();
+        assert!(validate_serving_profile(bundle).is_err());
+        let err = admit_bundle(bundle, &storage, now).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported serving profile"),
+            "{err}"
+        );
     }
 }

@@ -376,3 +376,20 @@ fn unauthenticated_bundle_admission_requires_explicit_opt_in() {
     );
     assert!(demo.storage.allow_unauthenticated_bundles);
 }
+
+#[test]
+fn max_chain_is_no_longer_a_configurable_field() {
+    // `storage.max_chain` advertised an unimplemented delta-chain limit.
+    // Configurations that still set it must fail parsing (unknown-field
+    // rejection) instead of silently accepting an ignored security bound.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(
+        &config_path,
+        "[server]\n[storage]\nbundle_dir='/tmp/bundles'\nmax_chain = 1\n",
+    )
+    .unwrap();
+    let err = Config::from_file(&config_path).unwrap_err().to_string();
+    assert!(err.contains("unknown field"), "{err}");
+    assert!(err.contains("max_chain"), "{err}");
+}

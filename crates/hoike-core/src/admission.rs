@@ -3,7 +3,7 @@
 //! Admission is read-only. Freshness, rollback checks, and installation belong
 //! to the caller.
 
-use ahu::{Bundle, SealVerification};
+use ahu::{Bundle, BundleType, CompressionAlgorithm, SealVerification};
 use der::{Decode, DecodePem, Encode};
 use tracing::{info, warn};
 
@@ -116,9 +116,58 @@ pub fn authenticate_bundle(
     Ok(verification)
 }
 
+/// Validate that a bundle matches the serving profile this responder
+/// supports: a full, uncompressed bundle (design §S3).
+///
+/// The ahu *format* can represent delta bundles, tombstones, Zstd
+/// compression, and delta-chain metadata; this responder implements none of
+/// the runtime machinery those require (no delta overlays, no decompression,
+/// no chain tracking). Admission therefore rejects them before any durable
+/// state changes. A valid seal does not change this: use
+/// [`authenticate_bundle`] to inspect an authenticated delta, and
+/// materialize deltas into a full, uncompressed bundle (`ahu apply`) before
+/// serving them.
+pub fn validate_serving_profile(bundle: &Bundle) -> Result<()> {
+    let reject = |reason: &str| {
+        Err(CoreError::Config(format!(
+            "unsupported serving profile: {reason}"
+        )))
+    };
+    if bundle.manifest.bundle_type != BundleType::Full {
+        return reject("delta bundle; materialize it into a full bundle before serving");
+    }
+    match &bundle.manifest.compression {
+        None => {}
+        Some(compression) => {
+            if compression.algorithm != CompressionAlgorithm::None {
+                return reject("compressed bundle; serve an uncompressed bundle instead");
+            }
+            if compression.dictionary_digest.is_some() {
+                return reject("compression dictionary; serve an uncompressed bundle instead");
+            }
+        }
+    }
+    if bundle.index.iter().any(|record| record.is_tombstone()) {
+        return reject("tombstone in a full bundle; tombstones only apply to deltas");
+    }
+    if bundle.manifest.continuity.base_manifest_digest.is_some() {
+        return reject("full bundle naming a base manifest");
+    }
+    if bundle.manifest.continuity.chain_length != 0 {
+        return reject("full bundle with nonzero chain_length");
+    }
+    Ok(())
+}
+
 /// Admit a bundle under the configured trust policy, or for explicitly enabled
 /// unauthenticated demo serving. Configured trust always takes precedence.
+///
+/// Admission also enforces the supported serving profile regardless of trust
+/// mode: a correctly sealed delta or compressed bundle is inspectable but not
+/// servable.
 pub fn admit_bundle(bundle: &Bundle, storage: &StorageConfig, now: u64) -> Result<AdmissionTrust> {
+    verify_structure(bundle)?;
+    validate_serving_profile(bundle)?;
     if storage.allow_unauthenticated_bundles
         && storage.seal_signer_pins.is_empty()
         && storage
@@ -127,7 +176,6 @@ pub fn admit_bundle(bundle: &Bundle, storage: &StorageConfig, now: u64) -> Resul
             .is_none_or(|v| v.is_empty())
         && storage.seal_authorizations.is_empty()
     {
-        verify_structure(bundle)?;
         warn!(
             target: "audit",
             event = "bundle_admission",

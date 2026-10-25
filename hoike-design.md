@@ -438,7 +438,6 @@ max_request   = 8192                # bytes; RFC 9919 GETs are ≤255
 [storage]
 bundle_dir    = "/var/lib/hoike/bundles"
 state_db      = "/var/lib/hoike/state"   # epoch high-water marks — MUST persist
-max_chain     = 24                       # deltas before demanding a full bundle
 
 [gossip]
 enabled       = true

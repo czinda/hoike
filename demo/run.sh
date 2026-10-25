@@ -177,7 +177,6 @@ max_request = 8192
 [storage]
 bundle_dir = "$BUNDLES_DIR"
 state_db = "$STATE_DIR"
-max_chain = 24
 # Demo keys are ephemeral; production requires provisioned seal trust.
 allow_unauthenticated_bundles = true
 
@@ -197,7 +196,6 @@ max_request = 8192
 [storage]
 bundle_dir = "$BUNDLES_DIR"
 state_db = "$DEMO_DIR/state-mldsa"
-max_chain = 24
 # Demo keys are ephemeral; production requires provisioned seal trust.
 allow_unauthenticated_bundles = true
 

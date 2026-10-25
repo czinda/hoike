@@ -130,8 +130,6 @@ pub struct StorageConfig {
     pub bundle_dir: PathBuf,
     #[serde(default = "default_state_db")]
     pub state_db: PathBuf,
-    #[serde(default = "default_max_chain")]
-    pub max_chain: u32,
     /// DER or PEM CA certificates for the bounded direct-issuer seal profile.
     #[serde(default)]
     pub seal_trust_anchors: Option<Vec<PathBuf>>,
@@ -381,9 +379,6 @@ fn default_max_request() -> usize {
 }
 fn default_state_db() -> PathBuf {
     PathBuf::from("/var/lib/hoike/state")
-}
-fn default_max_chain() -> u32 {
-    24
 }
 fn default_sig_alg() -> String {
     "ecdsa-p256".into()

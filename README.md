@@ -202,7 +202,6 @@ max_request = 8192
 [storage]
 bundle_dir = "/var/lib/hoike/bundles"
 state_db = "/var/lib/hoike/state"
-max_chain = 24
 allow_unauthenticated_bundles = false
 # Exact signer certificate pins (PEM or DER), not SPKI hashes:
 seal_signer_pins = ["/etc/hoike/seal-signer.pem"]
@@ -244,6 +243,19 @@ not authenticate the seal. Each demo admission emits an `audit` warning with
 `trust = "unauthenticated_demo"`. Any configured trust still applies, even with
 the flag enabled: invalid seals, unreadable trust files, and unauthorized scopes
 are rejected. Authorizations without pins or anchors are also rejected.
+
+Admission accepts only the supported serving profile: full, uncompressed
+bundles. The ahu format can *represent* deltas, tombstones, Zstd compression,
+and delta chains, but the responder implements no runtime delta overlays or
+decompression, so admission rejects those profiles before any durable state
+changes — including startup, hot reload, `hoike check`, and `hoike import`.
+A correctly sealed delta or compressed bundle is still inspectable with
+`ahu verify --config`; to serve one, materialize it into a full, uncompressed
+bundle first with `ahu apply` (an authenticated, resealed output must still
+satisfy predecessor continuity against the actual destination). The obsolete
+`storage.max_chain` setting was removed: accepting a chain-limit promise that
+was never implemented is misleading. Configurations that still set it fail to
+parse with an unknown-field error; remove the line when upgrading.
 
 For a signer or combined process, configure the CA's signing key,
 `responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.
@@ -324,6 +336,11 @@ changes, regression evidence, migration requirements, and remaining release gate
   validation is unsupported. Configure producer/CA authorizations where needed.
 - **CRL profile** — authenticated direct complete CRLs only; unsupported algorithms,
   delta/indirect CRLs and unsupported critical extensions reject explicitly.
+- **Serving profile** — only full, uncompressed bundles are admitted. Deltas,
+  tombstones, Zstd compression, and nonempty delta-chain metadata are ahu
+  *format* features the serving path rejects at admission; runtime delta
+  overlays and decompression are not implemented. Materialize deltas offline
+  with `ahu apply` first.
 - **Delta apply output** — unsigned intermediate by default; authenticate inputs and
   use an authorized real CMS sealing callback before trusted installation.
 - **Multi-CertID requests** — only the first `CertID` in a multi-Request

@@ -9,7 +9,6 @@ max_request = 8192
 [storage]
 bundle_dir = "/tmp/hoike-test"
 state_db = "/tmp/hoike-test/state"
-max_chain = 24
 allow_unauthenticated_bundles = true
 
 [[ca]]

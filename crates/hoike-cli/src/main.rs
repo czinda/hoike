@@ -1041,6 +1041,15 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
         }
     }
 
+    if let Err(e) = hoike_core::admission::validate_serving_profile(&bundle) {
+        eprintln!("  Serving profile: FAIL — {e}");
+        eprintln!(
+            "  Materialize the bundle into a full, uncompressed bundle first (see `ahu apply`)."
+        );
+        std::process::exit(1);
+    }
+    println!("  Serving profile: OK (full, uncompressed)");
+
     if !force {
         let state_store =
             match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {

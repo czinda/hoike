@@ -336,6 +336,30 @@ into a classified or otherwise isolated enclave SHOULD run full verification on
 import, since that is the one moment where the cost is acceptable and the
 provenance is least certain.
 
+### 3.2 Supported serving profile
+
+The format sections above describe what an ahu file can *represent*. What a
+given responder will *serve* is a narrower profile, and the two must not be
+conflated: a bundle can be well-formed, correctly sealed, and still not
+installable as a working set.
+
+The reference responder (`hoike`) admits only **full, uncompressed bundles**:
+`bundle_type = 0`, either no compression map or algorithm `none` with no
+dictionary, no `TOMBSTONE` index records, no `base_manifest_digest`, and
+`chain_length = 0`. Admission rejects every other profile — delta bundles,
+Zstd payloads, dictionary requirements, full-bundle tombstones, a full
+bundle's nonempty base reference, and nonzero full-bundle chain length —
+before changing durable state. A valid CMS seal does not widen the profile:
+an authenticated delta is inspectable (`ahu verify --config`) but not
+servable.
+
+Delta bundles are consumed offline: materialize them into a full,
+uncompressed bundle (`ahu apply`) and install that. Materialization is not a
+history reset — an authenticated, resealed full output must still satisfy
+predecessor continuity (`prev_manifest_digest`) against the actual
+destination, and a bundle naming a predecessor the destination has not seen
+is not an installable checkpoint.
+
 ---
 
 ## 4. Delta bundles
@@ -350,9 +374,12 @@ base. `bundle_type = 1`, `continuity.base_manifest_digest` is REQUIRED.
   archive cutoff and the producer stops asserting status for it.
 
 `continuity.chain_length` counts generations since the last full bundle. A
-mirror SHOULD refuse to extend a chain beyond a configured maximum and demand a
-full bundle, so that a mirror can never drift arbitrarily far from a known-good
-snapshot. A reasonable default is 24.
+mirror serving deltas directly SHOULD refuse to extend a chain beyond a
+configured maximum and demand a full bundle, so that it can never drift
+arbitrarily far from a known-good snapshot. The reference responder does not
+serve deltas at all — it admits only materialized full, uncompressed bundles
+(see §3.2) — so it exposes no chain-limit configuration; advertising a limit
+that is not enforced would be misleading.
 
 Applying deltas is deterministic: for a given base and an ordered set of deltas
 every mirror reaches an identical working set. Producers SHOULD publish the
