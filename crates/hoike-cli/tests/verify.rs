@@ -206,7 +206,12 @@ impl Fixture {
         config.storage.bundle_dir = self.dir.path().to_path_buf();
         config.storage.state_db = self.state.clone();
         config.storage.seal_signer_pins = vec![self.dir.path().join("signer.der")];
-        drop(hoike_core::ResponderState::load(config).unwrap());
+        // F04: fixture state is bootstrapped explicitly, then loaded under the
+        // writer guard (dropped with the responder).
+        hoike_core::StateStore::initialize(&self.state.join("state.json")).unwrap();
+        let guard =
+            std::sync::Arc::new(hoike_core::StateDirectoryLock::acquire(&self.state).unwrap());
+        drop(hoike_core::ResponderState::load(config, guard).unwrap());
     }
 }
 

@@ -1,5 +1,5 @@
 use ahu::{
-    Bundle, BundleBuilder, BundleType, CaScope, Compression, CompressionAlgorithm, Completeness,
+    Bundle, BundleBuilder, BundleType, CaScope, Completeness, Compression, CompressionAlgorithm,
     Continuity, Integrity, Manifest, ResponderId, ResponderIdType, Window,
 };
 use der::{Decode, Encode, EncodePem};
@@ -567,6 +567,21 @@ fn responder_config(dir: &std::path::Path, explicit_ca: bool) -> Config {
     config
 }
 
+/// Explicitly bootstrap the newly created fixture directory (F04), then load
+/// with a writer guard. Restarts of the same fixture acquire a fresh guard
+/// after the previous responder (and its guard) is dropped.
+fn init_and_load(config: &Config) -> hoike_core::error::Result<ResponderState> {
+    hoike_core::StateStore::initialize(&config.storage.state_db.join("state.json")).unwrap();
+    load(config)
+}
+
+fn load(config: &Config) -> hoike_core::error::Result<ResponderState> {
+    let guard = std::sync::Arc::new(
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap(),
+    );
+    ResponderState::load(config.clone(), guard)
+}
+
 #[test]
 fn normal_and_recovery_loads_require_trust() {
     for explicit_ca in [false, true] {
@@ -578,21 +593,21 @@ fn normal_and_recovery_loads_require_trust() {
         )
         .unwrap();
         let mut config = responder_config(dir.path(), explicit_ca);
-        assert!(ResponderState::load(config.clone()).is_err());
+        assert!(load(&config).is_err());
 
         config.storage.allow_unauthenticated_bundles = true;
-        let responder = ResponderState::load(config.clone()).unwrap();
+        let responder = init_and_load(&config).unwrap();
         assert_eq!(responder.total_entries(), 1);
         drop(responder);
         let state_path = config.storage.state_db.join("state.json");
         let committed = std::fs::read(&state_path).unwrap();
         std::fs::write(&bundle_path, b"interrupted write").unwrap();
         config.storage.allow_unauthenticated_bundles = false;
-        assert!(ResponderState::load(config.clone()).is_err());
+        assert!(load(&config).is_err());
         assert_eq!(std::fs::read(&state_path).unwrap(), committed);
 
         config.storage.allow_unauthenticated_bundles = true;
-        assert_eq!(ResponderState::load(config).unwrap().total_entries(), 1);
+        assert_eq!(load(&config).unwrap().total_entries(), 1);
     }
 }
 
@@ -609,7 +624,7 @@ fn failed_authentication_keeps_committed_state_and_recovery_rechecks_trust() {
         let mut config = responder_config(dir.path(), explicit_ca);
         config.storage = pinned_storage(dir.path(), &cert);
         config.storage.allow_unauthenticated_bundles = true;
-        let responder = ResponderState::load(config.clone()).unwrap();
+        let responder = init_and_load(&config).unwrap();
         let state_path = config.storage.state_db.join("state.json");
         let committed = std::fs::read(&state_path).unwrap();
 
@@ -619,7 +634,7 @@ fn failed_authentication_keeps_committed_state_and_recovery_rechecks_trust() {
         assert_eq!(responder.total_entries(), 1);
         drop(responder);
         // The bad configured bundle cannot replace the authenticated snapshot.
-        let recovered = ResponderState::load(config.clone()).unwrap();
+        let recovered = load(&config).unwrap();
         assert_eq!(recovered.total_entries(), 1);
         assert_eq!(std::fs::read(&state_path).unwrap(), committed);
         drop(recovered);
@@ -628,7 +643,7 @@ fn failed_authentication_keeps_committed_state_and_recovery_rechecks_trust() {
         let wrong = signing_key(8);
         let wrong_cert = issued_certificate(&wrong, &wrong, false, now);
         std::fs::write(&config.storage.seal_signer_pins[0], wrong_cert).unwrap();
-        assert!(ResponderState::load(config).is_err());
+        assert!(load(&config).is_err());
         assert_eq!(std::fs::read(&state_path).unwrap(), committed);
     }
 }
@@ -670,7 +685,7 @@ fn signed_orphan_delta_is_not_a_working_set() {
     std::fs::write(&path, full.to_bytes().unwrap()).unwrap();
     let mut config = responder_config(dir.path(), true);
     config.storage = storage;
-    let responder = ResponderState::load(config.clone()).unwrap();
+    let responder = init_and_load(&config).unwrap();
     assert_eq!(responder.total_entries(), 1);
     let state_path = config.storage.state_db.join("state.json");
     let original_state = std::fs::read(&state_path).unwrap();
@@ -740,7 +755,7 @@ fn compressed_bundle_is_rejected_before_activation() {
     .unwrap();
     let mut config = responder_config(dir.path(), true);
     config.storage = storage.clone();
-    let responder = ResponderState::load(config.clone()).unwrap();
+    let responder = init_and_load(&config).unwrap();
     let state_path = config.storage.state_db.join("state.json");
     let original_state = std::fs::read(&state_path).unwrap();
 

@@ -6,6 +6,7 @@
 # Services:
 #   - fixture-gen: Generates test CA, certs, and CRL (runs once, exits)
 #   - signer:      Produces .ahu bundles, ECDSA + ML-DSA (runs once, exits)
+#   - state-init:  Explicitly initializes state dirs, first run only (once, exits)
 #   - edge-ecdsa:  Keyless edge serving the ECDSA bundle
 #   - edge-mldsa:  Keyless edge serving the ML-DSA bundle
 #   - client:      Runs queries and prints results (runs once, exits)
@@ -69,6 +70,42 @@ services:
     networks:
       - hoike-demo
 
+  # ── Explicit state bootstrap (runs once, exits) ──
+  state-init:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.demo
+      target: runtime
+    depends_on:
+      signer:
+        condition: service_completed_successfully
+    volumes:
+      - ./configs:/demo/configs:ro
+      - state-ecdsa:/demo/state-ecdsa
+      - state-mldsa:/demo/state-mldsa
+    environment:
+      - RUST_LOG=info
+    # Initialize only state that does not exist yet. `hoike init-state` refuses
+    # existing state (it is never a reset), so the existence checks keep this
+    # step idempotent: a restart with existing state preserves all marks.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -f /demo/state-ecdsa/state.json ]; then
+          /usr/local/bin/hoike init-state --config /demo/configs/edge-ecdsa-docker.toml
+        else
+          echo "state-ecdsa already initialized — preserving marks"
+        fi
+        if [ ! -f /demo/state-mldsa/state.json ]; then
+          /usr/local/bin/hoike init-state --config /demo/configs/edge-mldsa-docker.toml
+        else
+          echo "state-mldsa already initialized — preserving marks"
+        fi
+    networks:
+      - hoike-demo
+
   # ── Keyless Edge: ECDSA bundle ──
   edge-ecdsa:
     build:
@@ -77,6 +114,8 @@ services:
       target: runtime
     depends_on:
       signer:
+        condition: service_completed_successfully
+      state-init:
         condition: service_completed_successfully
     ports:
       - "2560:2560"
@@ -104,6 +143,8 @@ services:
       target: runtime
     depends_on:
       signer:
+        condition: service_completed_successfully
+      state-init:
         condition: service_completed_successfully
     ports:
       - "2561:2561"

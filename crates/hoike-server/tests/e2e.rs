@@ -4,6 +4,26 @@ fn current_time() -> u64 {
         .unwrap()
         .as_secs()
 }
+
+// F04: state directories are bootstrapped explicitly and loaded under the
+// exclusive writer guard. Restarts of a fixture acquire a fresh guard after
+// the previous responder (and its guard) is dropped.
+fn init_state(config: &hoike_core::Config) {
+    hoike_core::StateStore::initialize(&config.storage.state_db.join("state.json")).unwrap();
+}
+
+fn writer_guard(config: &hoike_core::Config) -> std::sync::Arc<hoike_core::StateDirectoryLock> {
+    std::sync::Arc::new(hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap())
+}
+
+fn try_load(config: &hoike_core::Config) -> hoike_core::error::Result<hoike_core::ResponderState> {
+    hoike_core::ResponderState::load(config.clone(), writer_guard(config))
+}
+
+fn load(config: &hoike_core::Config) -> hoike_core::ResponderState {
+    try_load(config).unwrap()
+}
+
 use ahu::{
     BundleBuilder, BundleType, CaScope, Completeness, Continuity, Integrity, Manifest, ResponderId,
     ResponderIdType, Window,
@@ -202,7 +222,8 @@ bundle_file = "{bundle}"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    init_state(&config);
+    let state = load(&config);
     let app_state = hoike_server::AppState::new(state, config);
     let app = hoike_server::build_router(app_state);
 
@@ -355,7 +376,8 @@ allow_unauthenticated_bundles = true
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    init_state(&config);
+    let state = load(&config);
     let app_state = hoike_server::AppState::new(state, config);
     let app = hoike_server::build_router(app_state);
 
@@ -570,7 +592,8 @@ nonce_policy = "forward"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let msg = match hoike_core::ResponderState::load(config) {
+    init_state(&config);
+    let msg = match try_load(&config) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected config validation error"),
     };
@@ -611,7 +634,8 @@ nonce_policy = "live"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let msg = match hoike_core::ResponderState::load(config) {
+    init_state(&config);
+    let msg = match try_load(&config) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected config validation error for nonce_policy=live"),
     };
@@ -652,7 +676,8 @@ nonce_policy = "bogus"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let msg = match hoike_core::ResponderState::load(config) {
+    init_state(&config);
+    let msg = match try_load(&config) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected config validation error"),
     };
@@ -863,7 +888,8 @@ type = "demo"
     std::fs::write(dir.path().join("dummy.crl"), b"").unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    init_state(&config);
+    let state = load(&config);
 
     let demo_key = hoike_sign::demo_ecdsa_p256_key();
     let live = hoike_server::LiveSignerState {
@@ -1101,6 +1127,8 @@ type = "demo"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
+    // F04: state must exist before the initial signing pass derives epochs.
+    init_state(&config);
 
     // Persistent sources are empty here (CRL is stateless), but they still flow
     // through the same `SignerContext` mutex the endpoint locks — mirroring how
@@ -1118,7 +1146,7 @@ type = "demo"
 
     // Loading the bundle records the high-water mark (epoch 1) in the state store,
     // so the next signing pass must advance to epoch 2.
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    let state = load(&config);
 
     let ctx = hoike_server::SignerContext {
         sources: tokio::sync::Mutex::new(sources),
@@ -1230,7 +1258,8 @@ async fn expired_first_ca_does_not_block_fresh_second_ca() {
         dir.path().display()
     );
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
-    let state = hoike_core::ResponderState::load(cfg.clone()).unwrap();
+    init_state(&cfg);
+    let state = load(&cfg);
     let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg));
     let req = build_ocsp_request(&build_certid_for_ca(42, b"CA2", b"KEY2"));
     let response = app
@@ -1266,7 +1295,8 @@ async fn cache_lifetime_is_capped_by_remaining_validity() {
         dir.path().display()
     );
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
-    let state = hoike_core::ResponderState::load(cfg.clone()).unwrap();
+    init_state(&cfg);
+    let state = load(&cfg);
     let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg));
     let req = build_ocsp_request(&build_certid(42));
     let response = app
@@ -1514,7 +1544,8 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
             hex::encode(Sha256::digest(&cert))
         );
         let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
-        let result = hoike_core::ResponderState::load(cfg);
+        init_state(&cfg);
+        let result = try_load(&cfg);
         assert_eq!(
             result.is_ok(),
             case == "valid",
@@ -1588,7 +1619,8 @@ async fn check_live_signers_by_ca(default_paths: bool) {
         dir.path().display()
     ))
     .unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    init_state(&config);
+    let state = load(&config);
     let mut app_state = hoike_server::AppState::new(state, config);
     for (i, (key, public, _)) in identities.iter().enumerate() {
         app_state = app_state.with_live_signer_for(
@@ -1685,7 +1717,8 @@ fn missing_configured_default_bundle_never_uses_another_cas_file() {
     )
     .unwrap();
     let config:hoike_core::Config=toml::from_str(&format!("[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n[[ca]]\nlabel='missing'\n",dir.path().display())).unwrap();
-    assert!(hoike_core::ResponderState::load(config).is_err());
+    init_state(&config);
+    assert!(try_load(&config).is_err());
 }
 
 /// A structurally valid delta that names a base nobody loaded, with an
@@ -1777,7 +1810,8 @@ bundle_file = "{bundle}"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    init_state(&config);
+    let state = load(&config);
     let app_state = hoike_server::AppState::new(state, config);
     let responder = std::sync::Arc::clone(&app_state.responder);
     let app = hoike_server::build_router(app_state);

@@ -22,6 +22,12 @@ enum Commands {
         #[arg(long, default_value = "hoike.toml")]
         config: PathBuf,
     },
+    /// Explicitly initialize a fresh state directory (refuses existing state)
+    InitState {
+        /// Config file path
+        #[arg(long, default_value = "hoike.toml")]
+        config: PathBuf,
+    },
     /// Check configuration and bundle trust without installing or changing state
     Check {
         /// Config file path
@@ -124,6 +130,9 @@ fn main() {
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             rt.block_on(run_server(config));
         }
+        Commands::InitState { config } => {
+            run_init_state(config);
+        }
         Commands::Check { config } => {
             run_check(config);
         }
@@ -192,6 +201,40 @@ async fn run_server(config_path: PathBuf) {
         std::process::exit(1);
     }
 
+    // F04: hold the exclusive writer lock on the state directory for the
+    // entire lifetime of this server — listener, background signer loop, and
+    // admin on-demand writers all retain it through the responder.
+    let writer_guard = std::sync::Arc::new(
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to lock state directory {}: {e}",
+                config.storage.state_db.display()
+            );
+            std::process::exit(1);
+        }),
+    );
+
+    // Validate existing state before any preflight, signing, or source
+    // mutation. State is never initialized implicitly: a missing or incomplete
+    // state directory is an operator error, not a fresh timeline.
+    let state_file = config.storage.state_db.join("state.json");
+    if let Err(e) = hoike_core::StateStore::open(&state_file) {
+        eprintln!("State directory validation failed: {e}");
+        if state_file.exists() {
+            eprintln!(
+                "Recovery means restoring the state directory — marks and committed \
+                 snapshots together — from backup; it is never reset in place."
+            );
+        } else {
+            eprintln!(
+                "Run `hoike init-state --config {path}` once to initialize a new state \
+                 directory.",
+                path = config_path.display()
+            );
+        }
+        std::process::exit(1);
+    }
+
     let listen = config.server.listen.clone();
     let needs_signing = config.needs_signing();
 
@@ -240,21 +283,22 @@ async fn run_server(config_path: PathBuf) {
         info!("Prometheus metrics recorder installed");
     }
 
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap_or_else(|e| {
-        hoike_server::obs::record_bundle_load_failure(
-            "all",
-            hoike_server::obs::load_failure_reason(&e),
-        );
-        hoike_server::obs::audit!(
-            event = "bundle_load_failed",
-            trigger = "initial_load",
-            reason = hoike_server::obs::load_failure_reason(&e),
-            error = %e,
-            "initial bundle load failed"
-        );
-        eprintln!("Failed to initialize responder: {e}");
-        std::process::exit(1);
-    });
+    let state = hoike_core::ResponderState::load(config.clone(), writer_guard.clone())
+        .unwrap_or_else(|e| {
+            hoike_server::obs::record_bundle_load_failure(
+                "all",
+                hoike_server::obs::load_failure_reason(&e),
+            );
+            hoike_server::obs::audit!(
+                event = "bundle_load_failed",
+                trigger = "initial_load",
+                reason = hoike_server::obs::load_failure_reason(&e),
+                error = %e,
+                "initial bundle load failed"
+            );
+            eprintln!("Failed to initialize responder: {e}");
+            std::process::exit(1);
+        });
 
     let mut app_state = hoike_server::AppState::new(state, config.clone());
 
@@ -1050,6 +1094,16 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     }
     println!("  Serving profile: OK (full, uncompressed)");
 
+    // F04: offline import mutates the deployment — hold the exclusive writer
+    // lock for the full lifetime of the import.
+    let _guard = match hoike_core::StateDirectoryLock::acquire(&config.storage.state_db) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("  Writer lock:  FAIL — {e}");
+            std::process::exit(1);
+        }
+    };
+
     if !force {
         let state_store =
             match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {
@@ -1104,6 +1158,43 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
         config_path.display()
     );
     println!("  To reload a running server: send SIGHUP (not yet implemented)");
+}
+
+/// Explicitly initialize a fresh state directory (F04). Initialization is the
+/// operator's acknowledgment that the directory is new: an existing state file
+/// or any recovery material in the directory is refused. There is no `--force`
+/// reset; recovery means restoring marks and snapshots together.
+fn run_init_state(config_path: PathBuf) {
+    let config = hoike_core::Config::from_file(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config from {}: {e}", config_path.display());
+        std::process::exit(1);
+    });
+
+    // Hold the writer lock while initializing so a concurrent writer cannot
+    // race the emptiness check.
+    let _guard =
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap_or_else(|e| {
+            eprintln!("Failed to lock state directory: {e}");
+            std::process::exit(1);
+        });
+
+    let state_path = config.storage.state_db.join("state.json");
+    match hoike_core::StateStore::initialize(&state_path) {
+        Ok(_store) => {
+            println!(
+                "Initialized empty state directory: {}",
+                config.storage.state_db.display()
+            );
+            println!("  State file: {}", state_path.display());
+            println!(
+                "  Existing state is never reset; to recover, restore marks and snapshots together."
+            );
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize state: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_check(config_path: PathBuf) {

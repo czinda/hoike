@@ -38,8 +38,9 @@ podman compose logs client        # the four query results
 Watch the logs — you'll see:
 1. **fixture-gen** generates the CA, certs, and a fresh CRL (runs once, exits)
 2. **Signer** tier produces `.ahu` bundles (ECDSA and ML-DSA), then exits
-3. **Edge** nodes (keyless) load and serve them
-4. **Client** queries return `good`, `revoked`, and `unauthorized` responses
+3. **state-init** explicitly initializes the state volumes (first run only)
+4. **Edge** nodes (keyless) load and serve them
+5. **Client** queries return `good`, `revoked`, and `unauthorized` responses
 
 The one-shot services (`fixture-gen`, `signer`, `client`) use
 `depends_on: { condition: service_completed_successfully }` so the chain advances
@@ -199,14 +200,19 @@ completeness = "partial"   # CRL-sourced bundles cannot assert completeness
 
 **Command:**
 ```bash
+hoike init-state --config edge-ecdsa.toml   # once, when the state dir is new
 hoike serve --config edge-ecdsa.toml
 ```
 
 **What happens:**
-1. Edge checks bundle structure and digests, then logs unauthenticated demo admission
-2. Builds an in-memory index (mmap + binary search)
-3. Starts HTTP listener on port 2560
-4. Serves pre-signed responses verbatim — no parsing, no re-encoding, no signing
+1. `hoike init-state` explicitly acknowledges the new state directory — it refuses an existing state file or a directory holding recovery material, and there is no `--force` reset
+2. Edge checks bundle structure and digests, then logs unauthenticated demo admission
+3. Builds an in-memory index (mmap + binary search)
+4. Starts HTTP listener on port 2560
+5. Serves pre-signed responses verbatim — no parsing, no re-encoding, no signing
+6. Holds an exclusive OS writer lock (`.writer.lock` in the state directory) for the whole process lifetime — a second `hoike serve` on the same state directory is rejected
+
+A restart reuses the existing state directory as-is: it never initializes, resets, or deletes it. `hoike serve` on a missing state directory fails with a pointer to `hoike init-state` instead of silently starting a fresh anti-rollback timeline.
 
 **What to look for:**
 - Audit warning: `UNAUTHENTICATED DEMO bundle admitted; CMS seal not verified`
@@ -359,6 +365,7 @@ This is a technical proof-of-concept, not a production qualification. Missing fr
 The `docker-compose.yml` orchestrates:
 - **fixture-gen** service: Runs `generate-fixtures.sh` to produce the CA, certs, and a fresh CRL (one-shot)
 - **signer** service: Runs `hoike sign` to produce bundles (one-shot)
+- **state-init** service: Runs `hoike init-state` for state directories that do not exist yet (one-shot; a restart with existing state skips initialization and preserves all marks)
 - **edge-ecdsa** service: Keyless edge serving the ECDSA bundle
 - **edge-mldsa** service: Keyless edge serving the ML-DSA bundle
 - **client** service: Runs `hoike query` and prints results (one-shot)
@@ -452,7 +459,9 @@ demo/
 │   └── *-docker.toml         # committed (hand-maintained)
 ├── bundles/                  # .ahu bundles from ./run.sh (not committed; containers use a named volume)
 └── state-ecdsa/              # Edge anti-rollback high-water marks from ./run.sh
-    └── state.json            #   (not committed; containers use the state-ecdsa named volume)
+    ├── state.json            #   (not committed; containers use the state-ecdsa named volume)
+    ├── generations/          #   immutable committed snapshots, restored together with state.json
+    └── .writer.lock          #   OS writer lock file (never unlinked; the kernel lock is the lock)
 ```
 
 > The `bundles/`, `state-ecdsa/`, and `state-mldsa/` directories are created by the

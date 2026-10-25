@@ -861,6 +861,50 @@ mod urgent_tests {
         }
     }
 
+    fn scope_config(dir: &std::path::Path) -> Config {
+        let config_path = dir.join("hoike.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[server]
+[storage]
+bundle_dir = "{}/bundles"
+state_db = "{}/state"
+[[ca]]
+label = "test"
+issuer_name_der_b64 = "bmFtZQ=="
+issuer_key_bytes_b64 = "a2V5"
+
+[ca.signing_key]
+type = "demo"
+"#,
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        Config::from_file(&config_path).unwrap()
+    }
+
+    #[test]
+    fn sign_ca_scope_requires_existing_state() {
+        // Epoch derivation reads persisted state; a missing state file must be
+        // an explicit error, never a silently fresh timeline at epoch 1.
+        let dir = tempfile::tempdir().unwrap();
+        let config = scope_config(dir.path());
+        let source = MockSource(vec![(vec![0x01], CertificateStatus::Good)]);
+        let err = sign_ca_scope(&config, &config.ca[0], &source).unwrap_err();
+        assert!(
+            err.contains("state"),
+            "error must identify the state store: {err}"
+        );
+        assert!(
+            !config.storage.state_db.join("state.json").exists(),
+            "signing must not create state implicitly"
+        );
+    }
+
     #[test]
     fn revoked_serials_for_scope_returns_only_revoked() {
         // issuer_name_der_b64 = base64("name"), issuer_key_bytes_b64 = base64("key")

@@ -173,7 +173,11 @@ struct Server {
 
 impl Server {
     async fn start(f: &Fixture) -> Self {
-        let responder = hoike_core::ResponderState::load(f.config.clone()).unwrap();
+        hoike_core::StateStore::initialize(&f.config.storage.state_db.join("state.json")).unwrap();
+        let guard = std::sync::Arc::new(
+            hoike_core::StateDirectoryLock::acquire(&f.config.storage.state_db).unwrap(),
+        );
+        let responder = hoike_core::ResponderState::load(f.config.clone(), guard).unwrap();
         let state = hoike_server::AppState::new(responder, f.config.clone());
         let responder = state.responder.clone();
         let app = hoike_server::build_admin_router_standalone(state);

@@ -53,6 +53,9 @@ pub enum CoreError {
     #[error("state store error: {0}")]
     StateStore(String),
 
+    #[error("state directory lock error: {0}")]
+    StateLock(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

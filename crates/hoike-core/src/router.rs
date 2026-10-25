@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::error::{CoreError, Result};
 use crate::request::ParsedCertId;
 use crate::state::StateStore;
+use crate::storage::StateDirectoryLock;
 use ahu::Bundle;
 
 /// Routing key: (issuerNameHash, issuerKeyHash).
@@ -66,10 +67,32 @@ pub struct ResponderState {
     scope_map: ArcSwap<ScopeMap>,
     pub config: Config,
     state_store: Mutex<StateStore>,
+    /// Retained writer lock (F04). Every clone of this responder — the
+    /// listener owner, the background signer loop, admin on-demand writers —
+    /// keeps the state-directory lock held; it is released only when the last
+    /// writer referencing this responder goes away. Retention is the field's
+    /// entire purpose.
+    #[allow(dead_code)]
+    writer_guard: Arc<StateDirectoryLock>,
 }
 
 impl ResponderState {
-    pub fn load(config: Config) -> Result<Self> {
+    pub fn load(config: Config, guard: Arc<StateDirectoryLock>) -> Result<Self> {
+        // The guard must protect the directory this configuration names, so a
+        // mismatched guard can never authorize writes elsewhere.
+        let state_dir = std::fs::canonicalize(&config.storage.state_db).map_err(|e| {
+            CoreError::Config(format!(
+                "cannot resolve state directory {}: {e}",
+                config.storage.state_db.display()
+            ))
+        })?;
+        if guard.state_dir() != state_dir {
+            return Err(CoreError::Config(format!(
+                "writer lock guards state directory {} but the configuration uses {}",
+                guard.state_dir().display(),
+                state_dir.display()
+            )));
+        }
         let state_db_path = config.storage.state_db.join("state.json");
         let mut state_store = StateStore::open(&state_db_path)?;
         let scope_map = match load_scope_map(&config, &mut state_store) {
@@ -108,6 +131,7 @@ impl ResponderState {
                         }),
                         config,
                         state_store: Mutex::new(state_store),
+                        writer_guard: guard,
                     });
                 }
                 for ca in &mut recovery.ca {
@@ -129,6 +153,7 @@ impl ResponderState {
             scope_map: ArcSwap::from_pointee(scope_map),
             config,
             state_store: Mutex::new(state_store),
+            writer_guard: guard,
         })
     }
 

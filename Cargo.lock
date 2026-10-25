@@ -1329,6 +1329,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "uuid",
  "x509-cert 0.2.5",
  "x509-ocsp",
 ]
@@ -1347,6 +1348,7 @@ dependencies = [
  "hoike-sign",
  "p256 0.13.2",
  "percent-encoding",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",

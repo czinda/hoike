@@ -5,6 +5,7 @@ pub mod request;
 pub mod response;
 pub mod router;
 pub mod state;
+pub mod storage;
 
 pub use config::Config;
 pub use error::CoreError;
@@ -14,3 +15,4 @@ pub use request::{
 pub use response::*;
 pub use router::{LookupResult, ResponderState, ScopeDetail};
 pub use state::StateStore;
+pub use storage::{StateDirectoryLock, WRITER_LOCK_FILE};

@@ -108,7 +108,8 @@ ahu verify bundle.ahu --structure-only
 # Authenticate after provisioning seal trust in hoike.toml
 ahu verify bundle.ahu --config hoike.toml
 
-# Start the responder
+# Start the responder (initialize the state directory once, first)
+hoike init-state --config hoike.toml
 hoike serve --config hoike.toml
 
 # Validate configuration before deploying
@@ -127,7 +128,8 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 
 | Command | Description |
 |---------|-------------|
-| `hoike serve --config PATH` | Start the OCSP responder |
+| `hoike serve --config PATH` | Start the OCSP responder (requires an initialized state directory; holds the exclusive writer lock) |
+| `hoike init-state --config PATH` | Explicitly initialize a fresh state directory (refuses existing state) |
 | `hoike check --config PATH` | Read-only config and bundle trust checks; report cert expiry |
 | `hoike sign --ca LABEL --crl FILE [OPTIONS]` | Produce a signed ahu bundle from a CRL |
 | `hoike import --bundle PATH [--config PATH] [--force]` | Import a bundle for enclave/air-gap deployments |
@@ -191,7 +193,10 @@ HTTP 400. Inspection only reports seal presence; it does not authenticate a seal
 
 A keyless edge needs bundle storage and explicit seal trust. Paths below are
 operator-provisioned examples; see the [remediation migration guide](docs/review-remediation.md)
-before upgrading existing state or configuration.
+before upgrading existing state or configuration. The state directory must be
+initialized once with `hoike init-state --config hoike.toml` before the first
+`serve`; `serve` never creates it implicitly, and exactly one writer process
+per state directory is enforced with an OS lock.
 
 ```toml
 [server]

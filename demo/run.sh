@@ -216,6 +216,15 @@ start_edge() {
     section "Read-only configuration check (unauthenticated demo)"
     "$HOIKE_BIN" check --config "$CONFIG_DIR/edge-ecdsa.toml"
 
+    # F04: state is initialized explicitly, exactly once per run directory.
+    # A restart with existing state must never initialize or delete it.
+    if [[ ! -f "$STATE_DIR/state.json" ]]; then
+        section "Initializing state directory (first run)"
+        "$HOIKE_BIN" init-state --config "$CONFIG_DIR/edge-ecdsa.toml"
+    else
+        pass "Reusing existing state directory $STATE_DIR (marks preserved)"
+    fi
+
     section "Starting edge on http://127.0.0.1:2560"
     "$HOIKE_BIN" serve --config "$CONFIG_DIR/edge-ecdsa.toml" &
     EDGE_PID=$!
@@ -328,6 +337,14 @@ demo_antirollback() {
 # ── Demonstrate post-quantum edge ──
 demo_pq_edge() {
     banner "STAGE 6: Post-Quantum Edge (ML-DSA-65)"
+
+    # F04: explicit initialization of a newly allocated run directory only.
+    if [[ ! -f "$DEMO_DIR/state-mldsa/state.json" ]]; then
+        section "Initializing ML-DSA state directory (first run)"
+        "$HOIKE_BIN" init-state --config "$CONFIG_DIR/edge-mldsa.toml"
+    else
+        pass "Reusing existing ML-DSA state directory (marks preserved)"
+    fi
 
     section "Starting ML-DSA edge on http://127.0.0.1:2561"
     "$HOIKE_BIN" serve --config "$CONFIG_DIR/edge-mldsa.toml" &

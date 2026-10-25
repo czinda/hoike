@@ -88,7 +88,11 @@ allow_unauthenticated_bundles = true
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config).unwrap();
+    hoike_core::StateStore::initialize(&config.storage.state_db.join("state.json")).unwrap();
+    let guard = std::sync::Arc::new(
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap(),
+    );
+    let state = hoike_core::ResponderState::load(config, guard).unwrap();
 
     // The loaded bundle should be the one with epoch 10 (has key 0x22)
     let mut found_22 = false;

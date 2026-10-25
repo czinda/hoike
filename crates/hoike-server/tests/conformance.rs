@@ -214,7 +214,11 @@ completeness = "authoritative-complete"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    hoike_core::StateStore::initialize(&config.storage.state_db.join("state.json")).unwrap();
+    let guard = std::sync::Arc::new(
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap(),
+    );
+    let state = hoike_core::ResponderState::load(config.clone(), guard).unwrap();
     let app_state = hoike_server::AppState::new(state, config);
     let app = hoike_server::build_router(app_state);
 
