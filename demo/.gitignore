@@ -6,6 +6,14 @@ fixtures/crl.pem
 fixtures/crl-index.txt*
 fixtures/crl-serial.txt*
 
+# Demo seal pair — regenerated with a fresh validity window on every run (like
+# the CRL). A committed seal certificate would expire and fail admission
+# closed; the per-run regeneration keeps the configs/trusted-edge.toml pin
+# always valid for this run's bundles.
+fixtures/seal-key.p8
+fixtures/seal-key-sec1.pem
+fixtures/seal-cert.pem
+
 # Runtime outputs
 bundles/
 state-ecdsa/
@@ -17,3 +25,4 @@ state-mldsa/
 # test-edge.toml variants are hand-maintained and stay tracked.
 configs/edge-ecdsa.toml
 configs/edge-mldsa.toml
+configs/trusted-edge.toml

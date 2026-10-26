@@ -58,7 +58,7 @@ Status legend:
 | **FCS_TLSS_EXT.1** | TLS server, server authentication | **Met** | rustls 0.23 on the `aws-lc-rs` provider, TLS 1.3 + 1.2 floor (`crates/hoike-server/src/tls.rs`), behind the `tls` feature. Terminates on the admin + metrics management listeners. |
 | **FCS_TLSS_EXT.2** | TLS server, mutual (client-cert) authentication | **Partial** | Wired but off by default: set `admin_tls.client_ca` and a `WebPkiClientVerifier` requires client certs (`tls.rs::server_config`). Flip-the-flag to enable; no code change needed. |
 | **FTP_TRP.1** | Trusted path for remote administration | **Met** | Admin API + web UI moved off the OCSP port onto a dedicated TLS listener (`server.admin_listen` + `server.admin_tls`; router split in `crates/hoike-server/src/lib.rs::build_admin_router_standalone`). Existing bcrypt/RBAC login now runs over TLS. `hoike check` warns if admin rides the cleartext OCSP port. |
-| **FTP_ITC.1** | Trusted channel between TOE components | **Met** | *Forward proxy:* `https://` enforced at config-validation (`hoike check`), TLS-verified shared client (`handlers.rs::forward_client`). *Syncrepl:* LDAPS / StartTLS-before-bind so the bind password never crosses cleartext (`crates/hoike-sign/src/dogtag_sync.rs::connect`, `tls`/`ca_cert` config). *Gossip:* Ed25519-signed broadcasts — see FPT_ITT.1. |
+| **FTP_ITC.1** | Trusted channel between TOE components | **Met** | *Forward proxy:* `https://` enforced, redirects disabled, bounded upstream reads; per-CA startup-validated clients (`forwarding.rs::build_forward_clients`) — an optional `forward_ca` PEM bundle becomes that CA's only trusted roots (built-in roots disabled, hostname/validity kept on), otherwise bundled WebPKI roots, never the system trust store; invalid root configuration fails startup and `hoike check`. *Syncrepl:* LDAPS / StartTLS-before-bind so the bind password never crosses cleartext (`crates/hoike-sign/src/dogtag_sync.rs::connect`, `tls`/`ca_cert` config). *Gossip:* Ed25519-signed broadcasts — see FPT_ITT.1. |
 | **FPT_ITT.1** | Protection of TSF data between nodes (gossip) | **Met** | Generation/urgent-revocation broadcasts are Ed25519-signed at the payload boundary and verified on receive (`crates/hoike-gossip/src/crypto.rs`, `broadcast.rs::receive_item`); forged/unsigned messages are dropped before re-propagation. Authentication is an explicit policy, `gossip.auth_mode = "required"` (default) or `"permissive"` (`crypto.rs::load_authentication`, one shared path for `GossipNode::start` and `hoike check`): required mode needs a local `gossip.identity_key`, verifies every origin against `gossip.peer_identities` named keys, and rejects unsigned/unknown/forged input; permissive mode is the documented rollout mode that still accepts unsigned legacy broadcasts while rejecting unknown/forged signatures — including with an empty trusted set. The verifier is always present (no verifier-less bypass). Invalid enabled configuration or unreadable key material aborts startup. Rollout (provision mappings → permissive → enable signing → required) is limited to frame-aware versions: the one-byte frame tag keeps such a mixed fleet interoperable but does not qualify historical binaries. **Note:** SWIM liveness traffic (foca pings/acks) and the payload *confidentiality* are not yet covered — this authenticates the trust-bearing broadcasts, it does not encrypt the channel. |
 | **TLS Functional Package v1.1** | TLS 1.2 floor, approved ciphersuites, version negotiation | **Met** | TLS 1.3 + 1.2 only (`tls.rs`); ciphersuites from the `aws-lc-rs` provider. OCSP-for-TLS-stapling is downstream consumer concern, not this TOE. |
 
@@ -77,7 +77,7 @@ Status legend:
 | **FCS_CKM.1 / FCS_CKM.2** | Key generation / establishment | **Partial** | Signing keys via PKCS#8 file, PKCS#11/HSM (`signing_key.type="pkcs11"`), or ephemeral demo. TLS key establishment via `aws-lc-rs`. Lab uses one SoftHSM EC P-256 key across scopes. |
 | **FCS_CKM_EXT / FPT_SKP_EXT.1** | Protection of secret/private keys | **Partial** | HSM custody available (PKCS#11, incl. CKM_ML_DSA); seal key kept distinct from OCSP signing key. Lab posture is SoftHSM, not a validated HSM. |
 | **FCS_RBG_EXT.1** | Random bit generation | **Partial** | OS RNG via `getrandom`; TLS DRBG from `aws-lc-rs`. Not a claimed/validated entropy source in the lab. |
-| **Crypto module validation (FIPS)** | Validated cryptographic module | **Gap (by posture)** | `aws-lc-rs` is FIPS-capable but not built in `fips` mode here. Closing work is a build-profile change (`aws-lc-rs/fips` + `rustls/fips`), not a code change — see [Crypto notes](#crypto-notes). |
+| **Crypto module validation (FIPS)** | Validated cryptographic module | **Gap (by posture)** | `aws-lc-rs` is FIPS-capable but not built in `fips` mode here. Closing work requires the `aws-lc-rs/fips` + `rustls/fips` build **and** validation/evaluation of the deployed module boundary and environment — see [Crypto notes](#crypto-notes). |
 
 ## 4. Identification, authentication & management
 
@@ -112,8 +112,11 @@ Status legend:
   rustls provider, giving one crypto boundary. `crates/hoike-server/src/tls.rs`
   builds the `ServerConfig` with an *explicit* provider so it is unaffected by
   whichever provider a client-side dependency pulls in.
-- **FIPS follow-on.** A validated posture is a build change, not new code: enable
-  `aws-lc-rs/fips` and `rustls/fips`. This is heavier to build (validated module
+- **FIPS follow-on.** A validated posture starts with a build change — enable
+  `aws-lc-rs/fips` and `rustls/fips` — but does not end there: FIPS validation
+  covers the module build, its boundary, and the operating environment, so the
+  deployment itself must be validated. The feature flags alone do not make a
+  deployment FIPS-validated. This build is heavier to produce (validated module
   toolchain) and is not required for the lab.
 - **PQC.** ML-DSA-44/65/87 signing is available today (file keys and PKCS#11
   `CKM_ML_DSA`), ahead of the profile — dual-algorithm bundles let a fleet

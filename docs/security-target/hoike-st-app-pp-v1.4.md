@@ -184,7 +184,7 @@ not an evaluation lab:
 | AGD_OPE.1 / AGD_PRE.1 (guidance) | `README.md`, `CLAUDE.md`, `hoike check`, config comments. |
 | ALC_CMC.1 / ALC_CMS.1 (config mgmt) | Git + `Cargo.lock`; per-crate versioning (but see FPT_IDV_EXT.1 gap). |
 | ALC_TSU_EXT.1 (timely security updates) | Monthly `cargo audit`; **update authenticity is a gap** (FPT_TUD_EXT.1). |
-| ATE_IND.1 (independent testing) | 175 test functions; 20-check OCSP conformance suite. |
+| ATE_IND.1 (independent testing) | Workspace test suites in CI (unit, integration, e2e, CLI subprocess, platform state-machine suites); 20-check OCSP conformance suite. |
 | AVA_VAN.1 (vulnerability survey) | Rust memory safety; `cargo audit`; single audited `unsafe`. |
 
 ---

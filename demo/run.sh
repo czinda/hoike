@@ -118,6 +118,10 @@ generate_fixtures() {
 }
 
 # ── Sign bundles ──
+# The OCSP signing key is the ephemeral --demo-key, but the CMS seal uses the
+# persistent per-run seal pair from generate-fixtures.sh, so the demo exercises
+# the production seal policy: a complete key/certificate pair, distinct from
+# the OCSP key, pinned by configs/trusted-edge.toml and the edge configs.
 sign_bundles() {
     banner "STAGE 2: Sign OCSP Response Bundles"
 
@@ -131,6 +135,8 @@ sign_bundles() {
         --good-serials "$FIXTURES_DIR/good-serials.txt" \
         --sig-alg ecdsa-p256 \
         --demo-key \
+        --seal-key "$FIXTURES_DIR/seal-key.p8" \
+        --seal-cert "$FIXTURES_DIR/seal-cert.pem" \
         --epoch 1 \
         -o "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu"
 
@@ -139,7 +145,7 @@ sign_bundles() {
     section "Inspecting ECDSA bundle"
     "$AHU_BIN" inspect "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | head -20
 
-    section "Checking ECDSA bundle structure (unauthenticated demo)"
+    section "Checking ECDSA bundle structure (no trust policy)"
     "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" --structure-only
 
     section "Signing ML-DSA-65 bundle (epoch 1)"
@@ -150,18 +156,77 @@ sign_bundles() {
         --good-serials "$FIXTURES_DIR/good-serials.txt" \
         --sig-alg ml-dsa-65 \
         --demo-key \
+        --seal-key "$FIXTURES_DIR/seal-key.p8" \
+        --seal-cert "$FIXTURES_DIR/seal-cert.pem" \
         --epoch 1 \
         -o "$BUNDLES_DIR/demo-mldsa-epoch1.ahu"
 
     pass "ML-DSA bundle created: $(du -h "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" | cut -f1)"
 
-    section "Checking ML-DSA bundle structure (unauthenticated demo)"
+    section "Checking ML-DSA bundle structure (no trust policy)"
     "$AHU_BIN" verify "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" --structure-only
 
     section "Size comparison"
     echo "  ECDSA:  $(du -h "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | cut -f1)"
     echo "  ML-DSA: $(du -h "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" | cut -f1)"
-    echo "  Ratio:  ~$(( $(stat -f%z "$BUNDLES_DIR/demo-mldsa-epoch1.ahu") / $(stat -f%z "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu") ))x larger"
+    echo "  Ratio:  ~$(( $(wc -c < "$BUNDLES_DIR/demo-mldsa-epoch1.ahu") / $(wc -c < "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu") ))x larger"
+}
+
+# ── Authenticated verification against the demo pin ──
+verify_authenticated() {
+    banner "STAGE 2b: Authenticated Bundle Verification"
+
+    # Write the configs (including trusted-edge.toml) before first use.
+    create_edge_config
+
+    section "Authenticating the CMS seal against configs/trusted-edge.toml"
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" \
+        --config "$CONFIG_DIR/trusted-edge.toml"
+    pass "ECDSA bundle seal authenticated (signer pin matched)"
+
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" \
+        --config "$CONFIG_DIR/trusted-edge.toml"
+    pass "ML-DSA bundle seal authenticated (signer pin matched)"
+
+    section "Tampering with the bundle must fail verification"
+    # Flip the final byte (inside the trailing CMS seal region, which is
+    # covered by the data digest) — verification must fail closed.
+    TAMPER="$BUNDLES_DIR/demo-ecdsa-tampered.ahu"
+    cp "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" "$TAMPER"
+    TAMPER_SIZE=$(wc -c < "$TAMPER" | tr -d ' ')
+    LAST_BYTE=$(tail -c 1 "$TAMPER" | od -An -tu1 | tr -d ' ')
+    printf "$(printf '\\x%02x' $((LAST_BYTE ^ 0xFF)))" \
+        | dd of="$TAMPER" bs=1 seek=$((TAMPER_SIZE - 1)) conv=notrunc status=none
+    if "$AHU_BIN" verify "$TAMPER" \
+        --config "$CONFIG_DIR/trusted-edge.toml" >/dev/null 2>&1; then
+        fail "A tampered bundle passed verification!"
+        exit 1
+    else
+        pass "Tampered bundle rejected"
+    fi
+    rm "$TAMPER"
+
+    section "A wrong trust pin must fail authentication"
+    # Same bundle, but pinned to the demo CA certificate instead of the seal
+    # signer: structure and digests are valid, the seal is intact, and only
+    # the trust policy rejects it.
+    cat > "$CONFIG_DIR/wrong-pin.toml" <<EOF
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "$BUNDLES_DIR"
+state_db = "$STATE_DIR"
+seal_signer_pins = ["$FIXTURES_DIR/ca-cert.pem"]
+EOF
+    if "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" \
+        --config "$CONFIG_DIR/wrong-pin.toml" >/dev/null 2>&1; then
+        fail "An unpinned seal signer passed authenticated verification!"
+        exit 1
+    else
+        pass "Seal signed by an unpinned certificate rejected"
+    fi
+    rm "$CONFIG_DIR/wrong-pin.toml"
 }
 
 # ── Create edge config ──
@@ -177,8 +242,10 @@ max_request = 8192
 [storage]
 bundle_dir = "$BUNDLES_DIR"
 state_db = "$STATE_DIR"
-# Demo keys are ephemeral; production requires provisioned seal trust.
-allow_unauthenticated_bundles = true
+# Authenticated admission: pin this run's demo seal certificate. This is the
+# production trust model — the OCSP signing key is ephemeral (--demo-key),
+# but bundle admission is authenticated against the pinned seal signer.
+seal_signer_pins = ["$FIXTURES_DIR/seal-cert.pem"]
 
 [[ca]]
 label = "demo-ca"
@@ -196,14 +263,33 @@ max_request = 8192
 [storage]
 bundle_dir = "$BUNDLES_DIR"
 state_db = "$DEMO_DIR/state-mldsa"
-# Demo keys are ephemeral; production requires provisioned seal trust.
-allow_unauthenticated_bundles = true
+# Authenticated admission: pin this run's demo seal certificate.
+seal_signer_pins = ["$FIXTURES_DIR/seal-cert.pem"]
 
 [[ca]]
 label = "demo-ca"
 bundle_file = "$BUNDLES_DIR/demo-mldsa-epoch1.ahu"
 nonce_policy = "ignore"
 completeness = "partial"
+EOF
+
+    # Minimal read-only verification config referenced by VERIFICATION.md and
+    # the authenticated-verification stage: the same seal pin, no serving
+    # sections. `ahu verify --config` authenticates the CMS seal and scope
+    # authorization against exactly this trust policy.
+    cat > "$CONFIG_DIR/trusted-edge.toml" <<EOF
+# Generated by run.sh — pins this run's demo seal certificate so
+#   ahu verify bundles/<bundle>.ahu --config configs/trusted-edge.toml
+# performs real authenticated verification. The seal pair is regenerated (with
+# a fresh validity window) on every demo run, so the pin is only valid for the
+# bundles signed in the same run.
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "$BUNDLES_DIR"
+state_db = "$STATE_DIR"
+seal_signer_pins = ["$FIXTURES_DIR/seal-cert.pem"]
 EOF
 }
 
@@ -213,7 +299,7 @@ start_edge() {
 
     create_edge_config
 
-    section "Read-only configuration check (unauthenticated demo)"
+    section "Read-only configuration check (authenticated admission)"
     "$HOIKE_BIN" check --config "$CONFIG_DIR/edge-ecdsa.toml"
 
     # F04: state is initialized explicitly, exactly once per run directory.
@@ -225,6 +311,11 @@ start_edge() {
         pass "Reusing existing state directory $STATE_DIR (marks preserved)"
     fi
 
+    start_edge_process
+}
+
+# Start the ECDSA edge in the background and wait until it answers.
+start_edge_process() {
     section "Starting edge on http://127.0.0.1:2560"
     "$HOIKE_BIN" serve --config "$CONFIG_DIR/edge-ecdsa.toml" &
     EDGE_PID=$!
@@ -233,13 +324,24 @@ start_edge() {
     for i in {1..10}; do
         if curl -s http://127.0.0.1:2560 >/dev/null 2>&1; then
             pass "Edge server ready (PID $EDGE_PID)"
-            return
+            return 0
+        fi
+        if ! kill -0 "$EDGE_PID" 2>/dev/null; then
+            fail "Edge server exited during startup"
+            exit 1
         fi
         sleep 0.5
     done
 
     fail "Edge server did not start"
     exit 1
+}
+
+stop_edge() {
+    section "Stopping the edge (import is offline by design)"
+    kill "$EDGE_PID" 2>/dev/null || true
+    wait "$EDGE_PID" 2>/dev/null || true
+    pass "Edge stopped; writer lock released"
 }
 
 # ── Run client queries ──
@@ -300,9 +402,9 @@ run_queries() {
     fi
 }
 
-# ── Demonstrate anti-rollback ──
+# ── Demonstrate anti-rollback and restart continuity ──
 demo_antirollback() {
-    banner "STAGE 5: Anti-Rollback Protection"
+    banner "STAGE 5: Anti-Rollback Protection and Restart"
 
     section "Generating older-epoch bundle (epoch 0)"
     "$HOIKE_BIN" sign \
@@ -312,25 +414,53 @@ demo_antirollback() {
         --good-serials "$FIXTURES_DIR/good-serials.txt" \
         --sig-alg ecdsa-p256 \
         --demo-key \
+        --seal-key "$FIXTURES_DIR/seal-key.p8" \
+        --seal-cert "$FIXTURES_DIR/seal-cert.pem" \
         --epoch 0 \
         -o "$BUNDLES_DIR/demo-ecdsa-epoch0.ahu" 2>&1 | grep -v "^INFO"
 
     pass "Older bundle created (epoch 0)"
 
-    section "Attempting to import older-epoch bundle"
+    # Import is offline by design: the edge holds the exclusive writer lock on
+    # the state directory, so it must be stopped first.
+    stop_edge
+
+    section "Attempting to import older-epoch bundle (offline)"
     echo -e "${YELLOW}Expected result: REJECTED (epoch 0 <= high-water mark 1)${NC}"
 
     if "$HOIKE_BIN" import \
         --bundle "$BUNDLES_DIR/demo-ecdsa-epoch0.ahu" \
+        --ca demo-ca \
         --config "$CONFIG_DIR/edge-ecdsa.toml" 2>&1 | tee /tmp/hoike-import.log; then
         fail "Import should have been rejected!"
+        exit 1
     else
-        if grep -q "Anti-rollback: REJECTED" /tmp/hoike-import.log; then
+        if grep -q "epoch rollback" /tmp/hoike-import.log; then
             pass "Anti-rollback check PASSED — older epoch rejected"
         else
-            warn "Import failed for a different reason — check logs"
+            fail "Import failed for a different reason — check logs"
             cat /tmp/hoike-import.log
+            exit 1
         fi
+    fi
+
+    section "Restarting the edge on the existing state directory"
+    # The rejected import changed nothing: the identical committed generation
+    # reloads idempotently over the preserved marks (restart continuity).
+    start_edge_process
+    ISSUER_NAME_B64=$(cat "$DEMO_DIR/.issuer-name-b64")
+    ISSUER_KEY_B64=$(cat "$DEMO_DIR/.issuer-key-b64")
+    "$HOIKE_BIN" query \
+        --url http://127.0.0.1:2560 \
+        --serial 01 \
+        --issuer-name-b64 "$ISSUER_NAME_B64" \
+        --issuer-key-b64 "$ISSUER_KEY_B64" 2>&1 | tee /tmp/hoike-query-restart.log || true
+    if grep -q "OCSP status: Successful" /tmp/hoike-query-restart.log && \
+       grep -q "Status:.*GOOD" /tmp/hoike-query-restart.log; then
+        pass "Restart served the same committed generation (GOOD after restart)"
+    else
+        fail "Restart did not serve the committed generation"
+        exit 1
     fi
 }
 
@@ -375,6 +505,23 @@ demo_pq_edge() {
 
 # ── Main ──
 main() {
+    # The demo re-signs epoch 1 with a fresh CRL and a fresh seal pair on
+    # every run, so a new run over committed anti-rollback state is a
+    # *different* generation at the same epoch — which the preserved marks
+    # correctly reject. Demo runtime state is disposable by design.
+    if [[ -f "$STATE_DIR/state.json" || -f "$DEMO_DIR/state-mldsa/state.json" ]]; then
+        if [[ "${1:-}" == "--fresh" ]]; then
+            echo "Removing disposable demo runtime state (--fresh)"
+            rm -rf "$BUNDLES_DIR" "$STATE_DIR" "$DEMO_DIR/state-mldsa"
+        else
+            fail "Existing demo state found (a previous run committed marks)"
+            echo "       The demo signs a new epoch-1 generation each run; committed"
+            echo "       anti-rollback marks correctly reject the new generation."
+            echo "       Re-run with: ./run.sh --fresh   (removes bundles/ and state-*/)"
+            exit 1
+        fi
+    fi
+
     banner "hoike Executive Showcase Demo"
     echo "This demo proves hoike's core architectural bet:"
     echo "\"The machine that signs status and the machine that serves it are not the same.\""
@@ -382,16 +529,21 @@ main() {
     echo "What you'll see:"
     echo "  1. Test CA and CRL generation (OpenSSL)"
     echo "  2. Batch signing of OCSP responses into .ahu bundles (ECDSA + ML-DSA)"
-    echo "  3. Keyless edge serving pre-signed responses"
-    echo "  4. Client queries returning good/revoked/unauthorized"
-    echo "  5. Anti-rollback protection rejecting older epochs"
-    echo "  6. Post-quantum (ML-DSA-65) edge serving"
+    echo "  3. Authenticated seal verification against a pinned demo seal certificate"
+    echo "  4. Keyless edge serving pre-signed responses"
+    echo "  5. Client queries returning good/revoked/unauthorized"
+    echo "  6. Anti-rollback protection rejecting older epochs (offline import)"
+    echo "  7. Restart continuity over preserved state"
+    echo "  8. Post-quantum (ML-DSA-65) edge serving"
     echo ""
-    read -p "Press Enter to begin..."
+    # Tolerate non-interactive runs (piped/absent stdin): read returns
+    # nonzero on EOF, which must not abort under `set -e`.
+    read -p "Press Enter to begin..." || echo
 
     check_prereqs
     generate_fixtures
     sign_bundles
+    verify_authenticated
     start_edge
     sleep 2  # Let edge finish loading
     run_queries
@@ -403,9 +555,10 @@ main() {
     echo -e "${GREEN}Summary:${NC}"
     echo "  ✓ Keyless edge served responses without holding signing keys"
     echo "  ✓ ECDSA and ML-DSA bundles both worked (same code path)"
-    echo "  ✓ Anti-rollback rejected older-epoch bundle"
+    echo "  ✓ Bundle seals were authenticated against a pinned certificate"
+    echo "  ✓ Anti-rollback rejected an older-epoch import; restart served the"
+    echo "    same committed generation"
     echo "  ✓ Client received good, revoked, and unauthorized responses"
-    echo "  • Demo bundle structure was checked; seal authenticity was not checked"
     echo ""
     echo -e "${CYAN}Next steps:${NC}"
     echo "  • Inspect bundles: $AHU_BIN inspect $BUNDLES_DIR/*.ahu"

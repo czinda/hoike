@@ -1244,13 +1244,28 @@ fn run_check(config_path: PathBuf) {
     // CMS/signature-authenticated) and is not flagged here.
     check_trusted_channels(&config);
 
-    if let Err(e) = check_bundles(&config) {
+    // Resolve bundle selection before checking bundles so configuration and
+    // selection errors (unscoped legacy config, duplicate destinations, an
+    // empty bundle directory, invalid nonce policy) are labeled as config
+    // failures rather than masquerading as bundle verification failures.
+    let bundle_paths = match hoike_core::router::configured_bundle_paths(&config) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("  Bundle selection: FAIL — {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = check_bundles(&config, &bundle_paths) {
         eprintln!("  Bundle:    FAIL — {e}");
         std::process::exit(1);
     }
 }
 
-fn check_bundles(config: &hoike_core::Config) -> hoike_core::error::Result<()> {
+fn check_bundles(
+    config: &hoike_core::Config,
+    paths: &[std::path::PathBuf],
+) -> hoike_core::error::Result<()> {
     use hoike_core::admission::{AdmissionTrust, admit_bundle};
     use std::collections::HashSet;
 
@@ -1262,11 +1277,11 @@ fn check_bundles(config: &hoike_core::Config) -> hoike_core::error::Result<()> {
     let mut scopes = HashSet::new();
     let mut entries = 0;
     let mut demo = false;
-    for path in hoike_core::router::configured_bundle_paths(config)? {
+    for path in paths {
         if !checked.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
             continue;
         }
-        let bundle = ahu::Bundle::from_file(&path)?;
+        let bundle = ahu::Bundle::from_file(path)?;
         let trust = admit_bundle(&bundle, &config.storage, now)?;
         println!("\n  Bundle:    {}", path.display());
         match trust {

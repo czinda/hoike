@@ -2,6 +2,13 @@
 
 This ledger tracks the 29 findings reviewed against commit `912989b32b5f01289865669e76790ce2b8b72cf7`. It describes the remediation branch, not a deployed or independently certified release. The original review and comprehensive plan remain review artifacts; this document records the implemented behavior and remaining validation work.
 
+The follow-on **October 2026 audit** (twelve further findings, F01–F12) is
+closed in [`audit-remediation-2026-10-23.md`](audit-remediation-2026-10-23.md),
+which records per-finding fixes, regression test names, the migration contract
+validation, integrated release-evidence commands with results, and remaining
+qualification. This document's migration sections below remain the operator
+reference for the behaviors both ledgers introduced.
+
 ## Finding ledger
 
 “Regression” identifies executable coverage in this repository. An implemented change is not automatically production-qualified. Test names are supplied so results can be reproduced without relying on historic total test counts.
@@ -135,7 +142,7 @@ Build with `tls` when configuring TLS/mTLS and with `dogtag-sync`/`pkcs11` when 
 
 ## Validation record and remaining release gates
 
-`cargo test -p hoike-sign --features dogtag-sync,pkcs11 --offline` passed **69 library tests and all 6 ML-DSA bundle integration tests** after updating historical integration fixtures to fresh source windows. This includes AWS-LC RSA verification and PEM/DER issuer equivalence, real-signature PKCS#11 encoding, atomic output destination/failure, and PEM rotation regressions. Final local validation also passed:
+`cargo test -p hoike-sign --features dogtag-sync,pkcs11 --offline` passed **69 library tests and all 6 ML-DSA bundle integration tests** after updating historical integration fixtures to fresh source windows. This includes AWS-LC RSA verification and PEM/DER issuer equivalence, real-signature PKCS#11 encoding, atomic output destination/failure, and PEM rotation regressions. Intermediate validation during the September remediation also passed:
 
 - Default workspace: **197 tests**.
 - Workspace with `tls,metrics,pkcs11,dogtag-sync,hoike-server/embed-webui`: **221 tests**.
@@ -144,7 +151,17 @@ Build with `tls` when configuring TLS/mTLS and with `dogtag-sync`/`pkcs11` when 
 - Web UI production build and TypeScript `tsc --noEmit`.
 - Rust all-target, all-feature Clippy with `-D warnings`, formatting, and whitespace checks.
 
-The UI `npm run lint` command cannot execute because the existing project has no ESLint configuration file; this is a tooling follow-up, not a passing lint result. CI requests default workspace tests, TLS/metrics/PKCS#11/Dogtag feature tests, no-default-feature ahu tests, and release-mode parser regression. Feature-enabled unit tests do not exercise real 389 DS or a hardware HSM.
+**October 2026 closure validation** (branch `fix/audit-remediation` after the
+F01–F12 fixes; transcripts in the plan workspace, summarized in the
+[closure ledger](audit-remediation-2026-10-23.md)): default workspace
+**305 tests** and feature workspace (`tls,metrics,pkcs11,dogtag-sync`)
+**332 tests**, all passing; all-features clippy `-D warnings`, fmt,
+`git diff --check`, the minimal-library ahu checks, the release-mode parser
+regression, the web UI build, and a full scripted demo run (authenticated
+admission, OCSP queries, offline import rollback rejection, restart
+continuity) all passed on macOS.
+
+The UI `npm run lint` command cannot execute because the existing project has no ESLint configuration file; this is a tooling follow-up, not a passing lint result. CI requests default workspace tests, TLS/metrics/PKCS#11/Dogtag feature tests, no-default-feature ahu tests, the release-mode parser regression, and — added with the October closure — a **Linux + macOS matrix** running the hoike-core `state_lock`, `anti_rollback`, and `installation` suites, plus a web-UI build feeding the all-features clippy gate. Feature-enabled unit tests do not exercise real 389 DS or a hardware HSM.
 
 Still required before qualifying a deployment: live 389 DS delete/present/restart/stale-cookie tests; intended HSM and key-renewal integration; process restart and real power-loss recovery on the intended filesystem; adversarial upstream and login load; independent-client interoperability; configuration migration/canary; and a fresh security review. No production deployment or certification is asserted.
 

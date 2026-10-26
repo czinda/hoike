@@ -60,9 +60,12 @@ v1.1, including the transport-hardening trusted-path/trusted-channel SFRs — se
 ## The ahu bundle format
 
 The **ahu** (Hawaiian: a cairn, a trail marker) format is a portable container of
-pre-signed OCSP responses. Bundles are sealed with CMS `SignedData`, designed
-for zero-copy serving via `mmap` + binary search, and verified against
-configured signer certificate pins or CA anchors on load.
+pre-signed OCSP responses. Bundles are sealed with CMS `SignedData` and verified
+against configured signer certificate pins or CA anchors on load. The format is
+designed for zero-copy `mmap` serving, and the `ahu` crate ships a
+library-level `MmapBundle` reader for it; the current serving path loads
+bundles into memory and binary-searches the index there — `mmap` is not yet
+deployed in the serving hot path.
 
 See [`ahu-format-spec.md`](ahu-format-spec.md) for the full specification.
 
@@ -84,11 +87,16 @@ Binaries:
 - `target/release/hoike` — the OCSP responder (~8 MB)
 - `target/release/ahu` — bundle inspection and management tool (~1 MB)
 
-Running tests (147 tests across 6 crates):
+Running tests:
 
 ```bash
 cargo test --workspace
 ```
+
+The October 2026 audit remediation is closed out in
+[`docs/audit-remediation-2026-10-23.md`](docs/audit-remediation-2026-10-23.md),
+which records each finding, its fix and regression tests, the migration
+contract, and the integrated release-evidence commands with results.
 
 ## Quick start
 
@@ -424,6 +432,18 @@ changes, regression evidence, migration requirements, and remaining release gate
   unreadable key material abort startup. Not yet
   covered: payload *confidentiality* and authentication of foca's SWIM liveness traffic
   (pings/acks).
+- **Gossip does not distribute bundles** — a `GenerationAnnouncement` records
+  the peer's epoch in the fleet view but does not fetch, verify, or install the
+  peer's bundle (no pull-on-announce); bundle movement is an operator/import
+  concern.
+- **Writer exclusion is single-host** — the exclusive `.writer.lock` (flock)
+  bounds writers on one machine and one local filesystem. It is not
+  distributed signer fencing, and it is not qualified on network filesystems.
+- **Batching/mmap are library support, not deployed hot path** — `ahu`
+  provides `MmapBundle` (zero-copy reads) and the format supports response
+  batching, but the serving path loads full bundles into memory and serves
+  stored single-response entries; no runtime delta overlay, decompression, or
+  mmap hot path is deployed.
 - **Bounded CMS trust profile** — explicit certificate pins or direct-issued
   seal certificates under configured CA anchors. General intermediate-chain PKIX
   validation is unsupported. Configure producer/CA authorizations where needed.

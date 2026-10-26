@@ -8,8 +8,13 @@
 
 > **Implementation status:** Most features described here are implemented in
 > v0.2.0. For remaining gaps, see [README.md](README.md) — specifically the
-> Known Limitations section. Gossip authentication, full PKIX seal chain
-> validation, and several revocation source adapters remain planned.
+> Known Limitations section. Broadcast authentication for gossip is
+> implemented (Ed25519-signed, named-origin, explicit `auth_mode`); gossip
+> payload confidentiality, SWIM liveness authentication, and automatic bundle
+> pull-on-announce remain planned. Full PKIX seal chain validation and several
+> revocation source adapters also remain planned. The October 2026 audit
+> remediation closure is recorded in
+> [docs/audit-remediation-2026-10-23.md](docs/audit-remediation-2026-10-23.md).
 
 ---
 
@@ -335,7 +340,7 @@ HTTP request
    ├─ route: (hashAlg, issuerNameHash, issuerKeyHash) → CaContext(s)
    │      └─ no match → unauthorized
    │
-   ├─ lookup: entry_key = SHA-256(DER CertID) → binary search mmap index
+   ├─ lookup: entry_key = SHA-256(DER CertID) → binary search index
    │      ├─ hit  → write stored octets verbatim
    │      └─ miss → authoritative-complete ? unauthorized : forward-or-unauthorized
    │
@@ -359,6 +364,12 @@ debugging into a log line.
 **Never allocate per request on the hot path.** The response is already bytes in
 an `mmap`ed region. `writev` the headers and the slice. No parse, no copy, no
 re-encode.
+
+> **Implementation status (serving path):** the current serving path loads a
+> admitted bundle into memory and serves stored octets from there — no parse,
+> no re-encode, but not yet the `mmap` zero-copy hot path described above.
+> `ahu::MmapBundle` exists as library support; deploying it in the responder
+> hot path is future work, as is `SingleResponse` batching (§4).
 
 ---
 

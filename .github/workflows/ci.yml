@@ -15,7 +15,7 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────
-  # 1. Fast gate: check, clippy, fmt
+  # 1. Fast gate: check, clippy (all features, embedded UI), fmt
   # ──────────────────────────────────────────────
   check:
     name: Check & Lint
@@ -29,14 +29,59 @@ jobs:
           toolchain: "1.97"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # Build the web UI first so the `embed-webui` feature (include_dir over
+      # webui/dist) compiles against a real UI build, never a stale or empty
+      # directory. The all-features clippy gate below depends on this output.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6870020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - name: Build web UI
+        working-directory: webui
+        run: |
+          npm ci --no-audit --no-fund
+          npm exec tsc -- --noEmit
+          npm run build
       - name: cargo check
         run: cargo check --workspace --locked
       - name: cargo check (pkcs11 feature)
         run: cargo check -p hoike-sign -p hoike-cli --features pkcs11 --locked
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: cargo fmt
         run: cargo fmt --all -- --check
+
+  # ──────────────────────────────────────────────
+  # 1b. Platform evidence: state machine, anti-rollback, installation
+  #
+  # flock-based writer exclusion, strict state reopen, and durable
+  # installation behave differently enough across kernels that both macOS
+  # and Linux must execute the same suites before release.
+  # ──────────────────────────────────────────────
+  platform:
+    name: Platform state tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      RUSTUP_TOOLCHAIN: "1.97"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform-${{ matrix.os }}
+      - name: Install C/CMake prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config
+      - name: State lock, anti-rollback, and installation suites
+        run: cargo test -p hoike-core --locked --test state_lock --test anti_rollback --test installation
+
 
   # ──────────────────────────────────────────────
   # 2. Test matrix: stable + nightly

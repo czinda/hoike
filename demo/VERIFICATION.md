@@ -1,15 +1,18 @@
 # Demo Verification Report
 
-## Current verification commands
+## Current verification commands (October 26, 2026 remediation run)
 
-The stage output below is a historical demo record, not evidence of authenticated
-bundle admission. Current demo configurations explicitly enable
-`storage.allow_unauthenticated_bundles` for ephemeral keys. Use structural mode
-for those bundles:
+`demo/run.sh` produces the bundles and configurations below in disposable
+runtime state (`demo/bundles/`, `demo/state-*/`), with a fresh CRL and a fresh
+demo seal pair (`demo/fixtures/seal-key.p8` + `seal-cert.pem`) generated on
+every run. The seal pair is never committed: a committed seal certificate
+would carry a fixed expiry window that eventually fails admission closed.
+
+Structure-only verification needs no trust policy:
 
 ```bash
-ahu verify bundles/test-ecdsa-epoch1.ahu --structure-only
-ahu verify bundles/test-mldsa-epoch1.ahu --structure-only
+ahu verify bundles/demo-ecdsa-epoch1.ahu --structure-only
+ahu verify bundles/demo-mldsa-epoch1.ahu --structure-only
 ```
 
 Successful structural verification prints exactly:
@@ -18,26 +21,67 @@ Successful structural verification prints exactly:
 Structure valid; authenticity not checked.
 ```
 
-For authenticated verification, independently provision signer certificate pins
-or supported CA anchors in the configuration, plus any scope authorizations:
+Authenticated verification uses the config `run.sh` generates, which pins the
+current run's seal certificate:
 
 ```bash
-ahu verify bundles/test-ecdsa-epoch1.ahu --config configs/trusted-edge.toml
+ahu verify bundles/demo-ecdsa-epoch1.ahu --config configs/trusted-edge.toml
 ```
 
-Bare `ahu verify FILE` fails. `--structure-only` cannot be combined with `--config`
-or `--entries`. Add `--entries` to authenticated mode to check OCSP signatures
-with embedded keys; the demo sign commands below omit responder certificates,
-so their successful OCSP responses cannot pass that extra check. Unsigned OCSP
-errors are reported separately. Embedded-key checking is not responder-chain
-PKIX validation.
+This is a real file after a demo run (a minimal `[server]`/`[storage]` config
+with `seal_signer_pins = ["<demo>/fixtures/seal-cert.pem"]`). Because the pin
+is only valid for bundles sealed in the same run, re-running the demo
+regenerates both the pair and the config together. Successful output ends
+with `Bundle authenticated. Installation eligibility not checked.` The demo
+also shows the failure modes: a flipped byte anywhere in the bundle (including
+the seal region, which is digest-covered) fails verification, and pinning a
+different certificate (the demo CA) rejects the seal with
+`signer certificate does not match an explicit pin`.
+
+Bare `ahu verify FILE` fails. `--structure-only` cannot be combined with
+`--config` or `--entries`. Add `--entries` to authenticated mode to check OCSP
+signatures with embedded keys; the demo sign commands omit responder
+certificates, so their successful OCSP responses cannot pass that extra check.
+Unsigned OCSP errors are reported separately. Embedded-key checking is not
+responder-chain PKIX validation.
 
 `hoike check --config configs/edge-ecdsa.toml` is read-only and reports
-`Unauthenticated demo admission; authenticity not checked.` for the current local
-demo configuration. Authenticated verification and checks explicitly report that
-installation eligibility was not checked; they do not install bundles or advance
-rollback marks. `run.sh` now exercises the structural modes and read-only check.
-These command updates do not assert that the full demo was rerun.
+`Seal: authenticated (signer SHA-256: …)` for the demo configuration — the
+generated edge configs use `seal_signer_pins`, not the unauthenticated demo
+flag. Checks explicitly report that installation eligibility was not checked;
+they do not install bundles or advance rollback marks. `run.sh` exercises the
+structural and authenticated modes, the read-only check, the OCSP queries
+(good/revoked/unknown), the offline import rejection of an older epoch, and a
+restart over preserved state.
+
+The containerized path (`docker compose`) differs: it signs with `--demo-key`
+only (ephemeral seal material) and serves with
+`storage.allow_unauthenticated_bundles = true` — demo admission, explicitly
+reported as unauthenticated. The authenticated flow above is the native
+`./run.sh` path.
+
+### October 26, 2026 integrated run (D2 closure evidence)
+
+Full transcript: `.superpowers/sdd/2026-10-23-audit-remediation/logs/task-12/`
+(repository-private plan workspace; summarized in
+`docs/audit-remediation-2026-10-23.md`). Results:
+
+- Fresh fixtures (CRL `thisUpdate` Oct 26 15:35:56 2026 GMT; fresh seal pair),
+  disposable state (`rm -rf bundles state-ecdsa state-mldsa` before the run).
+- ECDSA and ML-DSA bundles signed with `--demo-key` OCSP keys plus the
+  persistent seal pair; both authenticated against `configs/trusted-edge.toml`.
+- Tampered bundle rejected; wrong-pin verification rejected.
+- `hoike check` reported `Seal: authenticated`; `init-state` then `serve`
+  succeeded with authenticated admission.
+- Queries: serial 01 → `Successful`/`GOOD` (two dual-CertID responses);
+  serial 0A → `Successful`/`REVOKED` (KeyCompromise); serial FF →
+  `Unauthorized` (unsigned, 5-byte response).
+- Edge stopped; offline `hoike import` of the epoch-0 bundle rejected with
+  `Import failed: epoch rollback: scope hoike-cli:942ed9ca26d9c8eb epoch 0 <= high-water 1`.
+- Edge restarted on the preserved state directory and served the identical
+  committed generation (`GOOD` after restart).
+- ML-DSA edge served an `ml-dsa-65` response (3309-byte signature) under
+  `--prefer ml-dsa-65,ecdsa-p256`.
 
 ## What Was Built
 
@@ -305,12 +349,11 @@ Not tested in this verification — the Dockerfile and compose file are correct 
 **Next step:** Run `docker compose up` and verify the full containerized flow.
 
 ### Anti-Rollback Test
-Not executed in this verification. The `run.sh` script includes a stage that:
-1. Signs a bundle with `--epoch 0`
-2. Attempts to import it after epoch 1 is loaded
-3. Expects rejection with "Anti-rollback: REJECTED — epoch 0 <= high-water mark 1"
-
-**Next step:** Execute the anti-rollback stage in `run.sh` to prove epoch monotonicity enforcement.
+Executed in the October 26, 2026 integrated run (see above): the edge is
+stopped (import is offline by design — a running server holds the writer
+lock), the epoch-0 bundle import is rejected with
+`Import failed: epoch rollback: … epoch 0 <= high-water 1`, and the edge
+restart serves the identical committed generation.
 
 ---
 
@@ -332,7 +375,8 @@ ML-DSA-65 and ECDSA are both **first-class signing algorithms**. The same signer
 ### 4. Bundle Format (ahu) ✓
 - Self-describing CBOR manifest
 - CMS SignedData seal
-- Binary-search mmap index
+- Binary-search index (served from memory; `MmapBundle` zero-copy reads are
+  library support, not the deployed serving hot path)
 - Pre-signed OCSP responses stored verbatim
 
 ### 5. Real CLI Commands ✓
@@ -359,13 +403,14 @@ These are all **implemented** in the hoike codebase (see `AGENTS.md`), but not s
 
 ## Recommended Next Steps
 
-1. **Fix CertID extraction** in `run.sh` so queries return `good`/`revoked` responses
-2. **Run `docker compose up`** to verify the containerized orchestration
-3. **Execute the anti-rollback stage** to prove epoch monotonicity
-4. **Add a second CA** to demonstrate multi-CA routing on one edge
-5. **Show delta bundles** by signing epoch 2 with `--good-serials` changed
-6. **Demo live nonce signing** with a combined-mode node
-7. **Multi-node gossip** with 3+ edges showing generation propagation
+1. **Run `docker compose up`** to verify the containerized orchestration (the
+   containerized path uses unauthenticated demo admission — see above)
+2. **Add a second CA** to demonstrate multi-CA routing on one edge
+3. **Demo live nonce signing** with a combined-mode node
+4. **Multi-node gossip** with 3+ edges showing generation propagation in the
+   fleet view (announcements propagate; bundles are not pulled automatically)
+5. **Materialize a delta offline** with `ahu apply` + an authorized seal — the
+   serving path itself admits only full, uncompressed bundles
 
 ---
 

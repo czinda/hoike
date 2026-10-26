@@ -43,13 +43,13 @@ else
 
 # ── Step 1: Generate CA private key and self-signed certificate ──
 if [[ ! -f ca-key.pem ]]; then
-    echo "[1/6] Generating CA private key (ECDSA P-256)..."
+    echo "[1/7] Generating CA private key (ECDSA P-256)..."
     openssl ecparam -genkey -name prime256v1 -noout -out ca-key.pem
     echo "       → ca-key.pem"
 fi
 
 if [[ ! -f ca-cert.pem ]]; then
-    echo "[2/6] Generating CA self-signed certificate..."
+    echo "[2/7] Generating CA self-signed certificate..."
     openssl req -new -x509 -key ca-key.pem -out ca-cert.pem -days 3650 \
         -subj "/CN=hoike Demo CA/O=hoike Demo/C=US" \
         -addext "basicConstraints=critical,CA:TRUE" \
@@ -59,13 +59,13 @@ fi
 
 # ── Step 2: Convert CA cert to DER (required by hoike --issuer) ──
 if [[ ! -f issuer.der ]]; then
-    echo "[3/6] Converting CA cert to DER format..."
+    echo "[3/7] Converting CA cert to DER format..."
     openssl x509 -in ca-cert.pem -outform DER -out issuer.der
     echo "       → issuer.der"
 fi
 
 # ── Step 3: Generate end-entity certificate keys and requests ──
-echo "[4/6] Generating end-entity certificates..."
+echo "[4/7] Generating end-entity certificates..."
 
 # Good certificates (serials 01-05)
 for serial in 01 02 03 04 05; do
@@ -96,8 +96,28 @@ echo "       → cert-0A.pem (will be revoked)"
 
 fi  # end CA/cert generation (skipped in --crl-only mode)
 
-# ── Step 4: Create CRL with revoked certificate ── (always runs — fresh thisUpdate)
-echo "[5/6] Generating CRL with revoked certificate (serial 0A)..."
+# ── Step 4: Demo seal pair (ALWAYS regenerated — like the CRL) ──
+# The demo signs its bundles with a persistent seal pair so that admission can
+# be authenticated against a real certificate pin (configs/trusted-edge.toml).
+# A committed cert would carry a fixed expiry window (a time-bomb: after it
+# passes, verification fails closed with "certificate outside validity
+# period"), so — like the CRL — the pair is regenerated with a fresh window on
+# every run and is never committed. The certificate stays inside the supported
+# seal profile: only subjectKeyIdentifier, keyUsage=digitalSignature, and
+# basicConstraints=CA:FALSE extensions.
+echo "[5/7] Generating demo seal pair (fresh window, P-256)..."
+openssl ecparam -genkey -name prime256v1 -noout -out seal-key-sec1.pem
+openssl pkcs8 -topk8 -nocrypt -in seal-key-sec1.pem -out seal-key.p8
+openssl req -new -x509 -key seal-key.p8 -out seal-cert.pem -days 90 \
+    -subj "/CN=hoike Demo Seal Signer/O=hoike Demo/C=US" \
+    -addext "keyUsage=critical,digitalSignature" \
+    -addext "basicConstraints=critical,CA:FALSE"
+rm seal-key-sec1.pem
+echo "       → seal-key.p8 (PKCS#8, distinct from the OCSP demo key)"
+echo "       → seal-cert.pem (pinned by configs/trusted-edge.toml)"
+
+# ── Step 5: Create CRL with revoked certificate ── (always runs — fresh thisUpdate)
+echo "[6/7] Generating CRL with revoked certificate (serial 0A)..."
 
 # OpenSSL needs a database and serial file for CRL generation
 touch crl-index.txt
@@ -131,8 +151,8 @@ openssl ca -config openssl-crl.cnf -gencrl -out crl.pem \
 rm openssl-crl.cnf
 echo "       → crl.pem (contains revoked serial 0A)"
 
-# ── Step 5: Create good-serials.txt for authoritative-complete bundles ──
-echo "[6/6] Creating good-serials.txt..."
+# ── Step 6: Create good-serials.txt for authoritative-complete bundles ──
+echo "[7/7] Creating good-serials.txt..."
 cat > good-serials.txt <<EOF
 # Known-good certificate serials (hex, one per line)
 # Used by hoike sign --good-serials to produce authoritative-complete bundles

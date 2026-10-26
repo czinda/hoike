@@ -41,7 +41,7 @@ These are documented design boundaries, not defects, and are not eligible for ad
 - **Bounded CRL profile.** Complete, direct CRLs only, signed with ECDSA P-256, RSA PKCS#1 v1.5, or ML-DSA. Delta and indirect CRLs and unknown critical extensions are rejected.
 - **Delta output is unsigned by default.** `ahu apply` produces an unsigned intermediate; use `apply_sealed` or the `--seal-key`/`--seal-cert` options to produce an installable bundle.
 - **Multi-request OCSP.** Only the first `CertID` in a multi-request `OCSPRequest` is answered.
-- **Cryptography is not FIPS-validated.** All cryptographic operations execute in Rust crates outside any validated module. HSM-produced signatures are the exception. See `docs/compliance/` and the FIPS status page on hoike.dev for the migration plan.
+- **Cryptography is not FIPS-validated.** All cryptographic operations execute in Rust crates outside any validated module. HSM-produced signatures are the exception. `aws-lc-rs` is FIPS-*capable*, but hoike does not build it in `fips` mode, and enabling that feature alone would not make a deployment FIPS-validated: validation covers the module build, its boundary, and the operating environment, and is a deployment/evaluation activity. See [`docs/security-target/`](docs/security-target/) and [`docs/niap-ppca-gap-matrix.md`](docs/niap-ppca-gap-matrix.md) for the current posture.
 - **Admin authentication is basic.** Per-account lockout, password policy, idle timeout, and operator identity in audit events are not yet implemented. Put the admin listener behind mutual TLS on a management network.
 
 ## Verifying releases

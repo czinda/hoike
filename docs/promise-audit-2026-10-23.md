@@ -4,6 +4,12 @@
 - **Baseline:** `c866700ed32910b66cf16af0d7d16b272797d240` (`demo/executive-showcase`)
 - **Scope:** README, design, ahu format specification, security/remediation documents, CLI/server entry points, and the local demo presentation.
 
+> **Closure (October 26, 2026):** all twelve findings below are remediated on
+> branch `fix/audit-remediation`; see the
+> [closure ledger](audit-remediation-2026-10-23.md) for the corrected behavior,
+> responsible commits, regression tests, migration actions, and integrated
+> evidence. This document is preserved unchanged as historical audit evidence.
+
 ## Result
 
 **The capabilities are not all complete end to end.** This audit identifies **12 actionable mismatches: 5 High, 5 Medium, and 2 Low**. Nine have isolated executable reproductions; the other three are source-traced. Severity describes operational/security impact under the stated conditions, not a CVSS rating.

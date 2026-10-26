@@ -35,6 +35,10 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 
 - Default signer builds use AWS-LC for RSA CRL verification; install a C compiler,
   CMake and pkg-config. This is not a FIPS-validation claim.
+- The declared Rust floor is `1.85` at the source level for first-party code.
+  Building `hoike-gossip` needs rustc >= 1.88 in practice: the locked `foca`
+  2.0.0 dependency declares `rust-version = "1.88"` and cargo enforces that
+  against the invoking toolchain. The pinned development toolchain is 1.97.
 
 - `x509-ocsp` 0.2.1 depends on `der` 0.7, while `ahu` uses `der` 0.8. Any crate
   that parses or constructs OCSP types must use `der` 0.7 (matching x509-ocsp).
@@ -145,7 +149,10 @@ metrics + audit log, ahu admin tooling, and the M4 gossip fleet view) are
 implemented. The design doc (`hoike-design.md`) is the roadmap — it describes the
 target architecture including automatic bundle pull-on-announce, which is not built. The README describes what runs today.
 
-See `docs/review-remediation.md` for all 29 review findings, migrations and evidence.
+See `docs/review-remediation.md` for all 29 review findings, migrations and evidence,
+and `docs/audit-remediation-2026-10-23.md` for the October 2026 twelve-finding audit
+closure (per-finding fixes, regression tests, migration contract, integrated
+release evidence, and remaining qualification).
 Keep one writer per state directory; immutable committed bundle snapshots and rollback
 marks must be backed up/restored together. Default delta apply is an unsigned
 intermediate: authenticate inputs and use a real authorized seal before installation.

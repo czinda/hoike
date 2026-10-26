@@ -591,7 +591,7 @@ fn parse_generalized_time(s: &str) -> Option<u64> {
     // Days from the Unix epoch to the civil date (Howard Hinnant's algorithm).
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;

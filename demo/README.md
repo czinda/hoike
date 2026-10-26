@@ -67,8 +67,12 @@ start. To wipe all container state and start completely fresh:
 podman compose down -v          # -v also removes the named volumes
 ```
 
-Omit `-v` to stop the stack but keep the epoch high-water marks (a later `up` then
-reloads the same epoch, which is allowed; an *older* epoch is still rejected).
+Omit `-v` to stop the stack but keep the epoch high-water marks. Note that a
+later `up` re-runs the signer, which produces a **new epoch-1 generation**
+(fresh CRL window, ephemeral keys) — the preserved marks correctly reject that
+new generation at the same epoch, and the edges exit with an anti-rollback
+error. Keeping state across `up`s only works if the bundles are unchanged; to
+rerun the containerized demo end-to-end, use `podman compose down -v`.
 
 ## Quick Start (Script)
 
@@ -78,11 +82,14 @@ cd demo
 ```
 
 The script:
-1. Generates a test CA, certificates, and CRL
-2. Signs bundles with ECDSA and ML-DSA
-3. Starts a keyless edge server
-4. Runs client queries showing all response types
-5. Demonstrates anti-rollback by rejecting an older-epoch bundle
+1. Generates a test CA, certificates, CRL, and a fresh demo seal pair
+2. Signs bundles with ECDSA and ML-DSA (sealed by the persistent demo seal pair)
+3. Authenticates the seals against the pinned demo certificate
+   (`configs/trusted-edge.toml`), and shows tampered/unpinned input failing
+4. Starts a keyless edge server (authenticated bundle admission)
+5. Runs client queries showing all response types
+6. Demonstrates anti-rollback by rejecting an older-epoch bundle via offline
+   `hoike import`, then restarting the edge over the preserved state
 
 ## Architecture Walkthrough
 
@@ -115,7 +122,9 @@ response anchors its `nextUpdate` to the CRL's `thisUpdate` (source freshness),
 not to wall-clock now, so a stale committed CRL would produce responses that are
 "born expired" and `hoike sign` would refuse to emit them. Because of this, the
 CRL and its OpenSSL bookkeeping files are **not** committed (see `demo/.gitignore`)
-— only the stable identity fixtures are. To force a full regeneration from
+— only the stable identity fixtures are. The demo **seal pair** is regenerated
+for the same reason: a committed seal certificate would carry a fixed expiry
+window that eventually fails admission closed. To force a full regeneration from
 scratch: `rm -rf demo/fixtures/ca-* demo/fixtures/cert-* demo/fixtures/issuer.der`.
 
 **Files created:**
@@ -123,6 +132,9 @@ scratch: `rm -rf demo/fixtures/ca-* demo/fixtures/cert-* demo/fixtures/issuer.de
 - `fixtures/ca-cert.pem` — Test CA certificate
 - `fixtures/issuer.der` — DER-encoded issuer certificate (required by hoike)
 - `fixtures/crl.pem` — Certificate Revocation List with one revoked cert (serial `0A`)
+- `fixtures/seal-key.p8` + `fixtures/seal-cert.pem` — Demo seal pair (P-256,
+  regenerated with a fresh validity window every run, never committed) used to
+  seal the demo bundles and pinned by `configs/trusted-edge.toml`
 - `fixtures/good-serials.txt` — Known-good certificate serials (for authoritative-complete bundles)
 
 ### Stage 2: Bundle Signing (Classical)
@@ -136,14 +148,19 @@ hoike sign \
   --good-serials fixtures/good-serials.txt \
   --sig-alg ecdsa-p256 \
   --demo-key \
+  --seal-key fixtures/seal-key.p8 \
+  --seal-cert fixtures/seal-cert.pem \
   --epoch 1 \
   -o bundles/demo-ecdsa-epoch1.ahu
 ```
 
 **What happens:**
 1. `hoike sign` reads the CRL and good-serials list
-2. Generates pre-signed OCSP responses for every entry (good and revoked)
-3. Seals them into an `.ahu` bundle with a CMS SignedData signature
+2. Generates pre-signed OCSP responses for every entry (good and revoked) with
+   the ephemeral `--demo-key`
+3. Seals them into an `.ahu` bundle with a CMS `SignedData` signature from the
+   persistent demo seal pair — a key distinct from the OCSP signing key, as
+   production configuration requires
 4. Writes the bundle to disk
 
 **What to look for:**
@@ -151,11 +168,11 @@ hoike sign \
 - Entry count (matching the good + revoked certificate count)
 - Epoch number (1 — this is generation 1 for this CA)
 
-**Why the seal matters:** With configured trust, the seal authenticates the
-producer and binds the bundle contents to its epoch. This demo uses ephemeral
-keys and explicitly opts into unauthenticated admission. For authenticated
-serving, provision signer certificate pins or CA anchors as shown in the
-[configuration guide](../README.md#configuration).
+**Why the seal matters:** the seal authenticates the producer and binds the
+bundle contents to its epoch. The demo pins the seal certificate in
+`configs/trusted-edge.toml` and the edge configs, so `ahu verify --config` and
+edge admission perform real authenticated verification. The OCSP signing key
+remains ephemeral (`--demo-key`) — that is the demo shortcut, not the seal.
 
 ### Stage 3: Bundle Signing (Post-Quantum)
 
@@ -168,6 +185,8 @@ hoike sign \
   --good-serials fixtures/good-serials.txt \
   --sig-alg ml-dsa-65 \
   --demo-key \
+  --seal-key fixtures/seal-key.p8 \
+  --seal-cert fixtures/seal-cert.pem \
   --epoch 1 \
   -o bundles/demo-mldsa-epoch1.ahu
 ```
@@ -189,7 +208,7 @@ listen = "127.0.0.1:2560"
 [storage]
 bundle_dir = "demo/bundles"
 state_db = "demo/state-ecdsa"
-allow_unauthenticated_bundles = true # Demo only; no seal trust is provisioned
+seal_signer_pins = ["demo/fixtures/seal-cert.pem"]  # authenticated admission
 
 [[ca]]
 label = "demo-ca"
@@ -206,8 +225,10 @@ hoike serve --config edge-ecdsa.toml
 
 **What happens:**
 1. `hoike init-state` explicitly acknowledges the new state directory — it refuses an existing state file or a directory holding recovery material, and there is no `--force` reset
-2. Edge checks bundle structure and digests, then logs unauthenticated demo admission
-3. Builds an in-memory index (mmap + binary search)
+2. Edge authenticates the CMS seal against the pinned seal certificate, then checks structure and digests
+3. Builds an in-memory index over the loaded bundle (binary search; the `ahu`
+   crate's zero-copy `MmapBundle` reader is library support, not the deployed
+   serving path)
 4. Starts HTTP listener on port 2560
 5. Serves pre-signed responses verbatim — no parsing, no re-encoding, no signing
 6. Holds an exclusive OS writer lock (`.writer.lock` in the state directory) for the whole process lifetime — a second `hoike serve` on the same state directory is rejected
@@ -215,7 +236,7 @@ hoike serve --config edge-ecdsa.toml
 A restart reuses the existing state directory as-is: it never initializes, resets, or deletes it. `hoike serve` on a missing state directory fails with a pointer to `hoike init-state` instead of silently starting a fresh anti-rollback timeline.
 
 **What to look for:**
-- Audit warning: `UNAUTHENTICATED DEMO bundle admitted; CMS seal not verified`
+- Log line: `CMS seal authenticated against configured trust policy`
 - Log line: `hoike OCSP responder starting` (mode=edge)
 - **No signing key mentioned** — the edge holds none
 
@@ -326,27 +347,30 @@ hoike sign \
   --good-serials fixtures/good-serials.txt \
   --sig-alg ecdsa-p256 \
   --demo-key \
-  --epoch 0 \   # <--- Older epoch
+  --seal-key fixtures/seal-key.p8 \
+  --seal-cert fixtures/seal-cert.pem \
+  --epoch 0 \
   -o bundles/demo-ecdsa-epoch0.ahu
 ```
 
-**Try to load it on the running edge:**
+**Try to install it with the offline importer:**
 ```bash
-# Option 1: hoike import (offline — stop the edge first, then run)
-# hoike stop / kill <hoike-pid>
+# Import is offline by design — stop the edge first (it holds the writer lock):
+kill <hoike-serve-pid>
 hoike import --bundle bundles/demo-ecdsa-epoch0.ahu --ca demo-ca --config edge-ecdsa.toml
-
-# Option 2: Replace the bundle file and reload (future feature)
-# cp bundles/demo-ecdsa-epoch0.ahu bundles/demo-ecdsa-epoch1.ahu
-# (restart the server; there is no SIGHUP reload)
 ```
 
 **Expected result:**
 ```
-Import failed: epoch rollback: scope <producer>:<issuer-key-hash> epoch 0 <= high-water 1
+Import failed: epoch rollback: scope hoike-cli:<issuer-key-hash prefix> epoch 0 <= high-water 1
 ```
 
-**Why this matters:** An attacker with write access to the bundle directory (or the ability to inject a stale bundle via gossip) cannot replay an old generation. The edge persists a high-water mark per `(producer_id, CA)` tuple in `state_db`. Any bundle with epoch ≤ high-water is rejected at load, before it ever reaches the serving path. (Import also authenticates the CMS seal and refuses to run while the edge holds the writer lock — run it offline. Demo configs with `allow_unauthenticated_bundles = true` still require explicit trust for import.)
+**Why this matters:** An attacker with write access to the bundle directory (or the ability to inject a stale bundle via gossip) cannot replay an old generation. The edge persists a high-water mark per `(producer_id, CA)` tuple in `state_db`. Any bundle with epoch ≤ high-water is rejected at load, before it ever reaches the serving path. The import authenticates the CMS seal under the configured pins (the demo flag never relaxes import) and refuses to run while the edge holds the writer lock — run it offline.
+
+**Restart continuity:** after the rejected import, `run.sh` restarts the edge on
+the unchanged state directory. The identical committed generation reloads
+idempotently over the preserved marks — the restart serves the same responses,
+and a *different* bundle at the same epoch would be rejected as a fork.
 
 **Fork detection:** If two bundles claim the same epoch but have different `prev_manifest_digest` values, the edge detects a fork and refuses both. This prevents a malicious producer (or a split-brain signer) from publishing conflicting generations.
 
@@ -354,12 +378,12 @@ Import failed: epoch rollback: scope <producer>:<issuer-key-hash> epoch 0 <= hig
 
 This is a technical proof-of-concept, not a production qualification. Missing from this demo:
 
-- **PKCS#11 HSM signing** — The signer uses `--demo-key` (ephemeral software keys). Production should use `signing_key.type = "pkcs11"` with a hardware security module.
-- **Authenticated bundle admission** — Demo configs explicitly set `allow_unauthenticated_bundles = true` with empty trust lists. Production requires independently provisioned signer pins or CA anchors.
+- **PKCS#11 HSM signing** — The signer uses `--demo-key` (ephemeral software keys) for OCSP signatures. Production should use `signing_key.type = "pkcs11"` with a hardware security module. The demo *seal* pair is a real persistent P-256 software pair, matching the current configured-seal backend.
 - **Real CA integration** — Fixtures are OpenSSL-generated. Production reads from Dogtag PKI, Red Hat Certificate System, or 389 DS syncrepl.
-- **TLS** — The demo runs plaintext HTTP. Production should use TLS for the admin/management channel (`server.admin_tls`) and gossip over an authenticated/encrypted channel.
-- **Gossip** — Fleet membership and generation propagation are implemented but not shown in this single-node demo. Multi-node demos would show `GenerationAnnouncement` broadcasts and automatic bundle pull-on-announce.
+- **TLS** — The demo runs plaintext HTTP. Production should use TLS for the admin/management channel (`server.admin_tls`); gossip broadcasts are authenticated (Ed25519) but the channel is not encrypted.
+- **Gossip** — Fleet membership and generation propagation are implemented but not shown in this single-node demo. A multi-node demo would show `GenerationAnnouncement` propagation in the fleet view; bundles are *not* automatically pulled on announce (that remains future work).
 - **Prometheus metrics** — Available via `--features metrics` and `server.metrics_listen`, but not wired in this demo.
+- **Containerized admission posture** — The `docker compose` path signs with `--demo-key` only (ephemeral seal) and serves with `allow_unauthenticated_bundles = true`; the native `./run.sh` path is the one that demonstrates authenticated admission with the pinned seal pair.
 
 ## Docker Compose Architecture
 
@@ -433,7 +457,7 @@ podman compose up -d --build
 ## Next Steps
 
 - **Multi-CA routing:** Add a second CA to the same edge. The edge routes by `(hashAlg, issuerNameHash, issuerKeyHash)` — one responder, many CAs.
-- **Delta bundles:** Produce a second bundle with `--epoch 2` and only changed entries. The edge applies it over the epoch-1 base.
+- **Delta bundles:** The *serving path rejects delta profiles* — admission accepts only full, uncompressed bundles. To use deltas, materialize them offline with `ahu apply` (authenticating inputs and resealing with an authorized key) and install the resulting full bundle.
 - **Nonce live-signing:** Configure `nonce_policy = "live"` on a combined or signer node to show on-demand nonce-bearing responses (requires signing key access, so incompatible with keyless edges).
 - **Gossip mesh:** Run 3+ edges with `gossip.enabled = true`, show SWIM membership and `GenerationAnnouncement` propagation in the fleet view (`/api/admin/gossip`).
 
@@ -443,20 +467,23 @@ podman compose up -d --build
 demo/
 ├── README.md                 # This file
 ├── docker-compose.yml        # Containerized demo orchestration
-├── run.sh                    # Scripted demo (no Docker)
-├── .gitignore                # Excludes regenerated CRL + all runtime outputs
+├── run.sh                    # Scripted demo (no Docker); --fresh resets runtime state
+├── .gitignore                # Excludes regenerated CRL/seal pair + all runtime outputs
 ├── fixtures/
 │   ├── ca-key.pem            # committed (stable identity)
 │   ├── ca-cert.pem           # committed
 │   ├── issuer.der            # committed
 │   ├── cert-0[1-5].pem, cert-0A.pem  # committed
 │   ├── good-serials.txt      # committed
-│   └── crl.pem               # REGENERATED each run (not committed)
+│   ├── crl.pem               # REGENERATED each run (not committed)
+│   ├── seal-key.p8           # REGENERATED each run (not committed) — demo seal pair
+│   └── seal-cert.pem         # REGENERATED each run (not committed) — pinned by trusted-edge.toml
 ├── scripts/
-│   └── generate-fixtures.sh  # OpenSSL commands; `--crl-only` re-stamps just the CRL
+│   └── generate-fixtures.sh  # OpenSSL commands; `--crl-only` re-stamps the CRL and seal pair
 ├── configs/
 │   ├── edge-ecdsa.toml       # generated by run.sh (not committed)
 │   ├── edge-mldsa.toml       # generated by run.sh (not committed)
+│   ├── trusted-edge.toml     # generated by run.sh (not committed) — seal pin for `ahu verify --config`
 │   └── *-docker.toml         # committed (hand-maintained)
 ├── bundles/                  # .ahu bundles from ./run.sh (not committed; containers use a named volume)
 └── state-ecdsa/              # Edge anti-rollback high-water marks from ./run.sh
@@ -464,6 +491,12 @@ demo/
     ├── generations/          #   immutable committed snapshots, restored together with state.json
     └── .writer.lock          #   OS writer lock file (never unlinked; the kernel lock is the lock)
 ```
+
+**Re-running the script demo:** every run signs a *new* epoch-1 generation
+(fresh CRL window and seal pair), so committed anti-rollback marks correctly
+reject a re-run over existing state. `run.sh` detects this and tells you to
+rerun with `./run.sh --fresh`, which removes the disposable runtime outputs
+(`bundles/`, `state-ecdsa/`, `state-mldsa/`); the identity fixtures are kept.
 
 > The `bundles/`, `state-ecdsa/`, and `state-mldsa/` directories are created by the
 > **native `./run.sh`** path. The **containerized** path keeps the equivalent state

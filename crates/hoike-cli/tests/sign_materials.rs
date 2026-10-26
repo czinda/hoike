@@ -196,7 +196,7 @@ fn one_shot_half_configured_seal_pair_is_rejected() {
             fixture.seal_cert.to_str().unwrap(),
         ],
     ] {
-        let refs: Vec<&str> = extra.iter().map(|s| *s).collect();
+        let refs: Vec<&str> = extra.to_vec();
         let output = fixture.sign(&refs);
         let stderr = stderr(&output);
         assert!(
