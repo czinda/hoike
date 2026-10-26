@@ -2,9 +2,21 @@ use ahu::{
     Bundle, BundleBuilder, BundleType, CaScope, Completeness, Continuity, Integrity, Manifest,
     ResponderId, ResponderIdType, Window,
 };
+use hoike_core::StateDirectoryLock;
 use hoike_core::state::StateStore;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+/// Explicitly bootstrap a newly created fixture state directory (F04) and
+/// return the writer guard the responder must retain. Restarts of the same
+/// fixture use `StateStore::open` after the previous guard is dropped.
+fn init_state(state_path: &std::path::Path) {
+    StateStore::initialize(state_path).unwrap();
+}
+
+fn writer_guard(config: &hoike_core::Config) -> std::sync::Arc<StateDirectoryLock> {
+    std::sync::Arc::new(StateDirectoryLock::acquire(&config.storage.state_db).unwrap())
+}
 
 fn make_bundle(producer: &str, epoch: u64, prev_digest: Option<[u8; 32]>) -> (Bundle, Vec<u8>) {
     let manifest = Manifest {
@@ -61,7 +73,7 @@ fn state_store_persists_across_instances() {
     let path = dir.path().join("state.json");
 
     {
-        let mut store = StateStore::open(&path).unwrap();
+        let mut store = StateStore::initialize(&path).unwrap();
         store
             .advance("producer-a", "aabbcc", 5, [0x11; 32])
             .unwrap();
@@ -84,7 +96,7 @@ fn rollback_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
 
-    let mut store = StateStore::open(&path).unwrap();
+    let mut store = StateStore::initialize(&path).unwrap();
     let (bundle_5, _) = make_bundle("test-producer", 5, None);
     store.check_rollback(&bundle_5).unwrap();
     store.advance_from_bundle(&bundle_5).unwrap();
@@ -127,7 +139,7 @@ fn same_epoch_identical_bundle_reload_allowed() {
 
     // First boot: accept and record epoch 7.
     {
-        let mut store = StateStore::open(&path).unwrap();
+        let mut store = StateStore::initialize(&path).unwrap();
         let (bundle_7, _) = make_bundle("test-producer", 7, None);
         store.check_rollback(&bundle_7).unwrap();
         store.advance_from_bundle(&bundle_7).unwrap();
@@ -157,7 +169,7 @@ fn fork_detected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
 
-    let mut store = StateStore::open(&path).unwrap();
+    let mut store = StateStore::initialize(&path).unwrap();
     let (bundle_1, _) = make_bundle("test-producer", 1, None);
     store.advance_from_bundle(&bundle_1).unwrap();
 
@@ -181,7 +193,7 @@ fn first_run_accepts_any_epoch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
 
-    let store = StateStore::open(&path).unwrap();
+    let store = StateStore::initialize(&path).unwrap();
     assert_eq!(store.get_high_water("any", "any"), None);
 
     let (bundle_100, _) = make_bundle("test-producer", 100, None);
@@ -193,7 +205,7 @@ fn advance_is_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
 
-    let mut store = StateStore::open(&path).unwrap();
+    let mut store = StateStore::initialize(&path).unwrap();
     store.advance("p", "k", 10, [0xAA; 32]).unwrap();
 
     assert!(path.exists());
@@ -213,7 +225,7 @@ fn identical_chained_bundle_passes_continuity_after_restart() {
     let path = dir.path().join("state.json");
     let (a, _) = make_bundle("test", 1, None);
     let (b, _) = make_bundle("test", 2, Some(ahu::manifest_digest(&a.manifest_bytes)));
-    let mut store = StateStore::open(&path).unwrap();
+    let mut store = StateStore::initialize(&path).unwrap();
     store.advance_from_bundle(&a).unwrap();
     store.check_continuity(&b).unwrap();
     store.advance_from_bundle(&b).unwrap();
@@ -226,7 +238,7 @@ fn identical_chained_bundle_passes_continuity_after_restart() {
 fn failed_persist_does_not_change_in_memory_marks() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
-    let mut store = StateStore::open(&path).unwrap();
+    let mut store = StateStore::initialize(&path).unwrap();
     store.advance("p", "k", 1, [1; 32]).unwrap();
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
@@ -249,6 +261,8 @@ mode = "edge"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+# Mocked seals exercise state transactions, not authenticated admission.
+allow_unauthenticated_bundles = true
 [[ca]]
 label = "a"
 bundle_file = "{dir}/a.ahu"
@@ -265,7 +279,9 @@ bundle_file = "{dir}/b.ahu"
     let (_, b) = make_bundle("b", 1, None);
     std::fs::write(dir.path().join("a.ahu"), a).unwrap();
     std::fs::write(dir.path().join("b.ahu"), b).unwrap();
-    let responder = ResponderState::load(config.clone()).unwrap();
+    // Explicit bootstrap of the newly created fixture directory (F04).
+    init_state(&dir.path().join("state/state.json"));
+    let responder = ResponderState::load(config.clone(), writer_guard(&config)).unwrap();
     let state_path = dir.path().join("state/state.json");
     let before = std::fs::read(&state_path).unwrap();
     let (_, newer_a) = make_bundle("a", 2, None);
@@ -274,10 +290,12 @@ bundle_file = "{dir}/b.ahu"
     assert!(responder.reload().is_err());
     assert_eq!(std::fs::read(&state_path).unwrap(), before);
     assert!(responder.bundle_scopes().iter().all(|s| s.epoch == 1));
+    // Drop the writer guard before simulating the process restart.
     drop(responder);
-    let recovered = ResponderState::load(config).unwrap();
+    let recovered = ResponderState::load(config.clone(), writer_guard(&config)).unwrap();
     assert_eq!(recovered.bundle_count(), 2);
     assert!(recovered.bundle_scopes().iter().all(|s| s.epoch == 1));
+    drop(recovered);
     let marks = StateStore::open(&state_path).unwrap();
     assert_eq!(marks.get_high_water("a", &hex::encode([0xbb; 32])), Some(1));
     assert_eq!(marks.get_high_water("b", &hex::encode([0xbb; 32])), Some(1));

@@ -15,11 +15,19 @@ bitflags::bitflags! {
     }
 }
 
-/// Algorithm discriminator for dual-algorithm bundles.
+/// Algorithm discriminator — the u16 at index-record bytes 46–47
+/// (ahu-format-spec.md §2.4.1).
 ///
-/// In single-algorithm bundles, all records have discriminator 0 (default).
-/// In dual-algorithm bundles, the classical response uses 0 and the
-/// post-quantum variant uses the algorithm-specific value.
+/// The discriminator distinguishes signature-algorithm variants of the same
+/// certificate. Records are sorted ascending by `(entry_key, discriminator)`
+/// and a duplicate pair is invalid. In single-algorithm bundles every record
+/// uses 0; in dual-algorithm bundles the classical response uses 0 and the
+/// post-quantum variant uses its algorithm-specific value.
+///
+/// Value 1 is unassigned in this profile. The decoder preserves any other
+/// u16 value and includes it in ordering, but preservation is not
+/// endorsement: an unknown value implies no support for the producer's
+/// intended signature algorithm.
 pub const ALG_DISC_DEFAULT: u16 = 0;
 pub const ALG_DISC_ML_DSA_44: u16 = 2;
 pub const ALG_DISC_ML_DSA_65: u16 = 3;
@@ -81,6 +89,10 @@ pub fn compute_entry_key(certid_der: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Validate that records are sorted ascending by `(entry_key, discriminator)`
+/// with no duplicate pair (ahu-format-spec.md §2.4.1). Equal entry keys must
+/// carry strictly ascending discriminators; a repeated pair is a
+/// `DuplicateEntryKey` error, any descending order an `IndexNotSorted` error.
 pub fn validate_sort_order(records: &[IndexRecord]) -> Result<()> {
     for i in 0..records.len().saturating_sub(1) {
         let key_ord = records[i].entry_key.cmp(&records[i + 1].entry_key);

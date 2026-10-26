@@ -1,0 +1,20 @@
+[package]
+name = "wire-profile-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone fixture generator: deliberately NOT a member of the hoike
+# workspace so the golden vectors are produced by an encoder that shares no
+# code with the ahu crate under test. Run from the repository root:
+#
+#   cargo run --manifest-path testdata/wire-profile-0.1/gen/Cargo.toml
+#
+# The only dependencies are SHA-256, P-256 signing (deterministic RFC 6979
+# nonces, so output is byte-reproducible), and hex for the printed report.
+[workspace]
+
+[dependencies]
+sha2 = "0.10"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+hex = "0.4"

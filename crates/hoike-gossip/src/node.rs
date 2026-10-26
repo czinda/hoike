@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::broadcast::{GossipMessage, HoikeBroadcastHandler};
 use crate::config::GossipConfig;
-use crate::crypto::{self, GossipSigner, GossipVerifier, VerifyPolicy};
+use crate::crypto::{self, GossipSigner};
 
 /// Seconds since the Unix epoch, or 0 if the clock is set before 1970.
 fn now_unix() -> u64 {
@@ -123,11 +123,26 @@ pub struct GossipNode {
 }
 
 impl GossipNode {
-    /// Start the gossip node: bind UDP, initialize foca, join seeds.
+    /// Start the gossip node: validate the authentication policy, bind UDP,
+    /// initialize foca, join seeds.
     pub async fn start(
         config: GossipConfig,
         msg_tx: tokio::sync::mpsc::Sender<GossipMessage>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Message authentication (FPT_ITT.1, F09). One shared helper loads the
+        // outbound signer and the always-present inbound verifier for the
+        // configured auth_mode. It runs before any socket is bound: an
+        // invalid enabled configuration is a fatal startup error, never a
+        // warning-and-continue that would silently run unauthenticated gossip
+        // (or bind a socket the process is about to abandon).
+        let (signer, verifier) = crypto::load_authentication(&config)?;
+        info!(
+            auth_mode = ?config.auth_mode,
+            peers = config.peer_identities.len(),
+            signing = signer.is_some(),
+            "gossip message authentication loaded"
+        );
+
         let bind_addr: SocketAddr = config
             .bind
             .parse()
@@ -153,43 +168,6 @@ impl GossipNode {
                 .unwrap_or_default()
                 .as_nanos() as u64,
         );
-        // Message authentication (FPT_ITT.1). Load this node's signing key (if
-        // any) and the trusted peer keys, then derive the rollout policy: an
-        // empty `peer_keys` list stays permissive (accept unsigned during a
-        // rolling upgrade), a populated one enforces (drop unsigned/forged).
-        let signer = match &config.identity_key {
-            Some(path) => {
-                let key = crypto::load_signing_key(path)
-                    .map_err(|e| format!("gossip identity_key {}: {e}", path.display()))?;
-                info!(key = %path.display(), "gossip message signing enabled");
-                Some(GossipSigner::new(key))
-            }
-            None => None,
-        };
-
-        if !config.peer_keys.is_empty() {
-            return Err("gossip.peer_keys is no longer safe: migrate to gossip.peer_identities (node name -> public key path)".into());
-        }
-        let mut identities = Vec::new();
-        for (name, path) in &config.peer_identities {
-            if name.is_empty() || name.len() > 256 {
-                return Err("gossip peer identity must contain 1..=256 bytes".into());
-            }
-            identities.push((name.clone(), crypto::load_verifying_key(path)?));
-        }
-        if let Some(s) = &signer {
-            identities.push((config.node_name.clone(), s.verifying_key()));
-        }
-        let verifier = if signer.is_some() || !identities.is_empty() {
-            let policy = if config.peer_identities.is_empty() {
-                VerifyPolicy::Permissive
-            } else {
-                VerifyPolicy::Required
-            };
-            Some(GossipVerifier::for_identities(identities, policy))
-        } else {
-            None
-        };
 
         let broadcast_handler = HoikeBroadcastHandler::new(msg_tx, verifier);
 
@@ -629,6 +607,8 @@ mod tests {
     }
 
     /// Bind a real (but isolated: no seeds) gossip node on an ephemeral port.
+    /// These tests exercise membership/table mechanics, not authentication, so
+    /// they use the explicit permissive mode and no key material.
     async fn test_node(name: &str) -> GossipNode {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let config = GossipConfig {
@@ -636,6 +616,7 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             seeds: vec![],
             node_name: name.into(),
+            auth_mode: crate::config::AuthMode::Permissive,
             identity_key: None,
             peer_keys: vec![],
             peer_identities: Default::default(),
@@ -706,5 +687,181 @@ mod tests {
         })
         .await;
         assert_eq!(node.generations().await.len(), 2, "two distinct nodes");
+    }
+
+    // ── F09: the provision → permissive → sign → required rollout, on real
+    // loopback sockets, with channel-based deadlines. ──
+
+    /// Wait until `node`'s fleet view lists a member named `name`.
+    async fn wait_for_member(node: &GossipNode, name: &str, limit: Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if node.members().await.iter().any(|m| m.name == name) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "peer '{name}' never became visible in the fleet view"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Receive the next announcement for a specific CA scope, skipping
+    /// duplicate deliveries of earlier scopes, failing on the deadline.
+    async fn recv_scope(
+        rx: &mut tokio::sync::mpsc::Receiver<GossipMessage>,
+        issuer_key_hash: &[u8],
+        limit: Duration,
+    ) -> GossipMessage {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let msg = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("announcement delivered within deadline")
+                .expect("gossip channel stays open");
+            if msg.scope_key().1 == issuer_key_hash {
+                return msg;
+            }
+        }
+    }
+
+    fn identity_files(
+        dir: &std::path::Path,
+        name: &str,
+        seed: u8,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (_, priv_path, pub_path) = crate::crypto::write_test_identity(dir, name, seed);
+        (priv_path, pub_path)
+    }
+
+    /// The full F09 rollout transition over loopback UDP: while the receiver
+    /// runs in permissive mode during the signing rollout, mapped peers stay
+    /// visible, signed announcements flow, and unsigned traffic is still
+    /// accepted; once the receiver runs in required mode, unsigned traffic is
+    /// rejected while the mapped signer's announcements keep flowing.
+    #[tokio::test]
+    async fn loopback_transition_permissive_signing_to_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alpha_priv, alpha_pub) = identity_files(dir.path(), "alpha", 21);
+        let (bravo_priv, bravo_pub) = identity_files(dir.path(), "bravo", 22);
+
+        let node_config = |name: &str,
+                           mode: crate::config::AuthMode,
+                           identity: Option<std::path::PathBuf>,
+                           peers: Vec<(&str, std::path::PathBuf)>,
+                           seeds: Vec<String>| {
+            let mut peer_identities = std::collections::BTreeMap::new();
+            for (peer, path) in peers {
+                peer_identities.insert(peer.to_string(), path);
+            }
+            GossipConfig {
+                enabled: true,
+                bind: "127.0.0.1:0".into(),
+                seeds,
+                node_name: name.into(),
+                auth_mode: mode,
+                identity_key: identity,
+                peer_keys: vec![],
+                peer_identities,
+            }
+        };
+        let start = |config: GossipConfig| async move {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let node = GossipNode::start(config, tx)
+                .await
+                .expect("gossip node starts");
+            (node, rx)
+        };
+
+        // Phase 1 — permissive rollout. alpha signs with a provisioned key;
+        // bravo maps alpha's key but has no local identity yet.
+        let (bravo, mut bravo_rx) = start(node_config(
+            "bravo",
+            crate::config::AuthMode::Permissive,
+            None,
+            vec![("alpha", alpha_pub.clone())],
+            vec![],
+        ))
+        .await;
+        let (alpha, mut alpha_rx) = start(node_config(
+            "alpha",
+            crate::config::AuthMode::Permissive,
+            Some(alpha_priv.clone()),
+            vec![("alpha", alpha_pub.clone())],
+            vec![bravo.identity().addr.to_string()],
+        ))
+        .await;
+
+        // Mapped peers remain visible during the permissive signing rollout.
+        wait_for_member(&bravo, "alpha", Duration::from_secs(15)).await;
+
+        // alpha's signed announcement reaches the mapped permissive peer.
+        alpha
+            .announce_generation("producer".into(), vec![0x01; 32], 7, [7; 32], None)
+            .await
+            .unwrap();
+        let signed = recv_scope(&mut bravo_rx, &[0x01; 32], Duration::from_secs(10)).await;
+        assert_eq!(signed.epoch(), 7);
+
+        // bravo's unsigned announcement still reaches permissive alpha.
+        bravo
+            .announce_generation("producer".into(), vec![0x02; 32], 3, [3; 32], None)
+            .await
+            .unwrap();
+        let unsigned = recv_scope(&mut alpha_rx, &[0x02; 32], Duration::from_secs(10)).await;
+        assert_eq!(unsigned.epoch(), 3);
+
+        // Phase 2 — required mode. A receiver restarted with a local identity
+        // and both mappings (the post-rollout configuration) still sees the
+        // mapped signer, accepts its signed announcements, and drops bravo's
+        // unsigned traffic.
+        let (bravo_required, mut bravo_required_rx) = start(node_config(
+            "bravo",
+            crate::config::AuthMode::Required,
+            Some(bravo_priv.clone()),
+            vec![("alpha", alpha_pub.clone()), ("bravo", bravo_pub.clone())],
+            vec![
+                alpha.identity().addr.to_string(),
+                bravo.identity().addr.to_string(),
+            ],
+        ))
+        .await;
+        wait_for_member(&bravo_required, "alpha", Duration::from_secs(15)).await;
+        wait_for_member(&bravo_required, "bravo", Duration::from_secs(15)).await;
+
+        // alpha's signed announcement still flows under required mode.
+        alpha
+            .announce_generation("producer".into(), vec![0x03; 32], 9, [9; 32], None)
+            .await
+            .unwrap();
+        let signed = recv_scope(&mut bravo_required_rx, &[0x03; 32], Duration::from_secs(10)).await;
+        assert_eq!(signed.epoch(), 9);
+
+        // bravo's unsigned traffic is rejected after required mode: within
+        // the deadline nothing carrying its scope may arrive, even though the
+        // same emission path delivered to the permissive alpha in phase 1.
+        bravo
+            .announce_generation("producer".into(), vec![0x04; 32], 4, [4; 32], None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut leaked = None;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, bravo_required_rx.recv()).await {
+                Ok(Some(msg)) if msg.scope_key().1 == [0x04; 32] => {
+                    leaked = Some(msg);
+                    break;
+                }
+                // Stale re-transmissions of earlier signed scopes are fine.
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("required receiver's channel closed"),
+                Err(_) => break, // deadline elapsed: nothing leaked
+            }
+        }
+        assert!(
+            leaked.is_none(),
+            "unsigned broadcast must be rejected in required mode: {leaked:?}"
+        );
     }
 }

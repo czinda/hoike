@@ -1,7 +1,10 @@
 # The ahu Pre-Signed OCSP Response Bundle Format
 
 **Version:** 0.1 (draft — not yet stable)
-**Status:** Working draft for review
+**Status:** Working draft for review. §2–§3 and §7–§8 document the
+**as-implemented 0.1 wire profile** — the emitted bytes and reader
+enforcement are frozen as described; future incompatible changes require a
+new explicit profile version.
 **Editor:** Chris Zinda
 **Companion implementation:** `hoike` (see `hoike-design.md`)
 
@@ -126,6 +129,22 @@ Header fields are **not** directly covered by the seal. They are validated
 indirectly: the manifest carries digests of the index and data sections, so a
 tampered offset either fails a digest check or points outside the file.
 
+#### 2.1.1 Version layers
+
+Three independent version identifiers are in play, and none may be inferred
+from another:
+
+| Layer | Where | Value in this profile | Advances when |
+|---|---|---|---|
+| File format | header `format_major`.`format_minor` | 0.1 | Container layout changes |
+| Manifest schema | manifest `format_version` | 1 | CBOR manifest schema changes |
+| Implementation | companion software package | 0.2 | Software releases |
+
+A bundle emitted by implementation 0.2 carries header 0.1 and manifest
+`format_version` 1. These vectors freeze that profile as implemented; any
+incompatible change requires a new explicit version, never a silent
+reinterpretation of existing bytes.
+
 ### 2.2 Manifest
 
 Deterministic CBOR per RFC 8949 §4.2 (definite lengths, canonical map ordering,
@@ -134,7 +153,7 @@ be re-derived and digested reproducibly.
 
 ```
 manifest = {
-  1: uint,            ; format_version
+  1: uint,            ; format_version (1 in this profile — see §2.1.1)
   2: bstr .size 16,   ; bundle_id  (UUIDv7 RECOMMENDED — time-ordered)
   3: tstr,            ; producer_id (stable, e.g. "signer-a.pki.example")
   4: uint,            ; created_at (epoch seconds, UTC)
@@ -204,9 +223,13 @@ miss, and it is the most important semantic in the format:
   non-revoked-and-not-yet-purged certificate issued by this CA is represented.
   A mirror that misses a lookup in this scope MUST answer `unauthorized`
   (RFC 9919 §3.2.3) and MUST NOT forward.
-- `partial` — the bundle covers a subset (a shard, a hot set, a delta applied
-  without its base). A mirror that misses MAY forward upstream, and MUST answer
-  `unauthorized` if it cannot.
+- `partial` — the bundle covers a subset (a shard, a hot set). The field
+  describes *coverage*, never *servability*: it does not widen the serving
+  profile of §3.2, and in particular it does not make a delta — or any other
+  optional representation the format can carry — installable on a responder
+  that does not serve it. What a mirror does on a miss is a serving-profile
+  decision: forward upstream where it is configured to do so, and answer
+  `unauthorized` otherwise.
 
 **`ca_scope.epoch`** is per-CA, not per-bundle, because one bundle can carry
 several CAs whose generations advance at different rates.
@@ -216,15 +239,34 @@ is already worthless, without walking every entry.
 
 ### 2.3 Seal
 
-The seal is a **detached CMS `SignedData`** (RFC 5652) whose `eContent` is the
-manifest octets exactly as they appear in the file.
+The seal is a **detached CMS `SignedData`** (RFC 5652) over the manifest
+octets exactly as they appear in the file. The 0.1 profile, frozen as
+implemented:
 
-- `eContentType` MUST be `id-ct-ahuManifest` (see §7).
-- The `SignerInfo` MUST include the `content-type` and `message-digest` signed
-  attributes.
-- The seal certificate chain SHOULD be carried in `certificates`.
+- `encapContentInfo.eContentType` MUST be `id-data`
+  (1.2.840.113549.1.7.1), and `eContent` MUST be absent — the content is
+  detached, and the reader supplies the manifest octets out of band.
+- There MUST be exactly one `SignerInfo`, and the `digestAlgorithms` set
+  MUST contain exactly that one algorithm: SHA-256.
+- The `SignerInfo` MUST include exactly one `content-type` signed attribute
+  whose value is `id-data` (matching `eContentType`), and exactly one
+  `message-digest` signed attribute whose value is SHA-256 over the manifest
+  octets. The signature is computed over the DER encoding of the signed
+  attributes with the SET OF tag, per RFC 5652 §5.4.
+- The seal certificate SHOULD be carried in `certificates`, matched by
+  issuer-and-serialNumber or subjectKeyIdentifier.
 - The seal key MUST be distinct from any OCSP response signing key. They have
   different lifetimes, different threat exposure, and different rotation cadence.
+
+No content OID is allocated for the ahu manifest in this profile: the
+manifest is authenticated as ordinary CMS data. An ahu-specific content OID,
+a COSE seal encoding, or any other incompatible change constitutes a *new*
+profile and requires a new explicit `format_minor` (or major) plus reader
+support — never a reinterpretation of 0.1 bytes.
+
+The reference reader (`ahu`, `seal-verify` feature) enforces every rule
+above and accepts ECDSA P-256 and ML-DSA-44/65/87 signer keys; other
+signature algorithms are outside the frozen profile.
 
 CMS is chosen over COSE because the deploying audience already operates X.509
 chain validation, PKCS#11 signing, and CMS tooling, and because ML-DSA in CMS
@@ -232,15 +274,11 @@ is being standardized on the same track as ML-DSA in certificates. A COSE
 profile MAY be defined later as an alternative seal encoding; if so it gets a
 distinct `format_minor` and a distinct media type parameter.
 
-> **Open decision.** Whether the seal should instead be a bare COSE_Sign1 to
-> keep the format usable in constrained environments with no ASN.1 stack. The
-> counter-argument is that any consumer of this format is already parsing DER
-> OCSP responses, so it has an ASN.1 parser by definition.
-
 ### 2.4 Index
 
-A packed array of fixed-width records, sorted ascending by `entry_key`, byte
-comparison. Fixed width plus sort order means a mirror binary-searches an
+A packed array of fixed-width records, sorted ascending by the pair
+(`entry_key`, `discriminator`) — byte comparison on the key, numeric on the
+discriminator. Fixed width plus sort order means a mirror binary-searches an
 `mmap`ed region — no deserialization, no database, no allocation on the hot path.
 
 ```
@@ -250,7 +288,7 @@ Offset  Size  Field
  32      8    data_offset    (relative to data_offset in header)
  40      4    data_length
  44      2    flags
- 46      2    reserved (MUST be zero)
+ 46      2    discriminator  (algorithm variant)
 ------  ----  ---------------------------------------------------
                                                     total 48 bytes
 ```
@@ -264,13 +302,42 @@ Offset  Size  Field
 | 2 | `TOMBSTONE` | Delta only: remove this key from the working set. |
 | 3–15 | — | Reserved, MUST be zero, readers MUST ignore if set. |
 
+#### 2.4.1 Algorithm discriminators
+
+The discriminator distinguishes signature-algorithm variants of the same
+certificate. Single-algorithm bundles use 0 for every record.
+
+| Value | Meaning |
+|---|---|
+| 0 | Default / classical variant |
+| 2 | ML-DSA-44 variant |
+| 3 | ML-DSA-65 variant |
+| 4 | ML-DSA-87 variant |
+| 1 | Unassigned in this profile |
+
+A duplicate (`entry_key`, `discriminator`) pair MUST NOT appear: a reader
+that encounters one MUST reject the bundle, as it must for any non-ascending
+pair order. Equal `entry_key` with *ascending* discriminators is the
+dual-algorithm encoding: the same certificate addressed by two signature
+algorithms, one payload each.
+
+Dual-CertID responses and dual-algorithm records are independent dimensions.
+A dual-CertID pair (below) shares one payload under two entry keys and
+carries the *same* discriminator on both records; a dual-algorithm pair
+shares one entry key with *different* discriminators and different payloads.
+
+The index decoder preserves any other `u16` discriminator value and includes
+it in ordering exactly as its numeric value dictates. Preservation is not
+endorsement: an unknown value implies neither that a reader supports the
+producer's intended signature algorithm nor that the payload will be served —
+serving a nonzero discriminator requires an explicit request for it (RFC 6960
+§4.4.7.1 PreferredSignatureAlgorithms). Future assignments of unassigned
+values are additive and require no layout change.
+
 Two index records MAY point at the same payload. This is how RFC 9919 §3.2.1
 dual-CertID responses work: one `BasicOCSPResponse` carrying a SHA-1 `CertID`
 `SingleResponse` and a SHA-256 one is indexed under both entry keys, stored
 once, and served to either generation of client. Both records set `ALIAS`.
-
-Duplicate `entry_key` values MUST NOT appear. A reader that encounters a
-non-ascending or duplicate key MUST reject the bundle.
 
 ### 2.5 Data
 
@@ -301,8 +368,12 @@ A mirror loading a bundle MUST, in this order:
 3. Verify `integrity.index_digest` and `integrity.data_digest`.
 4. For each `ca_scope`: compare `epoch` against the locally recorded high-water
    mark for `(producer_id, issuerKeyHash)`. **A mirror MUST reject a scope whose
-   epoch is less than or equal to its high-water mark.** This is the anti-rollback
-   rule and it is not optional.
+   epoch is less than its high-water mark.** This is the anti-rollback rule and
+   it is not optional. An epoch *equal* to the high-water mark has exactly one
+   legitimate meaning: reloading the identical generation after a restart. It
+   is accepted if and only if the manifest digest matches the digest recorded
+   for that generation; an equal epoch presenting a different manifest digest
+   is a fork or rollback attack and MUST be rejected.
 5. If `continuity.prev_manifest_digest` is present, verify it matches the
    manifest digest the mirror recorded for the previous generation. A mismatch
    indicates a fork — the mirror MUST refuse the bundle and raise an alarm
@@ -336,6 +407,35 @@ into a classified or otherwise isolated enclave SHOULD run full verification on
 import, since that is the one moment where the cost is acceptable and the
 provenance is least certain.
 
+### 3.2 Supported serving profile
+
+The format sections above describe what an ahu file can *represent*. What a
+given responder will *serve* is a narrower profile, and the two must not be
+conflated: a bundle can be well-formed, correctly sealed, and still not
+installable as a working set.
+
+The reference responder (`hoike`) admits only **full, uncompressed bundles**:
+`bundle_type = 0`, either no compression map or algorithm `none` with no
+dictionary, no `TOMBSTONE` index records, no `base_manifest_digest`, and
+`chain_length = 0`. Admission rejects every other profile — delta bundles,
+Zstd payloads, dictionary requirements, full-bundle tombstones, a full
+bundle's nonempty base reference, and nonzero full-bundle chain length —
+before changing durable state. A valid CMS seal does not widen the profile:
+an authenticated delta is inspectable (`ahu verify --config`) but not
+servable. Nor does any format-level assertion: the optional representations
+the format can carry — delta bundles, tombstones, Zstd compression,
+sharding, and a `partial` completeness value (§2.2) — are optional to
+*represent*, never sufficient to *serve*. Nothing in the format overrides
+these admission rules.
+
+Delta bundles are consumed offline: materialize them into a full,
+uncompressed bundle (`ahu apply`) and install that. Materialization is not a
+history reset: the materialized output carries
+`continuity.prev_manifest_digest` naming its last input, so an
+authenticated, resealed full output must still satisfy predecessor
+continuity against the actual destination, and a bundle naming a predecessor
+the destination has not recorded is not an installable checkpoint.
+
 ---
 
 ## 4. Delta bundles
@@ -350,9 +450,12 @@ base. `bundle_type = 1`, `continuity.base_manifest_digest` is REQUIRED.
   archive cutoff and the producer stops asserting status for it.
 
 `continuity.chain_length` counts generations since the last full bundle. A
-mirror SHOULD refuse to extend a chain beyond a configured maximum and demand a
-full bundle, so that a mirror can never drift arbitrarily far from a known-good
-snapshot. A reasonable default is 24.
+mirror serving deltas directly SHOULD refuse to extend a chain beyond a
+configured maximum and demand a full bundle, so that it can never drift
+arbitrarily far from a known-good snapshot. The reference responder does not
+serve deltas at all — it admits only materialized full, uncompressed bundles
+(see §3.2) — so it exposes no chain-limit configuration; advertising a limit
+that is not enforced would be misleading.
 
 Applying deltas is deterministic: for a given base and an ordered set of deltas
 every mirror reaches an identical working set. Producers SHOULD publish the
@@ -479,13 +582,14 @@ trustworthy time source, and MUST log the condition.
 
 ## 7. Registrations and identifiers
 
-These are placeholders until allocated. Obtain a Private Enterprise Number from
-IANA before publishing anything that another implementation will encode against.
-
-```
-id-hoike           OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 <PEN> }
-id-ct-ahuManifest  OBJECT IDENTIFIER ::= { id-hoike 1 1 }
-```
+This profile allocates **no object identifier**. The seal is standard CMS
+`SignedData` over `id-data` (1.2.840.113549.1.7.1) using the standard CMS
+signed attributes — `content-type` (1.2.840.113549.1.9.3) and
+`message-digest` (1.2.840.113549.1.9.4) — so no ahu-specific registration is
+required to produce or verify a bundle. Should a future profile assign an
+ahu content OID or change the seal encoding, it does so under a new
+`format_minor`, never by reinterpreting 0.1 bytes; obtain a Private
+Enterprise Number from IANA before publishing any such registration.
 
 Media type registration target: `application/vnd.hoike.ahu`, with an optional
 `seal` parameter (`cms` | `cose`) if a second seal encoding is defined.
@@ -494,23 +598,38 @@ Media type registration target: `application/vnd.hoike.ahu`, with an optional
 
 ## 8. Test vectors
 
-To be supplied with the reference implementation. The set should include, at
-minimum:
+Golden wire vectors for the frozen 0.1 profile are committed under
+`testdata/wire-profile-0.1/`:
 
-1. Minimal full bundle — one CA, one entry, classical signature.
-2. Dual-CertID aliasing — one payload, two index records.
-3. Multi-CA bundle with divergent epochs.
-4. Delta with add, replace, and tombstone.
-5. Rollback attempt — a bundle at epoch N−1 that a conformant mirror MUST reject.
-6. Fork attempt — mismatched `prev_manifest_digest`.
-7. Truncated data section — digest mismatch.
-8. Post-quantum bundle signed with ML-DSA, for size and parsing regression.
+1. `minimal-full.ahu` — one CA, one entry, classical (discriminator 0)
+   payload, full bundle, no compression.
+2. `dual-algorithm.ahu` — one `entry_key` carrying discriminator 0 and
+   discriminator 4 records in the documented `(entry_key, discriminator)`
+   order.
+
+Both are hand-assembled independently of the reference writer and sealed
+with a recorded synthetic P-256 seal certificate; the fixture README
+publishes SHA-256 checksums, decoded field values, and generation
+instructions. Because they are immutable vectors, verification against them
+uses a fixed test time inside the recorded seal-certificate window;
+production clocks stay real. The consuming tests live in
+`crates/ahu/tests/wire_profile.rs`.
+
+Vectors still to be supplied: multi-CA with divergent epochs; delta with
+add, replace, and tombstone; rollback attempt (epoch below high-water);
+fork attempt (mismatched `prev_manifest_digest`, or equal epoch with a
+different manifest digest); truncated data section; post-quantum-sealed
+bundle.
 
 ---
 
 ## 9. Open questions
 
-1. **Seal encoding** — CMS as specified, or COSE_Sign1 for lighter consumers.
+1. **Seal encoding** — resolved for the 0.1 profile: detached CMS
+   `SignedData` over `id-data` with the `content-type` and `message-digest`
+   signed attributes, as implemented (§2.3). A COSE_Sign1 profile for
+   lighter consumers would be a new minor version, not a reinterpretation of
+   0.1 bytes.
 2. **Whether `TOMBSTONE` belongs in the index at all**, or whether removals
    should be a separate manifest list. Index tombstones keep one code path;
    a separate list keeps the index purely a lookup structure.

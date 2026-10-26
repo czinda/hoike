@@ -66,6 +66,33 @@ cargo-check:
 
 # ── Stage 2: test ────────────────────────────────────────────────────
 
+# Platform evidence for the state machine: strict reopen, flock writer
+# exclusion, anti-rollback, and durable installation. GitHub Actions
+# (.github/workflows/ci.yml) is authoritative and additionally runs these
+# suites on macOS; this Linux job keeps the mirror equivalent honest.
+state-platform-tests:
+  stage: test
+  image: rust:1.97-slim
+  extends: .rust-cache
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: state-platform
+    paths:
+      - .cargo/registry/cache
+      - .cargo/registry/index
+      - .cargo/git/db
+      - target/
+  script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends cmake build-essential pkg-config
+    - cargo test -p hoike-core --locked --test state_lock --test anti_rollback --test installation
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
 cargo-test:
   stage: test
   image: rust:1.97-slim

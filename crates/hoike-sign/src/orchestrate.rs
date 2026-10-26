@@ -305,50 +305,32 @@ pub fn sign_and_write_all(
     Ok(out)
 }
 
-/// Write bundle bytes to `{bundle_dir}/{label}.ahu`, creating the directory if
-/// needed. Returns the written path.
+/// Write bundle bytes to the configured destination for `label`, creating
+/// the directory if needed. Returns the written path. Signer and importer
+/// share the same `Config::bundle_destination` resolution and the same
+/// durable `write_atomic` publication primitive (design §S5).
 pub fn write_bundle(
     config: &Config,
     label: &str,
     bytes: &[u8],
 ) -> std::result::Result<PathBuf, String> {
     let path = config
-        .ca
-        .iter()
-        .find(|ca| ca.label == label)
-        .and_then(|ca| ca.bundle_file.clone())
-        .unwrap_or_else(|| config.storage.bundle_dir.join(format!("{label}.ahu")));
+        .bundle_destination(label)
+        .map_err(|e| e.to_string())?;
     write_bundle_atomic(&path, bytes)?;
     Ok(path)
 }
 
-/// Durable replacement: readers see either complete old or complete new bytes.
+/// Durable replacement: readers see either complete old or complete new
+/// bytes. Delegates to the consolidated `hoike-core` implementation; a
+/// directory-fsync failure after the rename surfaces as the typed
+/// `DurabilityUncertain` error text.
 pub fn write_bundle_atomic(
     path: &std::path::Path,
     bytes: &[u8],
 ) -> std::result::Result<(), String> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|e| format!("create bundle directory: {e}"))?;
-    let tmp = parent.join(format!(".hoike-{}.tmp", uuid::Uuid::now_v7()));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map_err(|e| format!("publish {}: {e}", path.display()))
+    hoike_core::storage::write_atomic(path, bytes)
+        .map_err(|e| format!("publish {}: {e}", path.display()))
 }
 
 /// Dispatch bundle production over the CA's configured signing-key source and
@@ -440,6 +422,14 @@ fn produce_scope_bundle(
                 let mut signing_key =
                     crate::load_ecdsa_p256_key(path).map_err(|e| format!("signing key: {e}"))?;
                 info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
+                // F07: prove the OCSP signing key is not the seal key before
+                // producing anything — the same key under different file
+                // names is still rejected.
+                crate::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
+                    &signing_key,
+                    seal_key,
+                )
+                .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
                 let sk = seal_key.clone();
                 let sc = seal_cert_der.to_vec();
                 crate::produce_bundle::<_, p256::ecdsa::DerSignature>(
@@ -457,6 +447,14 @@ fn produce_scope_bundle(
                 let inner = crate::Pkcs11Signer::new(&pkcs11_config)
                     .map_err(|e| format!("PKCS#11 init: {e}"))?;
                 let mut bridge = crate::Pkcs11SignerBridge::new(inner);
+                // F07: the same separation proof through the PKCS#11 bridge —
+                // without exporting the HSM private key or assuming public-key
+                // attributes are readable.
+                crate::ensure_distinct_ecdsa_seal_key::<_, crate::Pkcs11EcdsaSignature>(
+                    &bridge,
+                    seal_key,
+                )
+                .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
                 let sk = seal_key.clone();
                 let sc = seal_cert_der.to_vec();
                 crate::produce_bundle::<_, crate::Pkcs11EcdsaSignature>(
@@ -481,6 +479,13 @@ fn produce_scope_bundle(
             Some(hoike_core::config::SigningKeyConfig::Demo) => {
                 warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
                 let mut signing_key = crate::demo_ecdsa_p256_key();
+                // F07: even the demo OCSP key must stay distinct from an
+                // explicitly configured seal key.
+                crate::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
+                    &signing_key,
+                    seal_key,
+                )
+                .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
                 let sk = seal_key.clone();
                 let sc = seal_cert_der.to_vec();
                 crate::produce_bundle::<_, p256::ecdsa::DerSignature>(
@@ -638,49 +643,26 @@ pub fn load_responder_cert(ca: &CaConfig) -> std::result::Result<Option<Vec<u8>>
 
 /// Load the seal key and certificate for CMS bundle sealing.
 ///
-/// Falls back to the OCSP signing key if no `seal_key` is configured and the
-/// signing key is ECDSA P-256. For ML-DSA signing keys (which are not P-256),
-/// falls back to an ephemeral demo seal key with a warning.
+/// F07: delegates the seal-material policy — complete persistent pair,
+/// half-pair error, demo-only distinct ephemeral fallback, and the F08 CMS
+/// pair preflight — to the shared `load_or_generate_seal_material` helper
+/// (the same decision the one-shot CLI sign path uses), prefixing this CA's
+/// label. Implicit OCSP-signing-key reuse and non-demo ephemeral fallback are
+/// removed. The OCSP/seal key-separation proof runs in the loaded-signer
+/// branches that consume this material.
 pub fn load_seal_materials(
     ca_config: &CaConfig,
 ) -> std::result::Result<(SealKey, Vec<u8>), String> {
-    let seal_key = if let Some(path) = &ca_config.seal_key {
-        let ecdsa_key =
-            crate::load_ecdsa_p256_key(path).map_err(|e| format!("load seal key: {e}"))?;
-        SealKey::EcdsaP256(ecdsa_key)
-    } else if !ca_config.is_ml_dsa() {
-        if let Some(hoike_core::config::SigningKeyConfig::File { path }) = &ca_config.signing_key {
-            warn!(
-                ca = ca_config.label,
-                "using OCSP signing key as seal key — configure seal_key for production"
-            );
-            let ecdsa_key = crate::load_ecdsa_p256_key(path)
-                .map_err(|e| format!("load signing key for seal: {e}"))?;
-            SealKey::EcdsaP256(ecdsa_key)
-        } else {
-            warn!(
-                ca = ca_config.label,
-                "no seal_key configured — generating ephemeral seal key"
-            );
-            SealKey::EcdsaP256(crate::demo_ecdsa_p256_key())
-        }
-    } else {
-        warn!(
-            ca = ca_config.label,
-            "ML-DSA signing key cannot be used as P-256 seal key — \
-             configure seal_key for production; using ephemeral seal key"
-        );
-        SealKey::EcdsaP256(crate::demo_ecdsa_p256_key())
-    };
-
-    let seal_cert_der = if let Some(path) = &ca_config.seal_cert {
-        std::fs::read(path).map_err(|e| format!("read seal cert: {e}"))?
-    } else {
-        crate::generate_seal_cert_for_key(&seal_key)
-            .map_err(|e| format!("generate seal cert: {e}"))?
-    };
-
-    Ok((seal_key, seal_cert_der))
+    let demo = matches!(
+        &ca_config.signing_key,
+        Some(hoike_core::config::SigningKeyConfig::Demo)
+    );
+    crate::load_or_generate_seal_material(
+        ca_config.seal_key.as_deref(),
+        ca_config.seal_cert.as_deref(),
+        demo,
+    )
+    .map_err(|e| format!("CA '{}': {e}", ca_config.label))
 }
 
 /// Resolve a PKCS#11 config from a CA's signing-key config. PIN resolution is
@@ -859,6 +841,50 @@ mod urgent_tests {
         fn is_authoritative_complete(&self) -> bool {
             false
         }
+    }
+
+    fn scope_config(dir: &std::path::Path) -> Config {
+        let config_path = dir.join("hoike.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[server]
+[storage]
+bundle_dir = "{}/bundles"
+state_db = "{}/state"
+[[ca]]
+label = "test"
+issuer_name_der_b64 = "bmFtZQ=="
+issuer_key_bytes_b64 = "a2V5"
+
+[ca.signing_key]
+type = "demo"
+"#,
+                dir.display(),
+                dir.display()
+            ),
+        )
+        .unwrap();
+        Config::from_file(&config_path).unwrap()
+    }
+
+    #[test]
+    fn sign_ca_scope_requires_existing_state() {
+        // Epoch derivation reads persisted state; a missing state file must be
+        // an explicit error, never a silently fresh timeline at epoch 1.
+        let dir = tempfile::tempdir().unwrap();
+        let config = scope_config(dir.path());
+        let source = MockSource(vec![(vec![0x01], CertificateStatus::Good)]);
+        let err = sign_ca_scope(&config, &config.ca[0], &source).unwrap_err();
+        assert!(
+            err.contains("state"),
+            "error must identify the state store: {err}"
+        );
+        assert!(
+            !config.storage.state_db.join("state.json").exists(),
+            "signing must not create state implicitly"
+        );
     }
 
     #[test]

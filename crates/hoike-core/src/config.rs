@@ -22,16 +22,21 @@ pub struct GossipConfigSection {
     pub seeds: Vec<String>,
     #[serde(default = "default_gossip_node_name")]
     pub node_name: String,
+    /// Explicit inbound authentication policy for gossip broadcasts (FPT_ITT.1,
+    /// F09): "required" (default) or "permissive". Validated against those two
+    /// values here; the CLI bridges the string to hoike-gossip's `AuthMode`.
+    /// `required` drops unsigned/unknown/forged broadcasts and needs an
+    /// `identity_key`; `permissive` is the documented rollout mode that still
+    /// accepts unsigned legacy broadcasts while verifying signed ones.
+    #[serde(default = "default_gossip_auth_mode")]
+    pub auth_mode: String,
     /// Path to an Ed25519 PKCS#8 private key used to sign outbound gossip
-    /// messages (design §6.3, FPT_ITT.1). When set, every message this node
-    /// broadcasts is signed; peers with the matching public key verify and drop
-    /// unauthenticated messages. When unset, gossip stays unauthenticated
-    /// (backward compatible).
+    /// messages (design §6.3, FPT_ITT.1). Required when gossip is enabled in
+    /// `auth_mode = "required"`; optional while rolling out in permissive mode.
     pub identity_key: Option<PathBuf>,
-    /// Paths to Ed25519 public keys (PEM/DER) trusted to sign peer gossip
-    /// messages. When `identity_key` is set and this is empty, a node verifies
-    /// only its own signature scheme is well-formed; populate with peer keys to
-    /// authenticate the mesh.
+    /// Deprecated unbound key list. Nonempty values fail configuration with
+    /// migration instructions; use peer_identities to authorize each key's
+    /// node identity.
     #[serde(default)]
     pub peer_keys: Vec<PathBuf>,
     #[serde(default)]
@@ -43,6 +48,9 @@ fn default_gossip_bind() -> String {
 }
 fn default_gossip_node_name() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "hoike-node".into())
+}
+fn default_gossip_auth_mode() -> String {
+    "required".into()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -130,10 +138,7 @@ pub struct StorageConfig {
     pub bundle_dir: PathBuf,
     #[serde(default = "default_state_db")]
     pub state_db: PathBuf,
-    #[serde(default = "default_max_chain")]
-    pub max_chain: u32,
-    /// DER or PEM certificates trusted as seal signers.
-    /// When set, bundles without a valid CMS seal are rejected on load.
+    /// DER or PEM CA certificates for the bounded direct-issuer seal profile.
     #[serde(default)]
     pub seal_trust_anchors: Option<Vec<PathBuf>>,
     #[serde(default)]
@@ -141,6 +146,10 @@ pub struct StorageConfig {
     /// Explicitly trusted signer certificates, distinct from CA trust anchors.
     #[serde(default)]
     pub seal_signer_pins: Vec<PathBuf>,
+    /// Permit structure-only demo admission when no seal trust or scope
+    /// authorizations are configured. Never bypasses configured trust checks.
+    #[serde(default)]
+    pub allow_unauthenticated_bundles: bool,
 }
 
 /// Optional restriction of trusted seal certificates to producer and CA scope.
@@ -178,11 +187,13 @@ pub struct CaConfig {
     pub forward_insecure: bool,
     /// Optional PEM CA bundle for the forward target's server certificate.
     ///
-    /// NOTE: per-target custom roots are not yet wired into the forward path.
-    /// The shared outbound client validates the forward target against the
-    /// system trust store, so this CA must currently be installed system-wide to
-    /// take effect; setting it alone does not change validation. `hoike check`
-    /// emits the same caveat. Retained as forward-looking config.
+    /// When set, the CA's forwarding client trusts only these roots (the
+    /// bundled WebPKI roots are disabled) and the bundle must parse to at
+    /// least one certificate; an unreadable, empty, or malformed file fails
+    /// startup and `hoike check`. A `forward_ca` on a non-HTTPS `forward_to`
+    /// is a configuration error. Without `forward_ca`, the forward channel
+    /// validates against reqwest's bundled WebPKI roots (the `rustls-tls`
+    /// feature) — not the operating system trust store.
     pub forward_ca: Option<PathBuf>,
     /// Revocation source (required for combined/signer mode)
     pub source: Option<SourceConfig>,
@@ -234,11 +245,14 @@ pub struct CaConfig {
     /// Key rotation monitoring configuration.
     pub key_rotation: Option<KeyRotationConfigToml>,
     /// Path to PKCS#8 PEM/DER key for bundle seal signing.
-    /// If absent, falls back to the OCSP signing key (with a warning).
-    /// The seal key SHOULD be different from the OCSP signing key.
+    /// Required together with `seal_cert` for production signing keys
+    /// (file/PKCS#11); must hold a key distinct from the OCSP signing key.
+    /// Demo signing may omit both (a distinct ephemeral pair is generated),
+    /// but configuring exactly one of the two is always an error.
     pub seal_key: Option<PathBuf>,
     /// Path to the DER/PEM certificate for the seal signer.
-    /// If absent, generates a self-signed cert (for testing only).
+    /// Required together with `seal_key` for production signing keys;
+    /// a half-configured pair is always an error.
     pub seal_cert: Option<PathBuf>,
 }
 
@@ -379,9 +393,6 @@ fn default_max_request() -> usize {
 fn default_state_db() -> PathBuf {
     PathBuf::from("/var/lib/hoike/state")
 }
-fn default_max_chain() -> u32 {
-    24
-}
 fn default_sig_alg() -> String {
     "ecdsa-p256".into()
 }
@@ -420,6 +431,66 @@ impl Config {
         self.server.mode == "combined"
     }
 
+    /// Resolve the configured bundle destination for a CA label (design
+    /// §S5). The selected `bundle_file` wins; otherwise use
+    /// `bundle_dir/<label>.ahu`. Never infer a destination from an uploaded
+    /// filename.
+    ///
+    /// Rejects unknown labels, legacy unscoped configuration (no `[[ca]]`
+    /// entries — there is no per-CA destination to select), unsafe label
+    /// file-name components, and a destination shared with another
+    /// configured CA label: replacing it would ambiguously serve multiple
+    /// labels from one file.
+    pub fn bundle_destination(&self, label: &str) -> crate::error::Result<std::path::PathBuf> {
+        if self.ca.is_empty() {
+            return Err(crate::error::CoreError::Config(
+                "no [[ca]] entries are configured — legacy unscoped configuration has no \
+                 per-CA bundle destination; configure a labeled CA before producing or \
+                 importing bundles"
+                    .into(),
+            ));
+        }
+        if label.is_empty() || label == "." || label == ".." || label.contains(['/', '\\']) {
+            return Err(crate::error::CoreError::Config(format!(
+                "CA label '{label}' is not a safe bundle file name"
+            )));
+        }
+        let selected = self.ca.iter().find(|ca| ca.label == label).ok_or_else(|| {
+            crate::error::CoreError::Config(format!(
+                "unknown CA label '{label}' — configured labels: {}",
+                self.ca
+                    .iter()
+                    .map(|ca| ca.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        let destination = selected
+            .bundle_file
+            .clone()
+            .unwrap_or_else(|| self.storage.bundle_dir.join(format!("{label}.ahu")));
+        let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mine = canonical(&destination);
+        for ca in &self.ca {
+            if ca.label == label {
+                continue;
+            }
+            let other = ca
+                .bundle_file
+                .clone()
+                .unwrap_or_else(|| self.storage.bundle_dir.join(format!("{}.ahu", ca.label)));
+            if canonical(&other) == mine {
+                return Err(crate::error::CoreError::Config(format!(
+                    "CA label '{label}' destination {} is also configured for CA '{}' — give \
+                     each label a distinct destination",
+                    destination.display(),
+                    ca.label
+                )));
+            }
+        }
+        Ok(destination)
+    }
+
     pub fn is_signer(&self) -> bool {
         self.server.mode == "signer"
     }
@@ -449,12 +520,16 @@ impl Config {
     }
 
     pub fn validate_for_mode(&self) -> crate::error::Result<()> {
-        if self
-            .gossip
-            .as_ref()
-            .is_some_and(|g| g.enabled && !g.peer_keys.is_empty())
-        {
-            return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));
+        if let Some(g) = self.gossip.as_ref() {
+            if !g.peer_keys.is_empty() {
+                return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));
+            }
+            if !matches!(g.auth_mode.as_str(), "required" | "permissive") {
+                return Err(crate::error::CoreError::Config(format!(
+                    "gossip.auth_mode must be \"required\" or \"permissive\" (got '{}')",
+                    g.auth_mode
+                )));
+            }
         }
         let mut labels = std::collections::HashSet::new();
         for ca in &self.ca {
@@ -526,6 +601,30 @@ impl Config {
                          or type='demo' for testing only.",
                         ca.label, self.server.mode
                     )));
+                }
+                // F07: production signing requires a complete persistent seal
+                // pair. Demo signing may generate a distinct ephemeral seal
+                // pair only when neither seal input is supplied; a
+                // half-configured pair is always an error.
+                match (&ca.seal_key, &ca.seal_cert) {
+                    (None, None) => {
+                        if !matches!(&ca.signing_key, Some(SigningKeyConfig::Demo)) {
+                            return Err(crate::error::CoreError::Config(format!(
+                                "CA '{}': production signing requires a persistent seal_key \
+                                 and seal_cert pair — configure both, or use the demo signing \
+                                 key for testing",
+                                ca.label
+                            )));
+                        }
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(crate::error::CoreError::Config(format!(
+                            "CA '{}': seal_key and seal_cert must be configured together — a \
+                             half-configured seal pair is always an error",
+                            ca.label
+                        )));
+                    }
+                    (Some(_), Some(_)) => {}
                 }
             }
             if self.ca.is_empty() {

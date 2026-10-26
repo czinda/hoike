@@ -39,7 +39,7 @@ pub fn load_failure_reason(err: &hoike_core::CoreError) -> &'static str {
         EpochRollback { .. } | EpochJumpTooLarge { .. } => "rollback",
         ForkDetected { .. } => "fork",
         Bundle(_) => "bundle",
-        StateStore(_) => "state",
+        StateStore(_) | StateLock(_) => "state",
         Io(_) => "io",
         _ => "other",
     }

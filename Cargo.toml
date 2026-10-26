@@ -11,6 +11,13 @@ members = [
 
 [workspace.package]
 edition = "2024"
+# Declared floor for first-party source: no first-party code may require a
+# newer rustc (CI and the pinned rust-toolchain.toml build with 1.97). Note:
+# building hoike-gossip requires rustc >= 1.88 in practice because the locked
+# foca 2.0.0 dependency declares `rust-version = "1.88"` and cargo enforces
+# dependency requirements against the invoking toolchain. A full workspace
+# build on a 1.85 toolchain is therefore not currently possible; the 1.85
+# floor is a source-level constraint on this repository's own code.
 rust-version = "1.85"
 
 [workspace.dependencies]

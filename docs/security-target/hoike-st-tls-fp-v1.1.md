@@ -66,7 +66,7 @@ plaintext HTTP by design (signed responses).
 
 | Element | Status | Evidence / note |
 |---------|--------|-----------------|
-| Forward-proxy client validates server cert | **Partial** | Shared reqwest client with the system trust store validates the upstream OCSP server cert; `https://` enforced (`handlers.rs:287-296`; `hoike check` hard-fails cleartext w/o `forward_insecure` `main.rs:1045-1071`). **Gap within:** a custom `forward_ca` root is **not** wired into the forward client (`main.rs:1064-1069`, `handlers.rs:281-287`) — only the system store is used. |
+| Forward-proxy client validates server cert | **Partial** | Per-CA forwarding clients are built and validated at startup (`forwarding.rs::build_forward_clients`, consumed by serving and `hoike check`): with `forward_ca`, the parsed PEM bundle becomes that CA's only trusted roots (built-in roots disabled, hostname and validity checking kept on); without `forward_ca`, the CA's client validates against reqwest's bundled WebPKI roots — not the system trust store. `https://` is enforced, redirects are not followed, and upstream bodies are incrementally bounded (`handlers.rs::forward_request`). An unreadable/empty/malformed `forward_ca`, a root pinned to a non-HTTPS target, or a duplicate CA label fails startup and `hoike check`. Regressions: `forward_tls` suite `configured_private_root_succeeds`, `private_roots_are_isolated_per_ca`, `wrong_hostname_and_wrong_root_reject`, `invalid_root_configuration_fails_startup`, plus handlers regressions `cleartext_forwarding_requires_explicit_opt_in`, `redirects_are_not_followed`, `chunked_response_is_rejected_before_unbounded_buffering`, over real loopback TLS listeners. **Remaining gap:** ciphersuite/group selection is not pinned by hoike (see below). |
 | Syncrepl (LDAPS/StartTLS) client validates server cert | **Met** | `client_config_with_ca` builds a rustls (aws-lc-rs) config with the configured CA; StartTLS-before-bind or LDAPS (`dogtag_sync.rs:190-216,210-251`); `none` = default plaintext (Partial by config). |
 | Reference identifier / SAN matching | **Partial** | Delegated to rustls/webpki defaults (hostname verification on); not independently asserted or pinned by hoike. |
 | Ciphersuite / group selection enumerated | **Partial** | Same as server: inherits aws-lc-rs defaults, not pinned. |
@@ -90,19 +90,23 @@ plaintext HTTP by design (signed responses).
 
 | Verdict | Elements |
 |---------|----------|
-| **Met** | TLS 1.2+1.3 version floor; server cert/key loading; syncrepl client cert validation; supporting sig/hash crypto |
-| **Partial** | Ciphersuite/group/resumption/ALPN **not explicitly pinned** (inherit aws-lc-rs defaults); FCS_TLSS_EXT.2 mTLS (off by default); FCS_TLSC_EXT.1 forward-client custom-CA + reference-identifier assertion; FCS_RBG_EXT.1 |
-| **Gap** | Peer-TLS-cert revocation checking on the client; `forward_ca` not wired into forward client; FIPS module validation |
+| **Met** | TLS 1.2+1.3 version floor; server cert/key loading; syncrepl client cert validation; supporting sig/hash crypto; per-CA forwarding clients with private `forward_ca` roots (built-in roots disabled for that CA) or bundled WebPKI roots |
+| **Partial** | Ciphersuite/group/resumption/ALPN **not explicitly pinned** (inherit aws-lc-rs defaults); FCS_TLSS_EXT.2 mTLS (off by default); FCS_TLSC_EXT.1 reference-identifier assertion; FCS_RBG_EXT.1 |
+| **Gap** | Peer-TLS-cert revocation checking on the client; FIPS module validation |
 
 **Closing work to satisfy the FP as written:**
 
 1. **Pin an explicit ciphersuite + group + signature-algorithm list** on the rustls
    `ServerConfig`/`ClientConfig` (restrict `provider.cipher_suites` / `kx_groups`) and
    enumerate them in the ST — the single highest-value change for FP conformance.
-2. **Wire `forward_ca`** into the forward reqwest client so a private root can be pinned
-   (`main.rs:1064-1069`).
+2. ~~**Wire `forward_ca`** into the forward reqwest client~~ — **done**: each
+   forwarding CA gets a startup-validated client whose `forward_ca` PEM bundle
+   is its only trust root set (October audit F10, remediation task C3).
 3. **Enable mTLS** on the admin listener (`admin_tls.client_ca`) for FCS_TLSS_EXT.2.
-4. **Build `aws-lc-rs/fips` + `rustls/fips`** for a validated module.
+4. **Build `aws-lc-rs/fips` + `rustls/fips`** for a validated module — necessary
+   but not sufficient: FIPS validation of the deployment is an evaluation
+   activity covering the module boundary and operating environment, not a
+   build flag alone.
 5. Explicitly configure (or disable) **session resumption/tickets** and **ALPN**, and
    assert **reference-identifier** matching, rather than relying on defaults.
 
@@ -110,5 +114,6 @@ plaintext HTTP by design (signed responses).
 TLS 1.2/1.3, and the actual bytes on the wire are approved suites. The FP *conformance*
 gap is almost entirely about **making the selection explicit and enumerable** rather than
 inheriting library defaults — a configuration/enumeration exercise, not an algorithm
-substitution — plus the two genuine client-side gaps (forward custom-CA wiring, peer-cert
-revocation checking).
+substitution — plus the remaining genuine client-side gap (peer-cert revocation
+checking); the forward custom-CA gap was closed by the per-CA `forward_ca` clients
+(October audit F10).

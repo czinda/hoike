@@ -19,3 +19,4 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

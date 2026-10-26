@@ -37,38 +37,99 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    /// Open existing state, strictly (F04).
+    ///
+    /// Missing or malformed state is an error, never a silently fresh
+    /// timeline: forgetting recorded high-water marks would let an older
+    /// bundle be served again. Valid legacy JSON is preserved. Committed
+    /// snapshots must exist, match their content digest, and carry rollback
+    /// marks — incomplete committed state is a recovery failure.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    CoreError::StateStore(format!(
-                        "failed to create state directory {}: {e}",
-                        parent.display()
-                    ))
-                })?;
-            }
-        }
-
-        let state = if path.exists() {
-            let contents = std::fs::read_to_string(path).map_err(|e| {
-                CoreError::StateStore(format!("failed to read state file {}: {e}", path.display()))
-            })?;
-            serde_json::from_str(&contents).map_err(|e| {
-                CoreError::StateStore(format!(
-                    "failed to parse state file {}: {e}",
-                    path.display()
-                ))
-            })?
-        } else {
-            info!(path = %path.display(), "no existing state file — initializing fresh state");
-            PersistedState::default()
-        };
-
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            CoreError::StateStore(format!(
+                "cannot open state file {}: {e}. State is never created implicitly; \
+                 run `hoike init-state` to initialize a new state directory, or restore \
+                 the state file together with its committed snapshots",
+                path.display()
+            ))
+        })?;
+        let state: PersistedState = serde_json::from_str(&contents).map_err(|e| {
+            CoreError::StateStore(format!(
+                "failed to parse state file {}: {e}. Restore the state directory from \
+                 backup; this release has no automatic recovery and no reset escape hatch",
+                path.display()
+            ))
+        })?;
+        validate_persisted(&state, path)?;
         Ok(StateStore {
             path: path.to_path_buf(),
             state,
             staged: false,
         })
+    }
+
+    /// Explicitly initialize a fresh state directory (F04).
+    ///
+    /// Initialization is the operator's acknowledgment that this directory is
+    /// new. It refuses an existing state file and refuses a directory holding
+    /// any recovery material (snapshots, cookies, unknown files) so a partial
+    /// restore can never be silently reset. Only the writer lock file is
+    /// ignored when checking emptiness. Creating the directory does not by
+    /// itself authorize resetting it.
+    pub fn initialize(path: &Path) -> Result<Self> {
+        if path.exists() {
+            return Err(CoreError::StateStore(format!(
+                "refusing to initialize {}: state file already exists — existing state is \
+                 never reset; restore marks and snapshots together to recover",
+                path.display()
+            )));
+        }
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if dir.exists() {
+            // Any content besides the writer lock file is recovery material:
+            // a partial restore must never be silently reset.
+            let entries = std::fs::read_dir(dir).map_err(|e| {
+                CoreError::StateStore(format!(
+                    "failed to inspect state directory {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    CoreError::StateStore(format!(
+                        "failed to inspect state directory {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                if entry.file_name() != crate::storage::WRITER_LOCK_FILE {
+                    return Err(CoreError::StateStore(format!(
+                        "refusing to initialize state in {}: directory already contains \
+                         '{}' — restore state and recovery material together instead of \
+                         re-initializing",
+                        dir.display(),
+                        entry.file_name().to_string_lossy()
+                    )));
+                }
+            }
+        } else {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                CoreError::StateStore(format!(
+                    "failed to create state directory {}: {e}",
+                    dir.display()
+                ))
+            })?;
+        }
+        let store = StateStore {
+            path: path.to_path_buf(),
+            state: PersistedState::default(),
+            staged: false,
+        };
+        store.persist()?;
+        info!(path = %path.display(), "initialized fresh state directory");
+        Ok(store)
     }
 
     pub fn get_high_water(&self, producer_id: &str, issuer_key_hash_hex: &str) -> Option<u64> {
@@ -111,11 +172,23 @@ impl StateStore {
         Ok(())
     }
 
+    /// Stage a transaction candidate against this store (design §S5).
+    ///
+    /// A single-label installation stages into the candidate while
+    /// **preserving** other labels' committed snapshots. Callers performing
+    /// a full working-set reload must call [`Self::clear_active_bundles`]
+    /// explicitly, so the reload builds a replacement working set instead of
+    /// merging into whatever was committed before.
     pub(crate) fn transaction(&self) -> Self {
         let mut candidate = self.clone();
         candidate.staged = true;
-        candidate.state.active_bundles.clear();
         candidate
+    }
+
+    /// Drop all committed snapshot references: a full reload replaces the
+    /// whole working set rather than merging into it.
+    pub(crate) fn clear_active_bundles(&mut self) {
+        self.state.active_bundles.clear();
     }
 
     pub(crate) fn commit(&mut self, candidate: Self) -> Result<()> {
@@ -169,7 +242,7 @@ impl StateStore {
         let path = dir.join(format!("{digest}.ahu"));
         // Existing blobs are verified, never trusted solely by their filename.
         if !path.exists() || std::fs::read(&path)? != bytes {
-            Self::write_atomic(&path, &bytes)?;
+            crate::storage::write_atomic(&path, &bytes)?;
         }
         self.state.active_bundles.insert(label.to_owned(), path);
         Ok(())
@@ -259,32 +332,99 @@ impl StateStore {
     fn persist(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&self.state)
             .map_err(|e| CoreError::StateStore(format!("failed to serialize state: {e}")))?;
-        Self::write_atomic(&self.path, &json)
+        crate::storage::write_atomic(&self.path, &json)
     }
+}
 
-    fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let tmp = path.with_extension(format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)?;
-            std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+/// Validate persisted state before it is trusted (F04).
+///
+/// High-water marks and manifest digests are written as pairs, so a record on
+/// one side without its counterpart is a torn write. Every committed snapshot
+/// must exist, hash to the digest in its filename, and have its scopes covered
+/// by a high-water mark at or above the snapshot's epoch — a missing record
+/// referenced by a committed snapshot is recovery failure, not a new scope.
+fn validate_persisted(state: &PersistedState, path: &Path) -> Result<()> {
+    for (key, digest_hex) in &state.manifest_digests {
+        let decoded = hex::decode(digest_hex).map_err(|e| {
+            CoreError::StateStore(format!(
+                "state file {}: manifest digest for '{key}' is not valid hex: {e}",
+                path.display()
+            ))
+        })?;
+        if decoded.len() != 32 {
+            return Err(CoreError::StateStore(format!(
+                "state file {}: manifest digest for '{key}' has {} bytes, expected 32",
+                path.display(),
+                decoded.len()
+            )));
         }
-        result
+        if !state.high_water_marks.contains_key(key) {
+            return Err(CoreError::StateStore(format!(
+                "state file {}: manifest digest for '{key}' has no high-water record — \
+                 restore marks and snapshots together",
+                path.display()
+            )));
+        }
     }
+    for key in state.high_water_marks.keys() {
+        if !state.manifest_digests.contains_key(key) {
+            return Err(CoreError::StateStore(format!(
+                "state file {}: high-water mark for '{key}' has no manifest digest record — \
+                 restore marks and snapshots together",
+                path.display()
+            )));
+        }
+    }
+    for (label, snapshot) in &state.active_bundles {
+        let bytes = std::fs::read(snapshot).map_err(|e| {
+            CoreError::StateStore(format!(
+                "committed snapshot for '{label}' is missing: {} ({e}) — restore marks and \
+                 snapshots together; do not re-initialize",
+                snapshot.display()
+            ))
+        })?;
+        let digest_hex = snapshot
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                CoreError::StateStore(format!(
+                    "committed snapshot for '{label}' has a malformed name: {}",
+                    snapshot.display()
+                ))
+            })?;
+        let expected = hex::decode(digest_hex).map_err(|e| {
+            CoreError::StateStore(format!(
+                "committed snapshot for '{label}' has a non-digest name: {e}"
+            ))
+        })?;
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        if actual.as_slice() != expected.as_slice() {
+            return Err(CoreError::StateStore(format!(
+                "committed snapshot for '{label}' does not match its digest name: {}",
+                snapshot.display()
+            )));
+        }
+        let bundle = Bundle::from_bytes(&bytes).map_err(|e| {
+            CoreError::StateStore(format!(
+                "committed snapshot for '{label}' is unreadable: {e}",
+            ))
+        })?;
+        for scope in &bundle.manifest.ca_scopes {
+            let key = PersistedState::make_key(
+                &bundle.manifest.producer_id,
+                &hex::encode(&scope.issuer_key_hash),
+            );
+            match state.high_water_marks.get(&key) {
+                Some(hw) if *hw >= scope.epoch => {}
+                other => {
+                    return Err(CoreError::StateStore(format!(
+                        "committed snapshot '{label}' records scope at epoch {} with \
+                         high-water {:?} — incomplete committed state requires recovery",
+                        scope.epoch, other
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }

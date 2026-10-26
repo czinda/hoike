@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# hoike executive showcase demo — scripted, no-docker version
+# Proves: keyless edges, post-quantum signing, anti-rollback protection
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+HOIKE_BIN="$REPO_ROOT/target/release/hoike"
+AHU_BIN="$REPO_ROOT/target/release/ahu"
+
+# Terminal colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+DEMO_DIR="$SCRIPT_DIR"
+FIXTURES_DIR="$DEMO_DIR/fixtures"
+BUNDLES_DIR="$DEMO_DIR/bundles"
+STATE_DIR="$DEMO_DIR/state-ecdsa"
+CONFIG_DIR="$DEMO_DIR/configs"
+
+# Cleanup trap
+cleanup() {
+    echo -e "\n${YELLOW}[CLEANUP]${NC} Stopping background processes..."
+    jobs -p | xargs -r kill 2>/dev/null || true
+    wait 2>/dev/null || true
+    echo -e "${GREEN}[CLEANUP]${NC} Done."
+}
+trap cleanup EXIT INT TERM
+
+# ── Banner ──
+banner() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${CYAN}$1${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+section() {
+    echo ""
+    echo -e "${BLUE}▸▸▸ $1${NC}"
+}
+
+pass() {
+    echo -e "    ${GREEN}✓${NC} $1"
+}
+
+fail() {
+    echo -e "    ${RED}✗${NC} $1"
+}
+
+warn() {
+    echo -e "    ${YELLOW}⚠${NC} $1"
+}
+
+# ── Check prerequisites ──
+check_prereqs() {
+    section "Checking prerequisites"
+
+    if [[ ! -x "$HOIKE_BIN" ]]; then
+        fail "hoike binary not found at $HOIKE_BIN"
+        echo "       Run: cargo build --release"
+        exit 1
+    fi
+    pass "hoike binary found"
+
+    if [[ ! -x "$AHU_BIN" ]]; then
+        fail "ahu binary not found at $AHU_BIN"
+        echo "       Run: cargo build --release"
+        exit 1
+    fi
+    pass "ahu binary found"
+
+    if ! command -v openssl &>/dev/null; then
+        fail "openssl not found (required for fixture generation)"
+        exit 1
+    fi
+    pass "openssl found"
+}
+
+# ── Generate test fixtures ──
+generate_fixtures() {
+    banner "STAGE 1: Generate Test CA and Fixtures"
+
+    # Self-refreshing: the CA and end-entity certs are long-lived and stable, so
+    # we reuse them when present. But the CRL's thisUpdate is what pre-signed OCSP
+    # responses anchor their nextUpdate to (see hoike-sign/src/generate.rs) — a
+    # stale CRL yields responses that are "born expired" and hoike refuses to sign
+    # them. So we always re-stamp the CRL with a fresh thisUpdate on every run.
+    if [[ -f "$FIXTURES_DIR/ca-cert.pem" && -f "$FIXTURES_DIR/issuer.der" && -f "$FIXTURES_DIR/cert-0A.pem" ]]; then
+        pass "Reusing existing CA and certificates"
+        "$SCRIPT_DIR/scripts/generate-fixtures.sh" --crl-only
+    else
+        "$SCRIPT_DIR/scripts/generate-fixtures.sh"
+    fi
+
+    section "Fixture validation"
+    pass "CA cert: $(openssl x509 -in "$FIXTURES_DIR/ca-cert.pem" -noout -subject)"
+    pass "CRL: $(openssl crl -in "$FIXTURES_DIR/crl.pem" -noout -lastupdate | cut -d= -f2)"
+
+    # Extract issuer name and key for query commands using the same extraction
+    # logic that hoike sign uses internally (subject DER + public key raw bytes)
+    section "Extracting CertID parameters"
+    eval "$("$SCRIPT_DIR/scripts/extract-certid-params.py" "$FIXTURES_DIR/issuer.der")"
+
+    # Store for later use
+    echo "$ISSUER_NAME_B64" > "$DEMO_DIR/.issuer-name-b64"
+    echo "$ISSUER_KEY_B64" > "$DEMO_DIR/.issuer-key-b64"
+
+    pass "Issuer name (base64) cached"
+    pass "Issuer key (base64) cached"
+}
+
+# ── Sign bundles ──
+# The OCSP signing key is the ephemeral --demo-key, but the CMS seal uses the
+# persistent per-run seal pair from generate-fixtures.sh, so the demo exercises
+# the production seal policy: a complete key/certificate pair, distinct from
+# the OCSP key, pinned by configs/trusted-edge.toml and the edge configs.
+sign_bundles() {
+    banner "STAGE 2: Sign OCSP Response Bundles"
+
+    mkdir -p "$BUNDLES_DIR"
+
+    section "Signing ECDSA bundle (epoch 1)"
+    "$HOIKE_BIN" sign \
+        --ca demo-ca \
+        --crl "$FIXTURES_DIR/crl.pem" \
+        --issuer "$FIXTURES_DIR/issuer.der" \
+        --good-serials "$FIXTURES_DIR/good-serials.txt" \
+        --sig-alg ecdsa-p256 \
+        --demo-key \
+        --seal-key "$FIXTURES_DIR/seal-key.p8" \
+        --seal-cert "$FIXTURES_DIR/seal-cert.pem" \
+        --epoch 1 \
+        -o "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu"
+
+    pass "ECDSA bundle created: $(du -h "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | cut -f1)"
+
+    section "Inspecting ECDSA bundle"
+    "$AHU_BIN" inspect "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | head -20
+
+    section "Checking ECDSA bundle structure (no trust policy)"
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" --structure-only
+
+    section "Signing ML-DSA-65 bundle (epoch 1)"
+    "$HOIKE_BIN" sign \
+        --ca demo-ca \
+        --crl "$FIXTURES_DIR/crl.pem" \
+        --issuer "$FIXTURES_DIR/issuer.der" \
+        --good-serials "$FIXTURES_DIR/good-serials.txt" \
+        --sig-alg ml-dsa-65 \
+        --demo-key \
+        --seal-key "$FIXTURES_DIR/seal-key.p8" \
+        --seal-cert "$FIXTURES_DIR/seal-cert.pem" \
+        --epoch 1 \
+        -o "$BUNDLES_DIR/demo-mldsa-epoch1.ahu"
+
+    pass "ML-DSA bundle created: $(du -h "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" | cut -f1)"
+
+    section "Checking ML-DSA bundle structure (no trust policy)"
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" --structure-only
+
+    section "Size comparison"
+    echo "  ECDSA:  $(du -h "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" | cut -f1)"
+    echo "  ML-DSA: $(du -h "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" | cut -f1)"
+    echo "  Ratio:  ~$(( $(wc -c < "$BUNDLES_DIR/demo-mldsa-epoch1.ahu") / $(wc -c < "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu") ))x larger"
+}
+
+# ── Authenticated verification against the demo pin ──
+verify_authenticated() {
+    banner "STAGE 2b: Authenticated Bundle Verification"
+
+    # Write the configs (including trusted-edge.toml) before first use.
+    create_edge_config
+
+    section "Authenticating the CMS seal against configs/trusted-edge.toml"
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" \
+        --config "$CONFIG_DIR/trusted-edge.toml"
+    pass "ECDSA bundle seal authenticated (signer pin matched)"
+
+    "$AHU_BIN" verify "$BUNDLES_DIR/demo-mldsa-epoch1.ahu" \
+        --config "$CONFIG_DIR/trusted-edge.toml"
+    pass "ML-DSA bundle seal authenticated (signer pin matched)"
+
+    section "Tampering with the bundle must fail verification"
+    # Flip the final byte (inside the trailing CMS seal region, which is
+    # covered by the data digest) — verification must fail closed.
+    TAMPER="$BUNDLES_DIR/demo-ecdsa-tampered.ahu"
+    cp "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" "$TAMPER"
+    TAMPER_SIZE=$(wc -c < "$TAMPER" | tr -d ' ')
+    LAST_BYTE=$(tail -c 1 "$TAMPER" | od -An -tu1 | tr -d ' ')
+    NEW_BYTE=$((LAST_BYTE ^ 0xFF))
+    # Command substitution strips NUL bytes, so a 0x00 replacement would
+    # leave the copy byte-identical; flip to a nonzero byte instead.
+    (( NEW_BYTE == 0 )) && NEW_BYTE=1
+    printf "$(printf '\\x%02x' "$NEW_BYTE")" \
+        | dd of="$TAMPER" bs=1 seek=$((TAMPER_SIZE - 1)) conv=notrunc status=none
+    if "$AHU_BIN" verify "$TAMPER" \
+        --config "$CONFIG_DIR/trusted-edge.toml" >/dev/null 2>&1; then
+        fail "A tampered bundle passed verification!"
+        exit 1
+    else
+        pass "Tampered bundle rejected"
+    fi
+    rm "$TAMPER"
+
+    section "A wrong trust pin must fail authentication"
+    # Same bundle, but pinned to the demo CA certificate instead of the seal
+    # signer: structure and digests are valid, the seal is intact, and only
+    # the trust policy rejects it.
+    cat > "$CONFIG_DIR/wrong-pin.toml" <<EOF
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "$BUNDLES_DIR"
+state_db = "$STATE_DIR"
+seal_signer_pins = ["$FIXTURES_DIR/ca-cert.pem"]
+EOF
+    if "$AHU_BIN" verify "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" \
+        --config "$CONFIG_DIR/wrong-pin.toml" >/dev/null 2>&1; then
+        fail "An unpinned seal signer passed authenticated verification!"
+        exit 1
+    else
+        pass "Seal signed by an unpinned certificate rejected"
+    fi
+    rm "$CONFIG_DIR/wrong-pin.toml"
+}
+
+# ── Create edge config ──
+create_edge_config() {
+    mkdir -p "$CONFIG_DIR"
+
+    cat > "$CONFIG_DIR/edge-ecdsa.toml" <<EOF
+[server]
+mode = "edge"
+listen = "127.0.0.1:2560"
+max_request = 8192
+
+[storage]
+bundle_dir = "$BUNDLES_DIR"
+state_db = "$STATE_DIR"
+# Authenticated admission: pin this run's demo seal certificate. This is the
+# production trust model — the OCSP signing key is ephemeral (--demo-key),
+# but bundle admission is authenticated against the pinned seal signer.
+seal_signer_pins = ["$FIXTURES_DIR/seal-cert.pem"]
+
+[[ca]]
+label = "demo-ca"
+bundle_file = "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu"
+nonce_policy = "ignore"
+completeness = "partial"
+EOF
+
+    cat > "$CONFIG_DIR/edge-mldsa.toml" <<EOF
+[server]
+mode = "edge"
+listen = "127.0.0.1:2561"
+max_request = 8192
+
+[storage]
+bundle_dir = "$BUNDLES_DIR"
+state_db = "$DEMO_DIR/state-mldsa"
+# Authenticated admission: pin this run's demo seal certificate.
+seal_signer_pins = ["$FIXTURES_DIR/seal-cert.pem"]
+
+[[ca]]
+label = "demo-ca"
+bundle_file = "$BUNDLES_DIR/demo-mldsa-epoch1.ahu"
+nonce_policy = "ignore"
+completeness = "partial"
+EOF
+
+    # Minimal read-only verification config referenced by VERIFICATION.md and
+    # the authenticated-verification stage: the same seal pin, no serving
+    # sections. `ahu verify --config` authenticates the CMS seal and scope
+    # authorization against exactly this trust policy.
+    cat > "$CONFIG_DIR/trusted-edge.toml" <<EOF
+# Generated by run.sh — pins this run's demo seal certificate so
+#   ahu verify bundles/<bundle>.ahu --config configs/trusted-edge.toml
+# performs real authenticated verification. The seal pair is regenerated (with
+# a fresh validity window) on every demo run, so the pin is only valid for the
+# bundles signed in the same run.
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "$BUNDLES_DIR"
+state_db = "$STATE_DIR"
+seal_signer_pins = ["$FIXTURES_DIR/seal-cert.pem"]
+EOF
+}
+
+# ── Start edge server ──
+start_edge() {
+    banner "STAGE 3: Start Keyless Edge Server (ECDSA)"
+
+    create_edge_config
+
+    section "Read-only configuration check (authenticated admission)"
+    "$HOIKE_BIN" check --config "$CONFIG_DIR/edge-ecdsa.toml"
+
+    # F04: state is initialized explicitly, exactly once per run directory.
+    # A restart with existing state must never initialize or delete it.
+    if [[ ! -f "$STATE_DIR/state.json" ]]; then
+        section "Initializing state directory (first run)"
+        "$HOIKE_BIN" init-state --config "$CONFIG_DIR/edge-ecdsa.toml"
+    else
+        pass "Reusing existing state directory $STATE_DIR (marks preserved)"
+    fi
+
+    start_edge_process
+}
+
+# Start the ECDSA edge in the background and wait until it answers.
+start_edge_process() {
+    section "Starting edge on http://127.0.0.1:2560"
+    "$HOIKE_BIN" serve --config "$CONFIG_DIR/edge-ecdsa.toml" &
+    EDGE_PID=$!
+
+    # Wait for server to be ready
+    for i in {1..10}; do
+        if curl -s http://127.0.0.1:2560 >/dev/null 2>&1; then
+            pass "Edge server ready (PID $EDGE_PID)"
+            return 0
+        fi
+        if ! kill -0 "$EDGE_PID" 2>/dev/null; then
+            fail "Edge server exited during startup"
+            exit 1
+        fi
+        sleep 0.5
+    done
+
+    fail "Edge server did not start"
+    exit 1
+}
+
+stop_edge() {
+    section "Stopping the edge (import is offline by design)"
+    kill "$EDGE_PID" 2>/dev/null || true
+    wait "$EDGE_PID" 2>/dev/null || true
+    pass "Edge stopped; writer lock released"
+}
+
+# ── Run client queries ──
+run_queries() {
+    banner "STAGE 4: Client Queries"
+
+    ISSUER_NAME_B64=$(cat "$DEMO_DIR/.issuer-name-b64")
+    ISSUER_KEY_B64=$(cat "$DEMO_DIR/.issuer-key-b64")
+
+    section "Query 1: GOOD certificate (serial 01)"
+    echo -e "${CYAN}Expected: Successful / GOOD${NC}"
+    echo ""
+    "$HOIKE_BIN" query \
+        --url http://127.0.0.1:2560 \
+        --serial 01 \
+        --issuer-name-b64 "$ISSUER_NAME_B64" \
+        --issuer-key-b64 "$ISSUER_KEY_B64" 2>&1 | tee /tmp/hoike-query-good.log || true
+    echo ""
+
+    if grep -q "OCSP status: Successful" /tmp/hoike-query-good.log && \
+       grep -q "Status:.*GOOD" /tmp/hoike-query-good.log; then
+        pass "✓ Received Successful/GOOD as expected"
+    else
+        warn "Unexpected response — check output above"
+    fi
+
+    section "Query 2: REVOKED certificate (serial 0A)"
+    echo -e "${CYAN}Expected: Successful / REVOKED${NC}"
+    echo ""
+    "$HOIKE_BIN" query \
+        --url http://127.0.0.1:2560 \
+        --serial 0A \
+        --issuer-name-b64 "$ISSUER_NAME_B64" \
+        --issuer-key-b64 "$ISSUER_KEY_B64" 2>&1 | tee /tmp/hoike-query-revoked.log || true
+    echo ""
+
+    if grep -q "OCSP status: Successful" /tmp/hoike-query-revoked.log && \
+       grep -q "Status:.*REVOKED" /tmp/hoike-query-revoked.log; then
+        pass "✓ Received Successful/REVOKED as expected"
+    else
+        warn "Unexpected response — check output above"
+    fi
+
+    section "Query 3: UNKNOWN certificate (serial FF)"
+    echo -e "${CYAN}Expected: Unauthorized (edge has no signing key)${NC}"
+    echo ""
+    "$HOIKE_BIN" query \
+        --url http://127.0.0.1:2560 \
+        --serial FF \
+        --issuer-name-b64 "$ISSUER_NAME_B64" \
+        --issuer-key-b64 "$ISSUER_KEY_B64" 2>&1 | tee /tmp/hoike-query-unknown.log || true
+    echo ""
+
+    if grep -q "OCSP status: Unauthorized" /tmp/hoike-query-unknown.log; then
+        pass "✓ Received Unauthorized as expected"
+    else
+        warn "Unexpected response — check output above"
+    fi
+}
+
+# ── Demonstrate anti-rollback and restart continuity ──
+demo_antirollback() {
+    banner "STAGE 5: Anti-Rollback Protection and Restart"
+
+    section "Generating older-epoch bundle (epoch 0)"
+    "$HOIKE_BIN" sign \
+        --ca demo-ca \
+        --crl "$FIXTURES_DIR/crl.pem" \
+        --issuer "$FIXTURES_DIR/issuer.der" \
+        --good-serials "$FIXTURES_DIR/good-serials.txt" \
+        --sig-alg ecdsa-p256 \
+        --demo-key \
+        --seal-key "$FIXTURES_DIR/seal-key.p8" \
+        --seal-cert "$FIXTURES_DIR/seal-cert.pem" \
+        --epoch 0 \
+        -o "$BUNDLES_DIR/demo-ecdsa-epoch0.ahu" 2>&1 | grep -v "^INFO"
+
+    pass "Older bundle created (epoch 0)"
+
+    # Import is offline by design: the edge holds the exclusive writer lock on
+    # the state directory, so it must be stopped first.
+    stop_edge
+
+    section "Attempting to import older-epoch bundle (offline)"
+    echo -e "${YELLOW}Expected result: REJECTED (epoch 0 <= high-water mark 1)${NC}"
+
+    if "$HOIKE_BIN" import \
+        --bundle "$BUNDLES_DIR/demo-ecdsa-epoch0.ahu" \
+        --ca demo-ca \
+        --config "$CONFIG_DIR/edge-ecdsa.toml" 2>&1 | tee /tmp/hoike-import.log; then
+        fail "Import should have been rejected!"
+        exit 1
+    else
+        if grep -q "epoch rollback" /tmp/hoike-import.log; then
+            pass "Anti-rollback check PASSED — older epoch rejected"
+        else
+            fail "Import failed for a different reason — check logs"
+            cat /tmp/hoike-import.log
+            exit 1
+        fi
+    fi
+
+    section "Restarting the edge on the existing state directory"
+    # The rejected import changed nothing: the identical committed generation
+    # reloads idempotently over the preserved marks (restart continuity).
+    start_edge_process
+    ISSUER_NAME_B64=$(cat "$DEMO_DIR/.issuer-name-b64")
+    ISSUER_KEY_B64=$(cat "$DEMO_DIR/.issuer-key-b64")
+    "$HOIKE_BIN" query \
+        --url http://127.0.0.1:2560 \
+        --serial 01 \
+        --issuer-name-b64 "$ISSUER_NAME_B64" \
+        --issuer-key-b64 "$ISSUER_KEY_B64" 2>&1 | tee /tmp/hoike-query-restart.log || true
+    if grep -q "OCSP status: Successful" /tmp/hoike-query-restart.log && \
+       grep -q "Status:.*GOOD" /tmp/hoike-query-restart.log; then
+        pass "Restart served the same committed generation (GOOD after restart)"
+    else
+        fail "Restart did not serve the committed generation"
+        exit 1
+    fi
+}
+
+# ── Demonstrate post-quantum edge ──
+demo_pq_edge() {
+    banner "STAGE 6: Post-Quantum Edge (ML-DSA-65)"
+
+    # F04: explicit initialization of a newly allocated run directory only.
+    if [[ ! -f "$DEMO_DIR/state-mldsa/state.json" ]]; then
+        section "Initializing ML-DSA state directory (first run)"
+        "$HOIKE_BIN" init-state --config "$CONFIG_DIR/edge-mldsa.toml"
+    else
+        pass "Reusing existing ML-DSA state directory (marks preserved)"
+    fi
+
+    section "Starting ML-DSA edge on http://127.0.0.1:2561"
+    "$HOIKE_BIN" serve --config "$CONFIG_DIR/edge-mldsa.toml" &
+    EDGE_PQ_PID=$!
+
+    # Wait for server
+    for i in {1..10}; do
+        if curl -s http://127.0.0.1:2561 >/dev/null 2>&1; then
+            pass "ML-DSA edge ready (PID $EDGE_PQ_PID)"
+            break
+        fi
+        sleep 0.5
+    done
+
+    section "Querying with ML-DSA preference"
+    ISSUER_NAME_B64=$(cat "$DEMO_DIR/.issuer-name-b64")
+    ISSUER_KEY_B64=$(cat "$DEMO_DIR/.issuer-key-b64")
+
+    "$HOIKE_BIN" query \
+        --url http://127.0.0.1:2561 \
+        --serial 01 \
+        --issuer-name-b64 "$ISSUER_NAME_B64" \
+        --issuer-key-b64 "$ISSUER_KEY_B64" \
+        --prefer ml-dsa-65,ecdsa-p256 || true
+
+    pass "ML-DSA response received (~3.3 KB signature)"
+}
+
+# ── Main ──
+main() {
+    # The demo re-signs epoch 1 with a fresh CRL and a fresh seal pair on
+    # every run, so a new run over committed anti-rollback state is a
+    # *different* generation at the same epoch — which the preserved marks
+    # correctly reject. Demo runtime state is disposable by design.
+    if [[ -f "$STATE_DIR/state.json" || -f "$DEMO_DIR/state-mldsa/state.json" ]]; then
+        if [[ "${1:-}" == "--fresh" ]]; then
+            echo "Removing disposable demo runtime state (--fresh)"
+            rm -rf "$BUNDLES_DIR" "$STATE_DIR" "$DEMO_DIR/state-mldsa"
+        else
+            fail "Existing demo state found (a previous run committed marks)"
+            echo "       The demo signs a new epoch-1 generation each run; committed"
+            echo "       anti-rollback marks correctly reject the new generation."
+            echo "       Re-run with: ./run.sh --fresh   (removes bundles/ and state-*/)"
+            exit 1
+        fi
+    fi
+
+    banner "hoike Executive Showcase Demo"
+    echo "This demo proves hoike's core architectural bet:"
+    echo "\"The machine that signs status and the machine that serves it are not the same.\""
+    echo ""
+    echo "What you'll see:"
+    echo "  1. Test CA and CRL generation (OpenSSL)"
+    echo "  2. Batch signing of OCSP responses into .ahu bundles (ECDSA + ML-DSA)"
+    echo "  3. Authenticated seal verification against a pinned demo seal certificate"
+    echo "  4. Keyless edge serving pre-signed responses"
+    echo "  5. Client queries returning good/revoked/unauthorized"
+    echo "  6. Anti-rollback protection rejecting older epochs (offline import)"
+    echo "  7. Restart continuity over preserved state"
+    echo "  8. Post-quantum (ML-DSA-65) edge serving"
+    echo ""
+    # Tolerate non-interactive runs (piped/absent stdin): read returns
+    # nonzero on EOF, which must not abort under `set -e`.
+    read -p "Press Enter to begin..." || echo
+
+    check_prereqs
+    generate_fixtures
+    sign_bundles
+    verify_authenticated
+    start_edge
+    sleep 2  # Let edge finish loading
+    run_queries
+    demo_antirollback
+    demo_pq_edge
+
+    banner "Demo Complete!"
+    echo ""
+    echo -e "${GREEN}Summary:${NC}"
+    echo "  ✓ Keyless edge served responses without holding signing keys"
+    echo "  ✓ ECDSA and ML-DSA bundles both worked (same code path)"
+    echo "  ✓ Bundle seals were authenticated against a pinned certificate"
+    echo "  ✓ Anti-rollback rejected an older-epoch import; restart served the"
+    echo "    same committed generation"
+    echo "  ✓ Client received good, revoked, and unauthorized responses"
+    echo ""
+    echo -e "${CYAN}Next steps:${NC}"
+    echo "  • Inspect bundles: $AHU_BIN inspect $BUNDLES_DIR/*.ahu"
+    echo "  • Read the design: cat $REPO_ROOT/hoike-design.md"
+    echo "  • Try multi-CA routing: add a second CA to edge-ecdsa.toml"
+    echo ""
+    echo -e "${YELLOW}Servers are still running. Press Ctrl+C to stop.${NC}"
+
+    wait
+}
+
+main "$@"

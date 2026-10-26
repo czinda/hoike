@@ -8,8 +8,13 @@
 
 > **Implementation status:** Most features described here are implemented in
 > v0.2.0. For remaining gaps, see [README.md](README.md) — specifically the
-> Known Limitations section. Gossip authentication, full PKIX seal chain
-> validation, and several revocation source adapters remain planned.
+> Known Limitations section. Broadcast authentication for gossip is
+> implemented (Ed25519-signed, named-origin, explicit `auth_mode`); gossip
+> payload confidentiality, SWIM liveness authentication, and automatic bundle
+> pull-on-announce remain planned. Full PKIX seal chain validation and several
+> revocation source adapters also remain planned. The October 2026 audit
+> remediation closure is recorded in
+> [docs/audit-remediation-2026-10-23.md](docs/audit-remediation-2026-10-23.md).
 
 ---
 
@@ -233,7 +238,10 @@ RFC 9919 §7.1 makes that a MUST, and it is the constraint that ties
 Per RFC 9919 §3.2.1, one `BasicOCSPResponse` may carry two `SingleResponse`
 elements for the same certificate, one with a SHA-1 `CertID` and one with
 SHA-256. For pre-production this is strictly better than generating two
-responses: one signature, one payload, two index records in the bundle.
+responses: one signature, one payload, two index records in the bundle —
+both records carry the same algorithm discriminator, which is a separate
+dimension from the dual-CertID alias (see `ahu-format-spec.md` §2.4.1 for
+the `(entry_key, discriminator)` ordering).
 
 Make it a per-CA switch (`certid_compat = "dual" | "sha256" | "sha1"`), default
 `dual`, and log the CertID hash algorithm on every request so operators can see
@@ -332,7 +340,7 @@ HTTP request
    ├─ route: (hashAlg, issuerNameHash, issuerKeyHash) → CaContext(s)
    │      └─ no match → unauthorized
    │
-   ├─ lookup: entry_key = SHA-256(DER CertID) → binary search mmap index
+   ├─ lookup: entry_key = SHA-256(DER CertID) → binary search index
    │      ├─ hit  → write stored octets verbatim
    │      └─ miss → authoritative-complete ? unauthorized : forward-or-unauthorized
    │
@@ -356,6 +364,12 @@ debugging into a log line.
 **Never allocate per request on the hot path.** The response is already bytes in
 an `mmap`ed region. `writev` the headers and the slice. No parse, no copy, no
 re-encode.
+
+> **Implementation status (serving path):** the current serving path loads a
+> admitted bundle into memory and serves stored octets from there — no parse,
+> no re-encode, but not yet the `mmap` zero-copy hot path described above.
+> `ahu::MmapBundle` exists as library support; deploying it in the responder
+> hot path is future work, as is `SingleResponse` batching (§4).
 
 ---
 
@@ -381,8 +395,10 @@ One active signer per CA, standbys warm. A lease in shared state (etcd,
 Consul, or a database row with a fencing token) is sufficient — this does not
 need Raft. If two signers briefly overlap, the failure mode is duplicate
 generations at the same epoch, which mirrors detect via the anti-rollback and
-continuity rules and refuse. Prefer a stall over a fork; make the lease
-conservative.
+continuity rules and refuse — unless the duplicate is byte-identical to the
+recorded generation (same manifest digest), which the identical-generation
+restart exception accepts as a legitimate same-epoch reload. Prefer a stall
+over a fork; make the lease conservative.
 
 ### 6.3 Gossip
 
@@ -438,7 +454,6 @@ max_request   = 8192                # bytes; RFC 9919 GETs are ≤255
 [storage]
 bundle_dir    = "/var/lib/hoike/bundles"
 state_db      = "/var/lib/hoike/state"   # epoch high-water marks — MUST persist
-max_chain     = 24                       # deltas before demanding a full bundle
 
 [gossip]
 enabled       = true
@@ -478,11 +493,12 @@ forward_to     = "https://signer-a.pki.example:2560"
 ```
 hoike serve [--config PATH]
 hoike sign      --ca LABEL [--full|--delta]     # signer tier: produce a generation
-hoike check     --config PATH                   # validate config, HSM, sources
+hoike check     --config PATH                   # read-only config and bundle trust checks
 hoike query     URL --cert FILE --issuer FILE   # diagnostic client
 
 ahu inspect  FILE                  # manifest, scopes, epochs, counts
-ahu verify   FILE [--entries]      # seal, digests, sort order, optional per-entry
+ahu verify   FILE --config PATH [--entries]  # authenticate seal/scope; optional embedded-key checks
+ahu verify   FILE --structure-only          # structure/digests; authenticity not checked
 ahu extract  FILE --certid HEX     # pull one response out
 ahu diff     A B                   # what changed between generations
 ahu apply    BASE DELTA... -o OUT  # materialize a working set offline
@@ -549,6 +565,14 @@ the server's runtime.** DER in, DER out, plus the manifest schema and the epoch
 rules. If it will not build with `--no-default-features` in a constrained
 context, the boundary has leaked and the format has quietly become
 implementation-specific.
+
+The ahu wire profile is frozen as implemented: file header 0.1, CBOR manifest
+`format_version` 1 (both distinct from the 0.2 package version), detached CMS
+`id-data` seals with the `content-type` and `message-digest` signed
+attributes, and 48-byte index records with the algorithm discriminator at
+bytes 46–47 sorted by `(entry_key, discriminator)` with duplicate-pair
+rejection. Golden vectors live in `testdata/wire-profile-0.1/`; the normative
+text is `ahu-format-spec.md`.
 
 ### 10.1 Dependencies
 

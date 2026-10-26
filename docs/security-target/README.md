@@ -36,8 +36,9 @@ a TOE Summary Specification mapping every SFR to `file:line` evidence).
   scopes. That is a lab convenience, not a certifiable key-management posture.
 - The crypto is **not** running as a CC/FIPS-validated module. `aws-lc-rs` is
   *FIPS-capable* (it has a validated mode), but hoike does **not** build it with the
-  `fips` feature by default. A validated posture is a build-profile change, not new
-  code.
+  `fips` feature by default — and enabling that feature alone would still not make a
+  deployment FIPS-validated: validation covers the module build, boundary, and
+  operating environment, and is an evaluation activity.
 - Where an SFR is claimed **Met**, the TSS cites the implementing code. Where it is
   **Partial** or **Gap**, the TSS says so plainly and names the closing work. An ST
   that overclaims is worse than useless — a NIAP evaluator rejects it on the first
@@ -58,7 +59,7 @@ each ST restates the boundary briefly and refers here for detail.
 | TOE version | **0.2.0** (per-crate; see FPT_IDV_EXT.1 note below) |
 | TOE type | OCSP responder (RFC 6960 / 9654 / 9919) with a pre-signed-bundle serving model |
 | Developer | hoike project |
-| Form factor | Rust workspace, 6 crates, ~19,076 LoC, 175 test functions; two binaries (`hoike`, `ahu`) |
+| Form factor | Rust workspace, 6 crates, two binaries (`hoike`, `ahu`); scale and test coverage change per release — see the CI suites rather than fixed counts |
 | Platforms | Linux (x86_64/aarch64, gnu + musl), macOS (aarch64); distroless container (`gcr.io/distroless/cc-debian12:nonroot`) |
 
 > **FPT_IDV_EXT.1 caveat.** The crate manifests declare version `0.2.0`, but the clap
@@ -74,8 +75,9 @@ hoike deliberately splits **signing** from **serving**:
   seals them into `ahu` bundles with a CMS `SignedData` envelope, and holds the
   private keys (PKCS#8 files or PKCS#11/HSM).
 - **Edge tier** (`hoike-server`) — **keyless**, horizontally scalable. Serves
-  pre-signed responses from `ahu` bundles by binary-searching an mmap'd index. Holds
-  no OCSP signing key.
+  pre-signed responses from `ahu` bundles by binary-searching the in-memory index
+  of the loaded bundle (the `ahu` crate's `MmapBundle` zero-copy reader is
+  library support, not the deployed serving hot path). Holds no OCSP signing key.
 - **Gossip plane** (`hoike-gossip`) — SWIM membership (foca) + generation
   announcements; trust-bearing broadcasts are Ed25519-signed.
 
@@ -134,7 +136,7 @@ is the map; each ST is authoritative for its own column.
 | Signed responses / proof of origin (`hoike-sign/generate.rs`) | — | FCO_NRO_EXT.2 **Met** | — |
 | TLS server stack, rustls 0.23 / aws-lc-rs (`hoike-server/tls.rs`) | FTP_DIT_EXT.1 **Met** | FCS_TLSS_EXT.1 **Met**, FTP_TRP.1 **Met** | FCS_TLSS_EXT.1 **Met** |
 | TLS mutual auth (`tls.rs` `client_ca` → WebPkiClientVerifier) | — | FCS_TLSS_EXT.2 **Partial** | FCS_TLSC/TLSS mutual **Partial** |
-| Inter-component channels (`handlers.rs` forward, `dogtag_sync.rs` LDAPS) | FTP_DIT_EXT.1 **Met** | FTP_ITC.1 **Met** | FCS_TLSC_EXT.1 (client) **Partial** |
+| Inter-component channels (`forwarding.rs` per-CA clients, `dogtag_sync.rs` LDAPS) | FTP_DIT_EXT.1 **Met** | FTP_ITC.1 **Met** | FCS_TLSC_EXT.1 (client) **Partial** |
 | Gossip broadcast auth, Ed25519 (`hoike-gossip/crypto.rs`) | — | FPT_ITT.1 **Met** | — |
 | Approved signature algs — ECDSA P-256, ML-DSA (`hoike-sign/ml_dsa_bridge.rs`) | FCS_COP.1/1 **Met** | FCS_COP.1 (sig) **Met** | FCS_COP.1/SigGen **Met** |
 | Approved hashing — SHA-256 (SHA-1 compat only) | FCS_COP.1/4 **Met** | FCS_COP.1 (hash) **Met** | FCS_COP.1/Hash **Met** |
@@ -165,7 +167,7 @@ incomplete, or lab-posture only; **Gap** = not implemented (closing work named);
 | 4 | FDP_DAR_EXT.1 | App PP | No app-layer encryption at rest; state DB + sync cookie are plaintext (bundles are CMS-*signed*, not encrypted) | Rely on platform disk encryption (document) or add at-rest encryption |
 | 5 | FPT_AEX_EXT.1 | App PP | No `[profile.release]`/hardening flags; relies on rustc/platform defaults | Add release profile (LTO, `panic=abort`, `overflow-checks`), RELRO/PIE via RUSTFLAGS |
 | 6 | FAU_GEN.2 | App PP / PPCA | Audit events omit operator identity on management actions | Thread `operator_name` from the session into `audit!` calls |
-| 7 | FIPS validation | PPCA / TLS FP | aws-lc-rs not built in `fips` mode | Build `aws-lc-rs/fips` + `rustls/fips` |
+| 7 | FIPS validation | PPCA / TLS FP | aws-lc-rs not built in `fips` mode | Build `aws-lc-rs/fips` + `rustls/fips`, then validate the deployed module boundary and environment (the flags alone are not validation) |
 | 8 | FCS_TLSS_EXT.2 | PPCA / TLS FP | mTLS wired but off by default | Set `admin_tls.client_ca` (verifier already wired) |
 
 ---

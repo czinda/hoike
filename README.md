@@ -60,9 +60,12 @@ v1.1, including the transport-hardening trusted-path/trusted-channel SFRs — se
 ## The ahu bundle format
 
 The **ahu** (Hawaiian: a cairn, a trail marker) format is a portable container of
-pre-signed OCSP responses. Bundles are sealed with CMS `SignedData`, designed
-for zero-copy serving via `mmap` + binary search, and verified against
-configured trust anchors on load.
+pre-signed OCSP responses. Bundles are sealed with CMS `SignedData` and verified
+against configured signer certificate pins or CA anchors on load. The format is
+designed for zero-copy `mmap` serving, and the `ahu` crate ships a
+library-level `MmapBundle` reader for it; the current serving path loads
+bundles into memory and binary-searches the index there — `mmap` is not yet
+deployed in the serving hot path.
 
 See [`ahu-format-spec.md`](ahu-format-spec.md) for the full specification.
 
@@ -84,17 +87,23 @@ Binaries:
 - `target/release/hoike` — the OCSP responder (~8 MB)
 - `target/release/ahu` — bundle inspection and management tool (~1 MB)
 
-Running tests (147 tests across 6 crates):
+Running tests:
 
 ```bash
 cargo test --workspace
 ```
 
+The October 2026 audit remediation is closed out in
+[`docs/audit-remediation-2026-10-23.md`](docs/audit-remediation-2026-10-23.md),
+which records each finding, its fix and regression tests, the migration
+contract, and the integrated release-evidence commands with results.
+
 ## Quick start
 
 ```bash
-# Produce a bundle from a CRL (requires explicit key source)
-hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --signing-key responder.p8 -o bundle.ahu
+# Produce a bundle from a CRL (requires explicit key source and seal pair)
+hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der \
+  --signing-key responder.p8 --seal-key seal.p8 --seal-cert seal-cert.pem -o bundle.ahu
 
 # Or with ML-DSA post-quantum signing (demo key for testing)
 hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --sig-alg ml-dsa-65 --demo-key -o bundle.ahu
@@ -102,10 +111,14 @@ hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --sig-alg ml-dsa-65 
 # Inspect the bundle
 ahu inspect bundle.ahu
 
-# Inspect structural integrity; trusted admission also needs configured seal trust
-ahu verify bundle.ahu
+# Check structural integrity only (does not authenticate the bundle)
+ahu verify bundle.ahu --structure-only
 
-# Start the responder
+# Authenticate after provisioning seal trust in hoike.toml
+ahu verify bundle.ahu --config hoike.toml
+
+# Start the responder (initialize the state directory once, first)
+hoike init-state --config hoike.toml
 hoike serve --config hoike.toml
 
 # Validate configuration before deploying
@@ -124,10 +137,11 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 
 | Command | Description |
 |---------|-------------|
-| `hoike serve --config PATH` | Start the OCSP responder |
-| `hoike check --config PATH` | Validate config, bundle, cert expiry |
+| `hoike serve --config PATH` | Start the OCSP responder (requires an initialized state directory; holds the exclusive writer lock) |
+| `hoike init-state --config PATH` | Explicitly initialize a fresh state directory (refuses existing state) |
+| `hoike check --config PATH` | Read-only config and bundle trust checks; report cert expiry |
 | `hoike sign --ca LABEL --crl FILE [OPTIONS]` | Produce a signed ahu bundle from a CRL |
-| `hoike import --bundle PATH [--config PATH] [--force]` | Import a bundle for enclave/air-gap deployments |
+| `hoike import --bundle PATH --ca LABEL --config PATH` | Offline authenticated installation into the selected CA destination (fails while a server holds the writer lock) |
 | `hoike query --url URL --serial HEX [OPTIONS]` | Query a running OCSP responder |
 
 **`hoike sign` options:**
@@ -140,25 +154,66 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 - `--issuer-name-b64`: base64-encoded DER issuer name (for correct CertID hashes)
 - `--issuer-key-b64`: base64-encoded issuer public key bytes
 - `--issuer PATH`: issuer certificate (DER) for CertID computation
-- `--seal-key PATH`: PKCS#8 PEM or DER P-256 seal key file (separate from signing key)
+- `--seal-key PATH`: PKCS#8 PEM or DER P-256 seal key file — required together with `--seal-cert` for file-key signing (any algorithm); must hold a key distinct from the OCSP signing key
+- `--seal-cert PATH`: PEM or DER seal certificate matching the seal key
 - `--dual-alg ALG`: produce a dual-algorithm bundle (e.g. `ml-dsa-87`) alongside the classical `--sig-alg`
 - `--pq-signing-key PATH`: PKCS#8 PEM or DER PQ signing key file (for `--dual-alg`)
+
+File-key signing requires a complete persistent seal pair: provide both
+`--seal-key` and `--seal-cert` or neither. A half-configured pair is always an
+error, the signing key is never implicitly reused for sealing, and a seal key
+whose public key equals the OCSP signing key is rejected even when configured
+under a different file name. `--demo-key` (with no seal inputs) generates a
+distinct ephemeral seal pair for testing only.
 
 ### ahu
 
 | Command | Description |
 |---------|-------------|
 | `ahu inspect FILE` | Display manifest, scopes, epochs, counts |
-| `ahu verify FILE [--entries]` | Verify CMS seal, digests, sort order; optionally verify each OCSP response signature |
+| `ahu verify FILE --config PATH [--entries]` | Authenticate the CMS seal and scope authorization; check structure and optionally OCSP signatures |
+| `ahu verify FILE --structure-only` | Check structure and digests without authenticating the bundle |
 | `ahu extract FILE --certid HEX` | Extract a single response by entry key |
 | `ahu diff A B` | Show differences between two generations |
 | `ahu apply BASE DELTAS... -o OUT` | Apply delta bundles to a base, producing a materialized full bundle |
+
+Verification requires an explicit mode. Bare `ahu verify FILE` fails; it does not
+discover configuration. `--structure-only` conflicts with `--config` and
+`--entries`, and prints `Structure valid; authenticity not checked.` on success.
+
+Authenticated verification requires `storage.seal_signer_pins` or
+`storage.seal_trust_anchors`. It checks the seal certificate's current validity
+and supported profile, plus any configured `seal_authorizations`. The demo
+admission flag never bypasses these checks for `ahu verify --config`.
+Successful output states `Installation eligibility not checked.`: verification
+does not establish freshness or rollback eligibility and does not install a bundle.
+
+`--entries` checks signatures using embedded responder keys, not general
+responder-chain PKIX validation. Successful OCSP responses without embedded
+certificates make the command fail as incomplete. Protocol-defined unsigned OCSP
+error responses are counted separately from verified signatures.
+
+`hoike check` checks the configured bundle candidates with the same admission
+trust policy, without creating state, changing rollback marks, or installing
+snapshots. Explicit demo mode reports `Unauthenticated demo admission; authenticity
+not checked.` It does not substitute a committed snapshot for a failing candidate.
+
+The admin `POST /api/admin/bundles/verify` route uses the running server's trust
+policy. A structurally valid but untrusted upload returns HTTP 200 with
+`overall_ok: false`, `trust_status: "failed"`, a `trust_error`, and a null
+`signer_sha256`. Authenticated results report `trust_status: "authenticated"`,
+a null `trust_error`, and the signer's DER certificate SHA-256 fingerprint.
+`overall_ok` also requires all structural checks to pass. Malformed input returns
+HTTP 400. Inspection only reports seal presence; it does not authenticate a seal.
 
 ## Configuration
 
 A keyless edge needs bundle storage and explicit seal trust. Paths below are
 operator-provisioned examples; see the [remediation migration guide](docs/review-remediation.md)
-before upgrading existing state or configuration.
+before upgrading existing state or configuration. The state directory must be
+initialized once with `hoike init-state --config hoike.toml` before the first
+`serve`; `serve` never creates it implicitly, and exactly one writer process
+per state directory is enforced with an OS lock.
 
 ```toml
 [server]
@@ -169,7 +224,7 @@ max_request = 8192
 [storage]
 bundle_dir = "/var/lib/hoike/bundles"
 state_db = "/var/lib/hoike/state"
-max_chain = 24
+allow_unauthenticated_bundles = false
 # Exact signer certificate pins (PEM or DER), not SPKI hashes:
 seal_signer_pins = ["/etc/hoike/seal-signer.pem"]
 # Alternative: dedicated CA anchors for the supported direct-issuer profile.
@@ -188,18 +243,108 @@ enabled = false
 bind = "0.0.0.0:7946"
 seeds = []
 node_name = "edge-01"
-# Before enabling authenticated gossip, provision the local signing key and
-# mappings for each authorized origin (including this node where needed):
+# Explicit inbound authentication policy (FPT_ITT.1): "required" (default)
+# or "permissive". Required mode needs the local signing key below and drops
+# unsigned, forged, and unknown-origin broadcasts.
+auth_mode = "required"
 # identity_key = "/etc/hoike/gossip/edge-01.ed25519.p8"
 # [gossip.peer_identities]
 # edge-01 = "/etc/hoike/gossip/edge-01.pub.pem"
 # edge-02 = "/etc/hoike/gossip/edge-02.pub.pem"
 ```
 
+Gossip authentication is enabled through an explicit rollout sequence, not
+implicit key presence:
+
+1. **Provision** — generate an Ed25519 identity per node and distribute every
+   node's `peer_identities` mapping (including each node's own name/key pair)
+   while gossip is disabled or unsigned.
+2. **Permissive** — set `auth_mode = "permissive"` fleet-wide. Unsigned legacy
+   broadcasts are still accepted; signed frames are verified against the
+   provisioned identities, and unknown/forged signatures are already rejected.
+3. **Sign** — configure `identity_key` on every node so all outbound
+   broadcasts carry signatures.
+4. **Required** — set `auth_mode = "required"` fleet-wide. Unsigned traffic is
+   now rejected; a required node without a local identity key fails startup.
+
+This sequence assumes a *frame-aware* fleet: every node runs a binary that
+understands the signed frame wire tag. The one-byte tag keeps such a mixed
+fleet interoperable, but it does not make every historical binary compatible.
+`required` mode with missing or unreadable key material, a legacy nonempty
+`peer_keys` list, or a `peer_identities` entry for the local node name that
+disagrees with the local `identity_key` is a fatal startup error. `hoike check`
+reports the effective mode and its unsigned-acceptance posture using the same
+policy loading. Unreachable gossip peers (a partition) only degrade gossip;
+OCSP serving continues independently.
+
+Bundle admission requires configured seal trust by default, including startup,
+hot reload, and recovery from committed snapshots. Existing deployments with no
+trust policy must provision `seal_signer_pins` or `seal_trust_anchors` before
+upgrading. Embedded signer certificates do not establish trust by themselves.
+An empty `seal_authorizations` list leaves trusted signers unrestricted by scope;
+when configured, it must authorize every scope, including both SHA-1 and SHA-256
+scopes in dual-CertID bundles.
+
+For local demos only, set `storage.allow_unauthenticated_bundles = true` with no
+pins, anchors, or authorizations. This mode checks structure and digests but does
+not authenticate the seal. Each demo admission emits an `audit` warning with
+`trust = "unauthenticated_demo"`. Any configured trust still applies, even with
+the flag enabled: invalid seals, unreadable trust files, and unauthorized scopes
+are rejected. Authorizations without pins or anchors are also rejected.
+
+Admission accepts only the supported serving profile: full, uncompressed
+bundles. The ahu format can *represent* deltas, tombstones, Zstd compression,
+and delta chains, but the responder implements no runtime delta overlays or
+decompression, so admission rejects those profiles before any durable state
+changes — including startup, hot reload, `hoike check`, and `hoike import`.
+A correctly sealed delta or compressed bundle is still inspectable with
+`ahu verify --config`; to serve one, materialize it into a full, uncompressed
+bundle first with `ahu apply` (an authenticated, resealed output must still
+satisfy predecessor continuity against the actual destination). The obsolete
+`storage.max_chain` setting was removed: accepting a chain-limit promise that
+was never implemented is misleading. Configurations that still set it fail to
+parse with an unknown-field error; remove the line when upgrading.
+
+`hoike import --bundle PATH --ca LABEL --config PATH` is an offline,
+recoverable authenticated installation, not a staging copy. The label is
+required: it selects the configured destination (the CA's `bundle_file`, or
+`bundle_dir/<label>.ahu`); unknown labels, legacy unscoped configuration, and
+destinations shared by another configured label are rejected. The input is
+always authenticated under the configured seal trust and serving profile —
+the `allow_unauthenticated_bundles` demo flag never relaxes import — and
+rollback/predecessor checks run against the committed state, which must have
+been initialized with `hoike init-state`. The commit order is: immutable
+snapshot write+fsync, then the atomic state-descriptor commit (the
+installation commit point), then publication of the configured bundle path.
+A failure before the descriptor commit leaves the previous generation
+untouched; if the descriptor's directory fsync fails after its rename, the
+error is `DurabilityUncertain` and the operator must stop and reopen state;
+if the post-commit path publication fails, the import still reports success
+with a warning, startup recovers from the committed snapshot, and retrying
+the identical import repairs the path. Import is offline by design — a
+running server holds the exclusive writer lock and makes it fail promptly —
+and completion tells the operator to start the server (there is no SIGHUP
+path and no `--force` override). The authenticated admin reload endpoint is
+unaffected.
+
 For a signer or combined process, configure the CA's signing key,
 `responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.
-CRL sources require an independently authorized issuer certificate; its identity
-is used when explicit issuer-name/key bytes are not configured:
+`seal_key` and `seal_cert` must be configured together — a half-configured pair
+fails validation, and persistent signing keys (file or PKCS#11) require the
+complete pair. Only `type = "demo"` signing may omit both, which generates a
+distinct ephemeral seal pair for testing. `seal_cert` may be PEM or DER; it is
+normalized to DER and the seal
+key/certificate pair is proven with a real CMS preflight seal before anything
+is published — and re-proven on every signing pass (background loop, on-demand
+signing, post-rotation material reload), so a mismatched or expired
+replacement certificate fails closed and leaves the previous generation in
+place. The OCSP signing key and the seal key must be distinct: an ECDSA
+signer whose signature over the domain-separated separation message verifies
+under the seal public key is rejected before production, even when the same
+key material is configured under different file names. (An ML-DSA OCSP signer
+is algorithm-distinct from the configured P-256 seal key.) CRL sources
+require an independently authorized issuer certificate;
+its identity is used when explicit issuer-name/key bytes are not configured:
 
 ```toml
 # Add to the relevant [[ca]] table, before its nested source/signing tables:
@@ -223,10 +368,24 @@ pin_env = "HOIKE_HSM_PIN"
 Build with `pkcs11` for that signing key, `dogtag-sync` for directory sources,
 and `tls` when configuring TLS/mTLS. A configured security feature that is not
 available must fail rather than fall back. `nonce_policy = "forward"` requires
-an HTTPS `forward_to`; `live` belongs on signer/combined nodes. CRL enumeration
+an HTTPS `forward_to`; `live` belongs on signer/combined nodes. Each forwarding
+CA gets its own startup-validated outbound client: an optional `forward_ca`
+PEM bundle pins that CA's private roots (built-in roots disabled, hostname and
+validity checking kept on), while a CA without `forward_ca` validates the
+upstream against the bundled WebPKI roots — not the system trust store. An
+unreadable, empty, or malformed `forward_ca`, a root pinned to a non-HTTPS
+target, or a duplicate CA label fails startup and `hoike check`. CRL enumeration
 cannot establish authoritative completeness. Dogtag's `authoritative-complete`
 mode additionally requires a successful complete source refresh; see the migration
 guide for source-bound snapshot/cookie checkpoints and full-refresh requirements.
+
+The live/seal backend matrix is deliberately narrow: configured bundle seals
+are P-256 software keys (`seal_key` PKCS#8 file; ML-DSA seals remain available
+through the library and `ahu apply --seal-key` path), batch OCSP signing
+covers ECDSA software, ECDSA PKCS#11, and ML-DSA software keys, and live nonce
+signing covers the configured ECDSA software key. ML-DSA live nonce signing
+and HSM-backed seal keys are separate extensions, not implied by the signing
+key's backend.
 
 ## Workspace layout
 
@@ -266,15 +425,35 @@ changes, regression evidence, migration requirements, and remaining release gate
 
 - **Gossip: broadcasts signed, channel not encrypted** — generation/urgent-revocation
   broadcasts are Ed25519-signed and verified by named-origin mappings
-  (`gossip.identity_key` + `gossip.peer_identities`, design §6.3). Enforced mode
-  rejects unsigned, forged, or misattributed broadcasts. Not yet
+  (`gossip.auth_mode` + `gossip.identity_key` + `gossip.peer_identities`, design
+  §6.3). The explicit `auth_mode = "required"` default rejects unsigned, forged,
+  or misattributed broadcasts; `permissive` is the documented rollout mode and
+  still rejects unknown/forged signed frames. Invalid enabled configurations or
+  unreadable key material abort startup. Not yet
   covered: payload *confidentiality* and authentication of foca's SWIM liveness traffic
   (pings/acks).
+- **Gossip does not distribute bundles** — a `GenerationAnnouncement` records
+  the peer's epoch in the fleet view but does not fetch, verify, or install the
+  peer's bundle (no pull-on-announce); bundle movement is an operator/import
+  concern.
+- **Writer exclusion is single-host** — the exclusive `.writer.lock` (flock)
+  bounds writers on one machine and one local filesystem. It is not
+  distributed signer fencing, and it is not qualified on network filesystems.
+- **Batching/mmap are library support, not deployed hot path** — `ahu`
+  provides `MmapBundle` (zero-copy reads) and the format supports response
+  batching, but the serving path loads full bundles into memory and serves
+  stored single-response entries; no runtime delta overlay, decompression, or
+  mmap hot path is deployed.
 - **Bounded CMS trust profile** — explicit certificate pins or direct-issued
   seal certificates under configured CA anchors. General intermediate-chain PKIX
   validation is unsupported. Configure producer/CA authorizations where needed.
 - **CRL profile** — authenticated direct complete CRLs only; unsupported algorithms,
   delta/indirect CRLs and unsupported critical extensions reject explicitly.
+- **Serving profile** — only full, uncompressed bundles are admitted. Deltas,
+  tombstones, Zstd compression, and nonempty delta-chain metadata are ahu
+  *format* features the serving path rejects at admission; runtime delta
+  overlays and decompression are not implemented. Materialize deltas offline
+  with `ahu apply` first.
 - **Delta apply output** — unsigned intermediate by default; authenticate inputs and
   use an authorized real CMS sealing callback before trusted installation.
 - **Multi-CertID requests** — only the first `CertID` in a multi-Request

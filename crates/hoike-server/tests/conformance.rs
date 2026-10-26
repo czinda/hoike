@@ -25,11 +25,11 @@ fn signing_key() -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap()
 }
 
-fn build_conformance_bundle() -> Vec<u8> {
+fn build_conformance_bundle() -> (Vec<u8>, Vec<u8>) {
     use hoike_sign::{
         CaIdentity, CertIdCompat, CertificateStatus, GenerationConfig, StatusSnapshot,
     };
-    use sha2_v010::Digest as Digest010;
+    use signature::Signer;
     use x509_cert::ext::pkix::CrlReason;
 
     let ca = CaIdentity {
@@ -79,15 +79,36 @@ fn build_conformance_bundle() -> Vec<u8> {
     };
 
     let mut key = signing_key();
-    hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+    // Independent, current seal certificate provisioned as a pin at the edge.
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+    let mut cert =
+        x509_cert::Certificate::from_der(&hoike_sign::generate_seal_cert(&seal_key).unwrap())
+            .unwrap();
+    let now = current_time();
+    let time = |seconds| {
+        x509_cert::time::Time::UtcTime(
+            der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(seconds))
+                .unwrap(),
+        )
+    };
+    cert.tbs_certificate.validity = x509_cert::time::Validity {
+        not_before: time(now - 60),
+        not_after: time(now + 86400),
+    };
+    let signature: p256::ecdsa::DerSignature =
+        seal_key.sign(&cert.tbs_certificate.to_der().unwrap());
+    cert.signature = der::asn1::BitString::from_bytes(signature.as_bytes()).unwrap();
+    let cert = cert.to_der().unwrap();
+    let bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
         &ca,
         &snapshot,
         &config,
         &mut key,
-        |m| Ok(sha2_v010::Sha256::digest(m).to_vec()),
+        |m| hoike_sign::create_cms_seal(m, &hoike_sign::SealKey::EcdsaP256(seal_key), &cert),
         None,
     )
-    .expect("produce_bundle failed")
+    .expect("produce_bundle failed");
+    (bytes, cert)
 }
 
 fn build_certid_conformance(serial: u8) -> CertId {
@@ -161,10 +182,11 @@ fn build_request_with_nonce(cert_id: &CertId, nonce_len: usize) -> Vec<u8> {
 }
 
 async fn start_conformance_server() -> (u16, tempfile::TempDir) {
-    let bundle_bytes = build_conformance_bundle();
+    let (bundle_bytes, seal_cert) = build_conformance_bundle();
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("conformance.ahu");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+    std::fs::write(dir.path().join("seal-signer.der"), seal_cert).unwrap();
 
     let config_toml = format!(
         r#"
@@ -176,6 +198,7 @@ max_request = 8192
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.der"]
 
 [[ca]]
 label = "conformance-ca"
@@ -191,8 +214,12 @@ completeness = "authoritative-complete"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
-    let app_state = hoike_server::AppState::new(state, config);
+    hoike_core::StateStore::initialize(&config.storage.state_db.join("state.json")).unwrap();
+    let guard = std::sync::Arc::new(
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap(),
+    );
+    let state = hoike_core::ResponderState::load(config.clone(), guard).unwrap();
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -23,7 +23,20 @@ pub struct VerifyResult {
 /// This checks everything *except* the CMS seal signature (which requires
 /// a trust anchor) and individual OCSP response signatures (which are
 /// expensive at scale and optional per §3.1 of the spec).
+/// The decoded manifest must agree with the encoded manifest before its
+/// digests or metadata can be used by a caller.
 pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
+    let manifest = crate::manifest::Manifest::from_cbor(&bundle.manifest_bytes)?;
+    // Bundle exposes both representations publicly. Compare their normalized
+    // encodings so accepted CBOR encodings and NaN extension values remain
+    // usable, without allowing unsigned changes to the decoded fields. CMS
+    // verification still authenticates the original manifest_bytes verbatim.
+    if manifest.to_cbor() != bundle.manifest.to_cbor() {
+        return Err(AhuError::ManifestField(
+            "decoded manifest does not match manifest bytes".into(),
+        ));
+    }
+
     let mut result = VerifyResult {
         header_ok: true,
         manifest_ok: true,
@@ -42,20 +55,20 @@ pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
         record.write_to(&mut index_bytes)?;
     }
     let computed_index_digest: [u8; 32] = Sha256::digest(&index_bytes).into();
-    result.index_digest_ok = computed_index_digest == bundle.manifest.integrity.index_digest;
+    result.index_digest_ok = computed_index_digest == manifest.integrity.index_digest;
     if !result.index_digest_ok {
         return Err(AhuError::IndexDigestMismatch {
-            expected: hex::encode(bundle.manifest.integrity.index_digest),
+            expected: hex::encode(manifest.integrity.index_digest),
             actual: hex::encode(computed_index_digest),
         });
     }
 
     // Verify data digest.
     let computed_data_digest: [u8; 32] = Sha256::digest(&bundle.data).into();
-    result.data_digest_ok = computed_data_digest == bundle.manifest.integrity.data_digest;
+    result.data_digest_ok = computed_data_digest == manifest.integrity.data_digest;
     if !result.data_digest_ok {
         return Err(AhuError::DataDigestMismatch {
-            expected: hex::encode(bundle.manifest.integrity.data_digest),
+            expected: hex::encode(manifest.integrity.data_digest),
             actual: hex::encode(computed_data_digest),
         });
     }
@@ -65,11 +78,11 @@ pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
     result.sort_order_ok = true;
 
     // Verify entry count.
-    result.entry_count_matches = bundle.index.len() as u64 == bundle.manifest.entry_count;
+    result.entry_count_matches = bundle.index.len() as u64 == manifest.entry_count;
     if !result.entry_count_matches {
         result.warnings.push(format!(
             "entry_count in manifest ({}) does not match index record count ({})",
-            bundle.manifest.entry_count,
+            manifest.entry_count,
             bundle.index.len()
         ));
     }
@@ -89,8 +102,8 @@ pub fn verify_structure(bundle: &Bundle) -> Result<VerifyResult> {
     }
 
     // Check for delta-specific requirements.
-    if bundle.manifest.bundle_type == crate::manifest::BundleType::Delta
-        && bundle.manifest.continuity.base_manifest_digest.is_none()
+    if manifest.bundle_type == crate::manifest::BundleType::Delta
+        && manifest.continuity.base_manifest_digest.is_none()
     {
         return Err(AhuError::DeltaMissingBase);
     }
@@ -195,6 +208,95 @@ mod tests {
         assert!(result.sort_order_ok);
         assert!(result.entry_bounds_ok);
         assert!(result.entry_count_matches);
+    }
+
+    fn bundle_with_manifest(manifest: Manifest) -> Bundle {
+        let mut builder = BundleBuilder::new(manifest);
+        builder.add_entry([0xAA; 32], b"response".to_vec());
+        Bundle::from_bytes(&builder.build(|m| Ok(Sha256::digest(m).to_vec())).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn verify_rejects_payload_and_decoded_digest_mismatches() {
+        let valid = bundle_with_manifest(test_manifest());
+        for section in ["data", "index"] {
+            let mut bundle = Bundle::from_bytes(&valid.to_bytes().unwrap()).unwrap();
+            match section {
+                "data" => {
+                    bundle.data[0] ^= 1;
+                    bundle.manifest.integrity.data_digest = Sha256::digest(&bundle.data).into();
+                }
+                "index" => {
+                    bundle.index[0].entry_key[0] ^= 1;
+                    let mut index = Vec::new();
+                    bundle.index[0].write_to(&mut index).unwrap();
+                    bundle.manifest.integrity.index_digest = Sha256::digest(&index).into();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(bundle.manifest_bytes, valid.manifest_bytes);
+            let result = verify_structure(&bundle);
+            assert!(
+                matches!(result, Err(AhuError::ManifestField(_))),
+                "modified {section} accepted with an unsigned decoded digest: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_rejects_decoded_metadata_mismatches() {
+        let valid = bundle_with_manifest(test_manifest());
+        for field in ["producer", "scope", "epoch", "window", "entry_count"] {
+            let mut bundle = Bundle::from_bytes(&valid.to_bytes().unwrap()).unwrap();
+            match field {
+                "producer" => bundle.manifest.producer_id = "other".into(),
+                "scope" => bundle.manifest.ca_scopes[0].issuer_key_hash[0] ^= 1,
+                "epoch" => bundle.manifest.ca_scopes[0].epoch += 1,
+                "window" => bundle.manifest.window.next_update_min += 1,
+                "entry_count" => bundle.manifest.entry_count += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(bundle.manifest_bytes, valid.manifest_bytes);
+            let result = verify_structure(&bundle);
+            assert!(
+                matches!(result, Err(AhuError::ManifestField(_))),
+                "decoded {field} mismatch accepted: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_accepts_equivalent_manifest_encoding() {
+        let mut bundle = bundle_with_manifest(test_manifest());
+        let mut value: ciborium::Value =
+            ciborium::from_reader(bundle.manifest_bytes.as_slice()).unwrap();
+        let ciborium::Value::Map(ref mut entries) = value else {
+            panic!("test manifest must be a map");
+        };
+        entries.reverse();
+        bundle.manifest_bytes.clear();
+        ciborium::into_writer(&value, &mut bundle.manifest_bytes).unwrap();
+
+        let parsed = Bundle::from_bytes(&bundle.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.manifest, bundle.manifest);
+        assert_ne!(parsed.manifest_bytes, parsed.manifest.to_cbor());
+        verify_structure(&parsed).unwrap();
+    }
+
+    #[test]
+    fn verify_accepts_parsed_nan_extensions_but_rejects_changed_values() {
+        let mut manifest = test_manifest();
+        manifest.extensions = Some(vec![("test".into(), ciborium::Value::Float(f64::NAN))]);
+        let mut bundle = bundle_with_manifest(manifest);
+        // Manifest's derived PartialEq is non-reflexive for NaN. A consistently
+        // parsed extension must still be accepted by structural verification.
+        verify_structure(&bundle).unwrap();
+        bundle.manifest.extensions.as_mut().unwrap()[0].1 = ciborium::Value::Float(0.0);
+        let result = verify_structure(&bundle);
+        assert!(
+            matches!(result, Err(AhuError::ManifestField(_))),
+            "changed decoded extension accepted: {result:?}"
+        );
     }
 
     #[test]

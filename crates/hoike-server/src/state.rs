@@ -15,6 +15,11 @@ pub struct AppState {
     /// report an empty/disabled roster instead of members and generations.
     pub gossip: Option<Arc<hoike_gossip::GossipNode>>,
     pub admin: Arc<AdminState>,
+    /// Startup-validated outbound clients for nonce forwarding (F10/S8),
+    /// keyed by CA label. Built once by `forwarding::build_forward_clients`;
+    /// each forward-enabled CA gets exactly one client under its own trust
+    /// policy, so two CAs can never share (or silently overwrite) roots.
+    pub forward_clients: Arc<HashMap<String, reqwest::Client>>,
 }
 
 pub struct LiveSignerState {
@@ -91,8 +96,13 @@ impl std::fmt::Display for OperatorRole {
 }
 
 impl AppState {
-    pub fn new(responder: ResponderState, config: Config) -> Self {
-        AppState {
+    /// Fallible since F10: building the per-CA forwarding clients validates
+    /// the `forward_ca` material at startup, so an unreadable, empty, or
+    /// malformed root bundle (or a root pinned to a non-HTTPS target) fails
+    /// here instead of degrading the forward channel at request time.
+    pub fn new(responder: ResponderState, config: Config) -> Result<Self, String> {
+        let forward_clients = crate::forwarding::build_forward_clients(&config)?;
+        Ok(AppState {
             responder: Arc::new(responder),
             live_signers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             signer: None,
@@ -102,7 +112,15 @@ impl AppState {
                 started_at: Instant::now(),
                 sessions: Mutex::new(HashMap::new()),
             }),
-        }
+            forward_clients: Arc::new(forward_clients),
+        })
+    }
+
+    /// Outbound forwarding client for a CA label (F10/S8). `None` when the CA
+    /// has no client — a forwarding lookup without one is a configuration
+    /// mismatch the handler reports, never a cross-CA trust fallback.
+    pub fn forward_client_for(&self, label: &str) -> Option<&reqwest::Client> {
+        self.forward_clients.get(label)
     }
 
     /// Single-CA compatibility builder; never provides a cross-CA fallback.

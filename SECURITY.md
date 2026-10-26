@@ -18,10 +18,19 @@ Include a description, steps to reproduce, affected versions, and your assessmen
 hoike is a PKI component. Its security rests on three properties:
 
 1. **Response integrity.** Every OCSP response carries a signature from the CA or a delegated responder, verified by relying parties. hoike cannot forge a response for a key it does not hold.
-2. **Container integrity.** Every ahu bundle carries a CMS `SignedData` seal. Edge nodes verify the seal against a configured trust policy (certificate pins or CA anchors, optionally restricted per producer and scope) before loading, and enforce monotonic epochs with persisted high-water marks so an older generation cannot be replayed.
+2. **Container integrity.** Normal bundle admission requires a CMS `SignedData` seal and configured trust (certificate pins or CA anchors, optionally restricted per producer and scope). Startup, reload, and committed-snapshot recovery verify structure, digests, seal trust, and scope authorizations before accepting a bundle. Missing trust is an error. Edge nodes enforce monotonic epochs with persisted high-water marks so an older generation cannot be replayed.
 3. **Keyless edge.** Edge nodes hold no signing keys. Compromising an edge cannot produce a false `good`; it can only deny service or replay a still-valid generation until `nextUpdate`.
 
 The signer tier holds keys and is the asset to protect. Production signing keys belong in an HSM (`signing_key.type = "pkcs11"`).
+
+Local demos can explicitly set `storage.allow_unauthenticated_bundles = true`
+(default: `false`). With no pins, anchors, or authorizations, this mode admits
+structurally valid bundles without authenticating their seals and emits an
+`audit` warning identifying `unauthenticated_demo` admission. It does not provide
+the container-authentication guarantee above. Configured trust always takes
+precedence: verification errors never fall back to demo admission. Empty scope
+authorizations impose no additional restrictions on already trusted signers;
+configured authorizations must cover every bundle scope.
 
 ## Known limitations
 
@@ -32,7 +41,7 @@ These are documented design boundaries, not defects, and are not eligible for ad
 - **Bounded CRL profile.** Complete, direct CRLs only, signed with ECDSA P-256, RSA PKCS#1 v1.5, or ML-DSA. Delta and indirect CRLs and unknown critical extensions are rejected.
 - **Delta output is unsigned by default.** `ahu apply` produces an unsigned intermediate; use `apply_sealed` or the `--seal-key`/`--seal-cert` options to produce an installable bundle.
 - **Multi-request OCSP.** Only the first `CertID` in a multi-request `OCSPRequest` is answered.
-- **Cryptography is not FIPS-validated.** All cryptographic operations execute in Rust crates outside any validated module. HSM-produced signatures are the exception. See `docs/compliance/` and the FIPS status page on hoike.dev for the migration plan.
+- **Cryptography is not FIPS-validated.** All cryptographic operations execute in Rust crates outside any validated module. HSM-produced signatures are the exception. `aws-lc-rs` is FIPS-*capable*, but hoike does not build it in `fips` mode, and enabling that feature alone would not make a deployment FIPS-validated: validation covers the module build, its boundary, and the operating environment, and is a deployment/evaluation activity. See [`docs/security-target/`](docs/security-target/) and [`docs/niap-ppca-gap-matrix.md`](docs/niap-ppca-gap-matrix.md) for the current posture.
 - **Admin authentication is basic.** Per-account lockout, password policy, idle timeout, and operator identity in audit events are not yet implemented. Put the admin listener behind mutual TLS on a management network.
 
 ## Verifying releases

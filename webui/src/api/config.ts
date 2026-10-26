@@ -18,7 +18,6 @@ export interface ConfigResponse {
   storage: {
     bundle_dir: string;
     state_db: string;
-    max_chain: number;
     seal_trust_anchors: string[] | null;
   };
   cas: CaConfigInfo[];

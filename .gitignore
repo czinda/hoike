@@ -22,6 +22,8 @@ Thumbs.db
 # Test artifacts
 /tmp/
 *.ahu
+# Golden wire-profile vectors are source, not artifacts
+!testdata/wire-profile-0.1/*.ahu
 
 # Claude Code
 .claude/settings.local.json

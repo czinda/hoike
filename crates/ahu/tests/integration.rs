@@ -2,6 +2,11 @@ use ahu::*;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+// Wire-profile contract tests (header 0.1 / CBOR format_version 1, index
+// discriminator ordering, CMS seal profile) live in wire_profile.rs against
+// the golden vectors in testdata/wire-profile-0.1/. The tests here exercise
+// BundleBuilder round-trips and structural verification.
+
 fn build_test_bundle(entry_count: usize) -> Vec<u8> {
     let manifest = Manifest {
         format_version: 1,

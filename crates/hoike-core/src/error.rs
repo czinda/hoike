@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -52,6 +54,16 @@ pub enum CoreError {
 
     #[error("state store error: {0}")]
     StateStore(String),
+
+    #[error("state directory lock error: {0}")]
+    StateLock(String),
+
+    #[error(
+        "durability uncertain after replacing {path}: {reason}. The replacement may or may not \
+         survive a crash — stop writers, inspect the persisted descriptor, and reopen state \
+         before continuing; do not assume the previous generation was preserved"
+    )]
+    DurabilityUncertain { path: PathBuf, reason: String },
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

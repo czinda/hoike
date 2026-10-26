@@ -4,6 +4,26 @@ fn current_time() -> u64 {
         .unwrap()
         .as_secs()
 }
+
+// F04: state directories are bootstrapped explicitly and loaded under the
+// exclusive writer guard. Restarts of a fixture acquire a fresh guard after
+// the previous responder (and its guard) is dropped.
+fn init_state(config: &hoike_core::Config) {
+    hoike_core::StateStore::initialize(&config.storage.state_db.join("state.json")).unwrap();
+}
+
+fn writer_guard(config: &hoike_core::Config) -> std::sync::Arc<hoike_core::StateDirectoryLock> {
+    std::sync::Arc::new(hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap())
+}
+
+fn try_load(config: &hoike_core::Config) -> hoike_core::error::Result<hoike_core::ResponderState> {
+    hoike_core::ResponderState::load(config.clone(), writer_guard(config))
+}
+
+fn load(config: &hoike_core::Config) -> hoike_core::ResponderState {
+    try_load(config).unwrap()
+}
+
 use ahu::{
     BundleBuilder, BundleType, CaScope, Completeness, Continuity, Integrity, Manifest, ResponderId,
     ResponderIdType, Window,
@@ -172,6 +192,7 @@ fn build_test_bundle_with_real_certids(entries: &[(u64, &[u8])]) -> Vec<u8> {
         .expect("build failed")
 }
 
+// These transport tests deliberately serve mocked response bytes and seals.
 async fn start_test_server(bundle_bytes: Vec<u8>) -> (u16, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("test.ahu");
@@ -187,6 +208,7 @@ max_request = 8192
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "test"
@@ -200,8 +222,9 @@ bundle_file = "{bundle}"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
-    let app_state = hoike_server::AppState::new(state, config);
+    init_state(&config);
+    let state = load(&config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -342,6 +365,8 @@ max_request = 8192
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+# Mocked responses and seals for routing tests.
+allow_unauthenticated_bundles = true
 {ca_blocks}
 "#,
         dir = dir.path().display(),
@@ -351,8 +376,9 @@ state_db = "{dir}/state"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
-    let app_state = hoike_server::AppState::new(state, config);
+    init_state(&config);
+    let state = load(&config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -551,6 +577,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "bad-forward"
@@ -565,7 +592,8 @@ nonce_policy = "forward"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let msg = match hoike_core::ResponderState::load(config) {
+    init_state(&config);
+    let msg = match try_load(&config) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected config validation error"),
     };
@@ -591,6 +619,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "bad-live"
@@ -605,7 +634,8 @@ nonce_policy = "live"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let msg = match hoike_core::ResponderState::load(config) {
+    init_state(&config);
+    let msg = match try_load(&config) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected config validation error for nonce_policy=live"),
     };
@@ -631,6 +661,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
 
 [[ca]]
 label = "bad-policy"
@@ -645,7 +676,8 @@ nonce_policy = "bogus"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let msg = match hoike_core::ResponderState::load(config) {
+    init_state(&config);
+    let msg = match try_load(&config) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected config validation error"),
     };
@@ -806,15 +838,14 @@ async fn live_nonce_signing_returns_nonce_in_response() {
         ..Default::default()
     };
     let mut key = hoike_sign::demo_ecdsa_p256_key();
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
     let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
         &ca,
         &snapshot,
         &config,
         &mut key,
-        |m| {
-            use sha2_v010::Digest as _;
-            Ok(sha2_v010::Sha256::digest(m).to_vec())
-        },
+        |m| hoike_sign::create_cms_seal(m, &hoike_sign::SealKey::EcdsaP256(seal_key), &seal_cert),
         None,
     )
     .unwrap();
@@ -822,6 +853,7 @@ async fn live_nonce_signing_returns_nonce_in_response() {
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("test.ahu");
     std::fs::write(&bundle_path, &bundle_bytes).unwrap();
+    std::fs::write(dir.path().join("seal-signer.der"), &seal_cert).unwrap();
 
     // Config with nonce_policy = "live" in combined mode
     let config_toml = format!(
@@ -833,6 +865,7 @@ listen = "127.0.0.1:0"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.der"]
 
 [[ca]]
 label = "live-test"
@@ -855,7 +888,8 @@ type = "demo"
     std::fs::write(dir.path().join("dummy.crl"), b"").unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    init_state(&config);
+    let state = load(&config);
 
     let demo_key = hoike_sign::demo_ecdsa_p256_key();
     let live = hoike_server::LiveSignerState {
@@ -864,7 +898,9 @@ type = "demo"
         validity_secs: 86400,
         responder_cert_der: None,
     };
-    let app_state = hoike_server::AppState::new(state, config).with_live_signer(live);
+    let app_state = hoike_server::AppState::new(state, config)
+        .unwrap()
+        .with_live_signer(live);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1024,6 +1060,7 @@ async fn sign_endpoint_round_trip_signs_reloads_and_advances_epoch() {
     let crl_path = dir.path().join("test.crl");
     use base64::Engine;
     use der::Decode;
+    use p256::pkcs8::EncodePrivateKey;
     let (crl_der, cert_der) = build_round_trip_crl_der();
     std::fs::write(&crl_path, crl_der).unwrap();
     std::fs::write(dir.path().join("issuer.der"), &cert_der).unwrap();
@@ -1037,6 +1074,15 @@ async fn sign_endpoint_round_trip_signs_reloads_and_advances_epoch() {
             .raw_bytes(),
     );
     let bundle_path = dir.path().join("round-trip-test.ahu");
+    // Persist distinct seal material so every signing pass uses the same pin.
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
+    std::fs::write(
+        dir.path().join("seal-key.der"),
+        seal_key.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("seal-signer.der"), seal_cert).unwrap();
 
     // `password_hash` below is a bcrypt hash of "test-password" (cost 4) — a
     // synthetic, test-only credential, never a real secret.
@@ -1057,12 +1103,15 @@ role = "operator"
 [storage]
 bundle_dir = "{dir}"
 state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.der"]
 
 [[ca]]
 label = "round-trip-test"
 issuer_name_der_b64 = "{issuer_name}"
 issuer_key_bytes_b64 = "{issuer_key}"
 bundle_file = "{bundle}"
+seal_key = "{dir}/seal-key.der"
+seal_cert = "{dir}/seal-signer.der"
 
 [ca.source]
 type = "crl"
@@ -1080,6 +1129,8 @@ type = "demo"
     std::fs::write(&config_path, &config_toml).unwrap();
 
     let config = hoike_core::Config::from_file(&config_path).unwrap();
+    // F04: state must exist before the initial signing pass derives epochs.
+    init_state(&config);
 
     // Persistent sources are empty here (CRL is stateless), but they still flow
     // through the same `SignerContext` mutex the endpoint locks — mirroring how
@@ -1097,12 +1148,14 @@ type = "demo"
 
     // Loading the bundle records the high-water mark (epoch 1) in the state store,
     // so the next signing pass must advance to epoch 2.
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
+    let state = load(&config);
 
     let ctx = hoike_server::SignerContext {
         sources: tokio::sync::Mutex::new(sources),
     };
-    let app_state = hoike_server::AppState::new(state, config).with_signer_context(ctx);
+    let app_state = hoike_server::AppState::new(state, config)
+        .unwrap()
+        .with_signer_context(ctx);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1182,6 +1235,177 @@ type = "demo"
     );
 }
 
+fn to_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\r\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push_str("\r\n");
+    }
+    pem.push_str("-----END CERTIFICATE-----\r\n");
+    pem
+}
+
+/// F08: the documented `seal_cert = "/etc/hoike/seal-signer.pem"` signer
+/// example must actually work. The configured PEM certificate is normalized,
+/// the seal key/certificate pair is preflight-validated, and the resulting
+/// bundle is admitted by the pinned loader — through the real on-demand
+/// signing endpoint, which must revalidate rather than trust a startup
+/// verdict. (The DER-encoded twin of this flow is covered by the round-trip
+/// test above and `hoike-sign`'s `seal_materials` suite.)
+#[tokio::test]
+async fn on_demand_signing_accepts_configured_pem_seal_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let crl_path = dir.path().join("test.crl");
+    use base64::Engine;
+    use der::Decode;
+    use p256::pkcs8::EncodePrivateKey;
+    let (crl_der, cert_der) = build_round_trip_crl_der();
+    std::fs::write(&crl_path, crl_der).unwrap();
+    std::fs::write(dir.path().join("issuer.der"), &cert_der).unwrap();
+    let cert = x509_cert::Certificate::from_der(&cert_der).unwrap();
+    let issuer_name = base64::engine::general_purpose::STANDARD
+        .encode(cert.tbs_certificate.subject.to_der().unwrap());
+    let issuer_key = base64::engine::general_purpose::STANDARD.encode(
+        cert.tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes(),
+    );
+    let bundle_path = dir.path().join("pem-seal-test.ahu");
+    // Distinct seal material, persisted as the documented PEM pair. The pin
+    // is also PEM: the serving side loads the same encoding.
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
+    std::fs::write(
+        dir.path().join("seal-key.p8"),
+        seal_key.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("seal-signer.pem"), to_pem(&seal_cert)).unwrap();
+
+    // `password_hash` below is a bcrypt hash of "test-password" (cost 4) — a
+    // synthetic, test-only credential, never a real secret.
+    let config_toml = format!(
+        r#"
+[server]
+mode = "combined"
+listen = "127.0.0.1:0"
+
+[server.admin]
+session_ttl_secs = 3600
+
+[[server.admin.operators]]
+name = "op"
+password_hash = "$2y$04$DM3Fnh2MyUkSAP1Q5Rk4/eyX2w.VlF4vWTGcTvhex.StxDFv7HzWq"
+role = "operator"
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+seal_signer_pins = ["{dir}/seal-signer.pem"]
+
+[[ca]]
+label = "pem-seal-test"
+issuer_name_der_b64 = "{issuer_name}"
+issuer_key_bytes_b64 = "{issuer_key}"
+bundle_file = "{bundle}"
+seal_key = "{dir}/seal-key.p8"
+seal_cert = "{dir}/seal-signer.pem"
+
+[ca.source]
+type = "crl"
+path = "{crl}"
+issuer_cert = "{dir}/issuer.der"
+
+[ca.signing_key]
+type = "demo"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+        crl = crl_path.display(),
+    );
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    init_state(&config);
+
+    let sources = hoike_sign::create_persistent_sources(&config).unwrap();
+
+    // Initial signer pass with the PEM-configured seal certificate.
+    let initial = hoike_sign::sign_and_write_all(&config, &sources).unwrap();
+    assert_eq!(initial.len(), 1, "one CA has a source");
+    assert_eq!(initial[0].epoch, 1);
+
+    // The pinned loader must admit the PEM-sealed bundle at startup.
+    let state = load(&config);
+
+    let ctx = hoike_server::SignerContext {
+        sources: tokio::sync::Mutex::new(sources),
+    };
+    let app_state = hoike_server::AppState::new(state, config)
+        .unwrap()
+        .with_signer_context(ctx);
+    let app = hoike_server::build_router(app_state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    let login_resp = client
+        .post(format!("http://127.0.0.1:{port}/api/admin/session"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"name":"op","password":"test-password"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), 200, "login should succeed");
+    let login_json: serde_json::Value =
+        serde_json::from_str(&login_resp.text().await.unwrap()).unwrap();
+    let token = login_json["session_token"]
+        .as_str()
+        .expect("login response should carry a session_token")
+        .to_string();
+
+    // On-demand signing re-loads the seal material and must revalidate the
+    // PEM certificate against the configured seal key before publishing.
+    let sign_resp = client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/admin/sign/pem-seal-test"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sign_resp.status(),
+        200,
+        "on-demand signing with a PEM seal certificate should succeed"
+    );
+    let sign_json: serde_json::Value =
+        serde_json::from_str(&sign_resp.text().await.unwrap()).unwrap();
+    assert_eq!(sign_json["status"], "ok");
+    assert_eq!(sign_json["epoch"].as_u64().unwrap(), 2);
+
+    // The freshly written bundle's seal verifies under the pinned
+    // certificate derived from the same PEM file.
+    let bundle_after = ahu::Bundle::from_file(&bundle_path).unwrap();
+    ahu::verify_seal_with_pins(
+        &bundle_after.manifest_bytes,
+        &bundle_after.seal_bytes,
+        &[seal_cert],
+        current_time(),
+    )
+    .expect("PEM-configured seal must verify under its pin");
+}
+
 fn review_rewindow(bytes: &[u8], this: u64, next: u64) -> Vec<u8> {
     let bundle = ahu::Bundle::from_bytes(bytes).unwrap();
     let mut manifest = bundle.manifest.clone();
@@ -1205,12 +1429,13 @@ async fn expired_first_ca_does_not_block_fresh_second_ca() {
     std::fs::write(dir.path().join("a.ahu"), first).unwrap();
     std::fs::write(dir.path().join("b.ahu"), second).unwrap();
     let conf = format!(
-        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n[[ca]]\nlabel='a'\nbundle_file='{0}/a.ahu'\n[[ca]]\nlabel='b'\nbundle_file='{0}/b.ahu'\n",
+        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n[[ca]]\nlabel='a'\nbundle_file='{0}/a.ahu'\n[[ca]]\nlabel='b'\nbundle_file='{0}/b.ahu'\n",
         dir.path().display()
     );
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
-    let state = hoike_core::ResponderState::load(cfg.clone()).unwrap();
-    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg));
+    init_state(&cfg);
+    let state = load(&cfg);
+    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg).unwrap());
     let req = build_ocsp_request(&build_certid_for_ca(42, b"CA2", b"KEY2"));
     let response = app
         .oneshot(
@@ -1241,12 +1466,13 @@ async fn cache_lifetime_is_capped_by_remaining_validity() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ahu"), bytes).unwrap();
     let conf = format!(
-        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n",
+        "[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n",
         dir.path().display()
     );
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
-    let state = hoike_core::ResponderState::load(cfg.clone()).unwrap();
-    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg));
+    init_state(&cfg);
+    let state = load(&cfg);
+    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg).unwrap());
     let req = build_ocsp_request(&build_certid(42));
     let response = app
         .oneshot(
@@ -1381,13 +1607,17 @@ fn synthetic_issued_certificate(
     cert.tbs_certificate.issuer = issuer_cert.tbs_certificate.subject;
     // CMS's X.509 codec emits UTCTime for years before 2050. Sign the same
     // canonical representation that will be embedded in SignedData.
-    let validity = &mut cert.tbs_certificate.validity;
-    validity.not_before = x509_cert::time::Time::UtcTime(
-        der::asn1::UtcTime::from_unix_duration(validity.not_before.to_unix_duration()).unwrap(),
-    );
-    validity.not_after = x509_cert::time::Time::UtcTime(
-        der::asn1::UtcTime::from_unix_duration(validity.not_after.to_unix_duration()).unwrap(),
-    );
+    let now = current_time();
+    let time = |seconds| {
+        x509_cert::time::Time::UtcTime(
+            der::asn1::UtcTime::from_unix_duration(std::time::Duration::from_secs(seconds))
+                .unwrap(),
+        )
+    };
+    cert.tbs_certificate.validity = x509_cert::time::Validity {
+        not_before: time(now - 60),
+        not_after: time(now + 86400),
+    };
     if ca {
         cert.tbs_certificate.extensions = Some(vec![x509_cert::ext::Extension {
             extn_id: const_oid::ObjectIdentifier::new_unwrap("2.5.29.19"),
@@ -1415,6 +1645,34 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
     let anchor = synthetic_issued_certificate(&root, &root, true);
     let cert = synthetic_issued_certificate(&leaf, &root, false);
     let wrong_anchor = synthetic_issued_certificate(&wrong, &wrong, true);
+    let mut ocsp_key = p256::ecdsa::SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+    let ca = hoike_sign::CaIdentity {
+        label: "test-ca".into(),
+        issuer_name_der: "CN=Test CA,O=Hoike Test"
+            .parse::<x509_cert::name::Name>()
+            .unwrap()
+            .to_der()
+            .unwrap(),
+        issuer_key_bytes: ocsp_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+    };
+    let now = current_time();
+    let snapshot = hoike_sign::StatusSnapshot {
+        entries: [(vec![42], hoike_sign::CertificateStatus::Good)].into(),
+        this_update: now - 1,
+        next_update: Some(now + 3600),
+        ..Default::default()
+    };
+    let generation = hoike_sign::GenerationConfig {
+        producer_id: "e2e-test".into(),
+        certid_compat: hoike_sign::CertIdCompat::Sha256Only,
+        validity_secs: 3600,
+        jitter_secs: 0,
+        ..Default::default()
+    };
     for case in [
         "valid",
         "invalid-signature",
@@ -1423,21 +1681,20 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
         "wrong-scope",
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let parsed =
-            ahu::Bundle::from_bytes(&build_test_bundle_with_real_certids(&[(42, b"R")])).unwrap();
-        let mut builder = BundleBuilder::new(parsed.manifest.clone());
-        builder.add_entry(parsed.index[0].entry_key, b"R".to_vec());
         let key = hoike_sign::SealKey::EcdsaP256(if case == "invalid-signature" {
             wrong.clone()
         } else {
             leaf.clone()
         });
-        let bytes = builder
-            .build(|m| {
-                hoike_sign::create_cms_seal(m, &key, &cert)
-                    .map_err(|e| ahu::AhuError::Write(e.to_string()))
-            })
-            .unwrap();
+        let bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+            &ca,
+            &snapshot,
+            &generation,
+            &mut ocsp_key,
+            |m| hoike_sign::create_cms_seal(m, &key, &cert),
+            None,
+        )
+        .unwrap();
         std::fs::write(dir.path().join("test.ahu"), bytes).unwrap();
         if case != "missing-anchor" {
             std::fs::write(
@@ -1458,11 +1715,12 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
             } else {
                 "e2e-test"
             },
-            hex::encode(Sha256::digest(b"test-ca-public-key")),
+            hex::encode(Sha256::digest(&ca.issuer_key_bytes)),
             hex::encode(Sha256::digest(&cert))
         );
         let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
-        let result = hoike_core::ResponderState::load(cfg);
+        init_state(&cfg);
+        let result = try_load(&cfg);
         assert_eq!(
             result.is_ok(),
             case == "valid",
@@ -1489,6 +1747,10 @@ async fn check_live_signers_by_ca(default_paths: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut blocks = String::new();
     let mut identities = Vec::new();
+    let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
+    let seal_key = hoike_sign::SealKey::EcdsaP256(seal_key);
+    std::fs::write(dir.path().join("seal-signer.der"), &seal_cert).unwrap();
     for n in 1..=2u8 {
         let key = p256::ecdsa::SigningKey::from_bytes((&[n; 32]).into()).unwrap();
         let name = format!("CA-{n}").into_bytes();
@@ -1509,9 +1771,14 @@ async fn check_live_signers_by_ca(default_paths: bool) {
             None,
         )
         .unwrap();
+        let mut bundle =
+            ahu::Bundle::from_bytes(&build_bundle_for_ca(&name, &public, &[(42, &source)]))
+                .unwrap();
+        bundle.seal_bytes =
+            hoike_sign::create_cms_seal(&bundle.manifest_bytes, &seal_key, &seal_cert).unwrap();
         std::fs::write(
             dir.path().join(format!("ca-{n}.ahu")),
-            build_bundle_for_ca(&name, &public, &[(42, &source)]),
+            bundle.to_bytes().unwrap(),
         )
         .unwrap();
         let bundle_setting = if default_paths {
@@ -1523,12 +1790,13 @@ async fn check_live_signers_by_ca(default_paths: bool) {
         identities.push((key, public, cid));
     }
     let config: hoike_core::Config = toml::from_str(&format!(
-        "[server]\nmode='combined'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n{blocks}",
+        "[server]\nmode='combined'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nseal_signer_pins=['{0}/seal-signer.der']\n{blocks}",
         dir.path().display()
     ))
     .unwrap();
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap();
-    let mut app_state = hoike_server::AppState::new(state, config);
+    init_state(&config);
+    let state = load(&config);
+    let mut app_state = hoike_server::AppState::new(state, config).unwrap();
     for (i, (key, public, _)) in identities.iter().enumerate() {
         app_state = app_state.with_live_signer_for(
             &format!("ca-{}", i + 1),
@@ -1623,6 +1891,147 @@ fn missing_configured_default_bundle_never_uses_another_cas_file() {
         build_test_bundle_with_real_certids(&[(42, b"other-ca")]),
     )
     .unwrap();
-    let config:hoike_core::Config=toml::from_str(&format!("[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\n[[ca]]\nlabel='missing'\n",dir.path().display())).unwrap();
-    assert!(hoike_core::ResponderState::load(config).is_err());
+    let config:hoike_core::Config=toml::from_str(&format!("[server]\nmode='edge'\n[storage]\nbundle_dir='{0}'\nstate_db='{0}/state'\nallow_unauthenticated_bundles=true\n[[ca]]\nlabel='missing'\n",dir.path().display())).unwrap();
+    init_state(&config);
+    assert!(try_load(&config).is_err());
+}
+
+/// A structurally valid delta that names a base nobody loaded, with an
+/// out-of-line chain length. Its epoch advances past the committed
+/// generation so a rejected reload can only be explained by the serving
+/// profile, not by rollback protection.
+fn build_orphan_delta_bundle(serial: u64, response_bytes: &[u8]) -> Vec<u8> {
+    let manifest = Manifest {
+        format_version: 1,
+        bundle_id: Uuid::nil(),
+        producer_id: "e2e-test".into(),
+        created_at: current_time() - 1,
+        bundle_type: BundleType::Delta,
+        ca_scopes: vec![CaScope {
+            hash_algorithm: vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01],
+            issuer_name_hash: Sha256::digest(b"CN=Test CA,O=Hoike Test").to_vec(),
+            issuer_key_hash: Sha256::digest(b"test-ca-public-key").to_vec(),
+            epoch: 2,
+            responder_id: ResponderId {
+                id_type: ResponderIdType::ByKey,
+                value: vec![0xCC; 20],
+            },
+            responder_chain: None,
+            signature_algorithm: vec![0x02],
+            completeness: Completeness::AuthoritativeComplete,
+        }],
+        window: Window {
+            produced_at: current_time() - 1,
+            this_update_min: current_time() - 1,
+            next_update_min: current_time() + 86400,
+            next_update_max: current_time() + 93600,
+        },
+        integrity: Integrity {
+            index_digest: [0; 32],
+            data_digest: [0; 32],
+        },
+        entry_count: 0,
+        continuity: Continuity {
+            prev_manifest_digest: None,
+            base_manifest_digest: Some([0x77; 32]),
+            chain_length: 100,
+        },
+        shard: None,
+        compression: None,
+        extensions: None,
+    };
+
+    let mut builder = BundleBuilder::new(manifest);
+    let cert_id = build_certid(serial);
+    let entry_key: [u8; 32] = Sha256::digest(cert_id.to_der().unwrap()).into();
+    builder.add_entry(entry_key, response_bytes.to_vec());
+
+    builder
+        .build(|m| Ok(Sha256::digest(m).to_vec()))
+        .expect("build failed")
+}
+
+#[tokio::test]
+async fn rejected_profile_reload_keeps_serving_the_committed_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("test.ahu");
+    let response_bytes = b"MOCK-OCSP-RESPONSE-FOR-SERIAL-42";
+    std::fs::write(
+        &bundle_path,
+        build_test_bundle_with_real_certids(&[(42, response_bytes)]),
+    )
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[server]
+mode = "edge"
+listen = "127.0.0.1:0"
+max_request = 8192
+
+[storage]
+bundle_dir = "{dir}"
+state_db = "{dir}/state"
+allow_unauthenticated_bundles = true
+
+[[ca]]
+label = "test"
+bundle_file = "{bundle}"
+"#,
+        dir = dir.path().display(),
+        bundle = bundle_path.display(),
+    );
+    let config_path = dir.path().join("hoike.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let config = hoike_core::Config::from_file(&config_path).unwrap();
+    init_state(&config);
+    let state = load(&config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
+    let responder = std::sync::Arc::clone(&app_state.responder);
+    let app = hoike_server::build_router(app_state);
+
+    let state_path = dir.path().join("state").join("state.json");
+    let original_state = std::fs::read(&state_path).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    async fn query(client: &reqwest::Client, port: u16) -> reqwest::Response {
+        client
+            .post(format!("http://127.0.0.1:{port}/"))
+            .header("Content-Type", "application/ocsp-request")
+            .body(build_ocsp_request(&build_certid(42)))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    let client = reqwest::Client::new();
+    let resp = query(&client, port).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&resp.bytes().await.unwrap()[..], response_bytes);
+
+    // Demo admission would accept the delta's structure; the serving profile
+    // must reject it before any durable state changes.
+    std::fs::write(
+        &bundle_path,
+        build_orphan_delta_bundle(43, b"MOCK-OCSP-RESPONSE-FOR-SERIAL-43"),
+    )
+    .unwrap();
+    let err = responder.reload().unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported serving profile"),
+        "{err}"
+    );
+
+    // The committed generation stays queryable and durable state is untouched.
+    assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+    let resp = query(&client, port).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&resp.bytes().await.unwrap()[..], response_bytes);
 }

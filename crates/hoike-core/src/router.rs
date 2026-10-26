@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
+use crate::admission::admit_bundle;
 use crate::config::Config;
 use crate::error::{CoreError, Result};
 use crate::request::ParsedCertId;
 use crate::state::StateStore;
+use crate::storage::StateDirectoryLock;
 use ahu::Bundle;
 
 /// Routing key: (issuerNameHash, issuerKeyHash).
@@ -65,10 +67,32 @@ pub struct ResponderState {
     scope_map: ArcSwap<ScopeMap>,
     pub config: Config,
     state_store: Mutex<StateStore>,
+    /// Retained writer lock (F04). Every clone of this responder — the
+    /// listener owner, the background signer loop, admin on-demand writers —
+    /// keeps the state-directory lock held; it is released only when the last
+    /// writer referencing this responder goes away. Retention is the field's
+    /// entire purpose.
+    #[allow(dead_code)]
+    writer_guard: Arc<StateDirectoryLock>,
 }
 
 impl ResponderState {
-    pub fn load(config: Config) -> Result<Self> {
+    pub fn load(config: Config, guard: Arc<StateDirectoryLock>) -> Result<Self> {
+        // The guard must protect the directory this configuration names, so a
+        // mismatched guard can never authorize writes elsewhere.
+        let state_dir = std::fs::canonicalize(&config.storage.state_db).map_err(|e| {
+            CoreError::Config(format!(
+                "cannot resolve state directory {}: {e}",
+                config.storage.state_db.display()
+            ))
+        })?;
+        if guard.state_dir() != state_dir {
+            return Err(CoreError::Config(format!(
+                "writer lock guards state directory {} but the configuration uses {}",
+                guard.state_dir().display(),
+                state_dir.display()
+            )));
+        }
         let state_db_path = config.storage.state_db.join("state.json");
         let mut state_store = StateStore::open(&state_db_path)?;
         let scope_map = match load_scope_map(&config, &mut state_store) {
@@ -83,6 +107,7 @@ impl ResponderState {
                         .ok_or(original)?;
                     let path = path.clone();
                     let mut candidate = state_store.transaction();
+                    candidate.clear_active_bundles();
                     let bundle = load_and_verify_bundle(&path, &config)?;
                     candidate.check_rollback(&bundle)?;
                     candidate.check_continuity(&bundle)?;
@@ -107,6 +132,7 @@ impl ResponderState {
                         }),
                         config,
                         state_store: Mutex::new(state_store),
+                        writer_guard: guard,
                     });
                 }
                 for ca in &mut recovery.ca {
@@ -128,6 +154,7 @@ impl ResponderState {
             scope_map: ArcSwap::from_pointee(scope_map),
             config,
             state_store: Mutex::new(state_store),
+            writer_guard: guard,
         })
     }
 
@@ -332,21 +359,25 @@ fn validate_nonce_config(config: &Config) -> Result<()> {
 }
 
 fn load_scope_map(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
+    // A full reload explicitly builds a replacement working set: the
+    // candidate starts from the committed snapshots of every configured
+    // label, not a merge with whatever was committed before.
     let mut candidate = state_store.transaction();
+    candidate.clear_active_bundles();
     let map = load_scope_map_candidate(config, &mut candidate)?;
     state_store.commit(candidate)?;
     Ok(map)
 }
 
 fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Result<ScopeMap> {
-    validate_nonce_config(config)?;
+    let bundle_paths = configured_bundle_paths(config)?;
 
     let mut bundles: Vec<Arc<Bundle>> = Vec::new();
     let mut entries: HashMap<ScopeKey, Vec<ScopeEntry>> = HashMap::new();
     let mut loaded_paths: HashMap<std::path::PathBuf, usize> = HashMap::new();
 
     if config.ca.is_empty() {
-        let bundle = load_single_bundle(&config.storage.bundle_dir, None, config)?;
+        let bundle = load_and_verify_bundle(&bundle_paths[0], config)?;
         state_store.check_rollback(&bundle)?;
         state_store.check_continuity(&bundle)?;
         state_store.advance_from_bundle(&bundle)?;
@@ -363,19 +394,7 @@ fn load_scope_map_candidate(config: &Config, state_store: &mut StateStore) -> Re
         );
         bundles.push(Arc::new(bundle));
     } else {
-        for ca_config in &config.ca {
-            let bundle_path = if let Some(bf) = &ca_config.bundle_file {
-                bf.clone()
-            } else {
-                // Configured scopes must read the same per-label destination
-                // used by the signer; newest-file discovery is only for the
-                // legacy configuration with no explicit CA scopes.
-                config
-                    .storage
-                    .bundle_dir
-                    .join(format!("{}.ahu", ca_config.label))
-            };
-
+        for (ca_config, bundle_path) in config.ca.iter().zip(bundle_paths) {
             let canonical = bundle_path.canonicalize().unwrap_or(bundle_path.clone());
 
             let bundle_idx = if let Some(&idx) = loaded_paths.get(&canonical) {
@@ -463,135 +482,46 @@ fn register_bundle_scopes(
     }
 }
 
-fn load_single_bundle(
-    bundle_dir: &Path,
-    bundle_file: Option<&Path>,
-    config: &Config,
-) -> Result<Bundle> {
-    let path = if let Some(bf) = bundle_file {
-        bf.to_path_buf()
+/// Select configured bundle paths without opening or modifying rollback state.
+///
+/// Paths follow CA configuration order (and may repeat). With no explicit CAs,
+/// preserve legacy highest-epoch discovery. Both serving and read-only checks
+/// use the same selection and nonce-policy validation.
+pub fn configured_bundle_paths(config: &Config) -> Result<Vec<std::path::PathBuf>> {
+    validate_nonce_config(config)?;
+    if config.ca.is_empty() {
+        Ok(vec![find_newest_bundle(&config.storage.bundle_dir)?])
     } else {
-        find_newest_bundle(bundle_dir)?
-    };
-    load_and_verify_bundle(&path, config)
+        Ok(config
+            .ca
+            .iter()
+            .map(|ca| {
+                ca.bundle_file
+                    .clone()
+                    .unwrap_or_else(|| config.storage.bundle_dir.join(format!("{}.ahu", ca.label)))
+            })
+            .collect())
+    }
 }
 
 fn load_and_verify_bundle(path: &Path, config: &Config) -> Result<Bundle> {
     info!(path = %path.display(), "loading bundle");
     let bundle = Bundle::from_file(path)?;
-
-    let result = ahu::verify_structure(&bundle)?;
-    if !result.warnings.is_empty() {
-        for w in &result.warnings {
-            warn!(warning = w, "bundle verification warning");
-        }
-    }
-
-    // CMS seal verification
-    verify_bundle_seal(&bundle, config)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| CoreError::Config(e.to_string()))?
+        .as_secs();
+    let trust = admit_bundle(&bundle, &config.storage, now)?;
 
     info!(
         entry_count = bundle.manifest.entry_count,
         producer = %bundle.manifest.producer_id,
         scopes = bundle.manifest.ca_scopes.len(),
-        "bundle loaded and verified"
+        ?trust,
+        "bundle admitted"
     );
 
     Ok(bundle)
-}
-
-fn verify_bundle_seal(bundle: &Bundle, config: &Config) -> Result<()> {
-    let has_trust_anchors = config
-        .storage
-        .seal_trust_anchors
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-
-    let has_pins = !config.storage.seal_signer_pins.is_empty();
-    if !has_trust_anchors && !has_pins && !config.storage.seal_authorizations.is_empty() {
-        return Err(CoreError::Config(
-            "seal_authorizations requires trust anchors or explicit signer pins".into(),
-        ));
-    }
-    if has_trust_anchors || has_pins {
-        if bundle.seal_bytes.is_empty() {
-            return Err(CoreError::Config(
-                "seal_trust_anchors configured but bundle has no seal".into(),
-            ));
-        }
-
-        use der::{Decode, DecodePem, Encode};
-        let read_certs = |paths: &[std::path::PathBuf]| -> Result<Vec<Vec<u8>>> {
-            let mut anchors = Vec::new();
-            for path in paths {
-                let bytes = std::fs::read(path).map_err(|e| {
-                    CoreError::Config(format!(
-                        "cannot read seal trust anchor {}: {e}",
-                        path.display()
-                    ))
-                })?;
-                let cert = if bytes.starts_with(b"-----BEGIN") {
-                    x509_cert::Certificate::from_pem(&bytes)
-                } else {
-                    x509_cert::Certificate::from_der(&bytes)
-                }
-                .map_err(|e| {
-                    CoreError::Config(format!("invalid seal trust anchor {}: {e}", path.display()))
-                })?;
-                anchors.push(
-                    cert.to_der()
-                        .map_err(|e| CoreError::Config(e.to_string()))?,
-                );
-            }
-            Ok(anchors)
-        };
-        let anchors = read_certs(config.storage.seal_trust_anchors.as_deref().unwrap_or(&[]))?;
-        let pins = read_certs(&config.storage.seal_signer_pins)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| CoreError::Config(e.to_string()))?
-            .as_secs();
-        let verification = if has_pins {
-            ahu::verify_seal_with_pins(&bundle.manifest_bytes, &bundle.seal_bytes, &pins, now)
-                .or_else(|pin_error| {
-                    if has_trust_anchors {
-                        ahu::verify_seal_with_anchors(
-                            &bundle.manifest_bytes,
-                            &bundle.seal_bytes,
-                            &anchors,
-                            now,
-                        )
-                    } else {
-                        Err(pin_error)
-                    }
-                })
-        } else {
-            ahu::verify_seal_with_anchors(&bundle.manifest_bytes, &bundle.seal_bytes, &anchors, now)
-        }
-        .map_err(|e| CoreError::Config(format!("seal verification failed: {e}")))?;
-        if !config.storage.seal_authorizations.is_empty() {
-            for scope in &bundle.manifest.ca_scopes {
-                if !config.storage.seal_authorizations.iter().any(|auth| {
-                    auth.producer_id == bundle.manifest.producer_id
-                        && auth
-                            .issuer_key_hash
-                            .eq_ignore_ascii_case(&hex::encode(&scope.issuer_key_hash))
-                        && auth
-                            .signer_sha256
-                            .eq_ignore_ascii_case(&verification.signer_sha256)
-                }) {
-                    return Err(CoreError::Config(
-                        "seal signer is not authorized for producer/CA scope".into(),
-                    ));
-                }
-            }
-        }
-        info!(signer = %verification.signer_sha256, "CMS seal authenticated against configured trust policy");
-    } else if !bundle.seal_bytes.is_empty() {
-        warn!("bundle has a CMS seal but no seal_trust_anchors configured — seal not verified");
-    }
-
-    Ok(())
 }
 
 fn find_newest_bundle(dir: &Path) -> Result<std::path::PathBuf> {

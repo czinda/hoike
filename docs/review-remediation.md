@@ -2,6 +2,13 @@
 
 This ledger tracks the 29 findings reviewed against commit `912989b32b5f01289865669e76790ce2b8b72cf7`. It describes the remediation branch, not a deployed or independently certified release. The original review and comprehensive plan remain review artifacts; this document records the implemented behavior and remaining validation work.
 
+The follow-on **October 2026 audit** (twelve further findings, F01–F12) is
+closed in [`audit-remediation-2026-10-23.md`](audit-remediation-2026-10-23.md),
+which records per-finding fixes, regression test names, the migration contract
+validation, integrated release-evidence commands with results, and remaining
+qualification. This document's migration sections below remain the operator
+reference for the behaviors both ledgers introduced.
+
 ## Finding ledger
 
 “Regression” identifies executable coverage in this repository. An implemented change is not automatically production-qualified. Test names are supplied so results can be reproduced without relying on historic total test counts.
@@ -32,7 +39,7 @@ This ledger tracks the 29 findings reviewed against commit `912989b32b5f01289865
 | 22 | Decimal serial parsing uses bounded arbitrary-width conversion and canonicalizes bytes; values above 128 bits are supported up to 20 bytes. Invalid input fails the refresh. | `large_serials_are_supported_and_bounded`. |
 | 23 | Rotation uses the PEM/DER loader, reports failures, renews expired material before startup, refreshes valid external replacements, and prevents generation after rejected live key/certificate replacement. | `rotation::regression_tests::pem_and_der_have_identical_rotation_status_and_invalid_cert_fails`, `rotation_preflight_tests::expired_live_certificate_is_renewed_before_startup_and_bad_pair_rejected` and configured live pair refresh; real renewal command/HSM integration pending. |
 | 24 | Signer and loader resolve explicit bundle paths or the same per-CA `<label>.ahu` default; publication uses durable temporary-file/rename replacement. | `orchestrate::publication_tests::configured_bundle_destination_is_respected_and_failure_preserves_old_file`, `e2e::default_bundle_paths_keep_ca_scope_and_live_key_together`, signed endpoint round-trip and transactional loader regressions; storage-specific power-loss tests pending. |
-| 25 | Forward transport policy is enforced at serving startup/request time; redirects are disabled and upstream body reads are incrementally bounded. | `handlers` regressions `cleartext_forwarding_requires_explicit_opt_in`, `redirects_are_not_followed`, `chunked_response_is_rejected_before_unbounded_buffering`; production transport qualification remains pending. |
+| 25 | Forward transport policy is enforced at serving startup/request time; redirects are disabled and upstream body reads are incrementally bounded. Per-CA forwarding clients (October audit F10) validate `forward_ca` material at startup: a nonempty parsed PEM bundle becomes the CA's only trusted roots (built-in roots disabled), an unreadable/empty/malformed file or a non-HTTPS target with a root fails startup and `hoike check`, and duplicate labels reject instead of overwriting a trust policy. | `handlers` regressions `cleartext_forwarding_requires_explicit_opt_in`, `redirects_are_not_followed`, `chunked_response_is_rejected_before_unbounded_buffering`; `forward_tls` (tls feature) `configured_private_root_succeeds`, `private_roots_are_isolated_per_ca`, `wrong_hostname_and_wrong_root_reject`, `invalid_root_configuration_fails_startup`, `forwarding_handler_serves_authenticated_upstream_response` over real loopback TLS listeners with fresh synthetic P-256 CA/leaf chains; production transport qualification remains pending. |
 | 26 | Gossip limits retained generations, expires old records, and bounds accepted announcement payloads. | `node::tests::generation_storage_is_bounded_and_expires`; no sustained fleet load claimed. |
 | 27 | Trusted gossip keys are authorized for named origins; another member cannot claim that identity. | `crypto::tests::authenticated_peer_cannot_claim_another_origin`. |
 | 28 | Partial is the configuration default. Authoritative completeness requires successful source evidence and is carried into the signed manifest. CRL-only sources cannot claim positive issuance completeness. | Source completeness implementation and signing integration; live 389 DS completeness qualification pending. |
@@ -52,19 +59,82 @@ Sources must provide a fresh, ordered thisUpdate/nextUpdate interval. Configured
 
 `storage.seal_trust_anchors` remains a distinct CA-anchor policy. The implemented profile accepts a configured CA itself or a signer directly issued by it, with ECDSA P-256 or ML-DSA signatures. It requires CA basic constraints on anchors, applicable key usage, valid times, and only the supported extension profile. Intermediate-chain building, general policy processing, and arbitrary certificate extensions are not supported. Provision compatible dedicated seal certificates or use explicit pins; do not relabel an arbitrary signer certificate as a CA trust anchor.
 
-Configure `[[storage.seal_authorizations]]` to restrict each signer to `producer_id`, `issuer_key_hash` (hex of the manifest scope hash), and `signer_sha256` (SHA-256 of the **DER certificate**, hex). When configured, every scope needs a matching authorization; dual SHA-1/SHA-256 issuer scopes need matching entries for each hash. Without authorization entries, a trusted seal signer is allowed across configured scopes. Without anchors or pins, authenticated seal enforcement remains disabled; that mode is unsuitable when bundle input is not already trusted. A successful `ahu verify` alone does not establish your deployment's signer authorization policy.
+Configure `[[storage.seal_authorizations]]` to restrict each signer to `producer_id`, `issuer_key_hash` (hex of the manifest scope hash), and `signer_sha256` (SHA-256 of the **DER certificate**, hex). When configured, every scope needs a matching authorization; dual SHA-1/SHA-256 issuer scopes need matching entries for each hash. Without authorization entries, a trusted seal signer is allowed across configured scopes. Normal admission requires anchors or pins. Only explicit `storage.allow_unauthenticated_bundles = true` with no trust or authorization configuration enables unauthenticated demo admission; configured trust failures never fall back to that mode.
+
+### Seal material pairing and key separation (October audit F07)
+
+Signer/combined CAs with a persistent signing key (`type = "file"` or `type = "pkcs11"`) must configure a complete `seal_key` + `seal_cert` pair per CA; configuration validation rejects a missing or half-configured pair. The previous implicit fallbacks — reusing the OCSP signing key as the seal key, and generating an ephemeral seal key for non-demo configurations — are removed. Only `type = "demo"` signing may omit both seal inputs, in which case a distinct ephemeral seal pair is generated for that signing pass (testing only; it is never pinned across generations). The one-shot `hoike sign` command mirrors this: `--seal-key` and `--seal-cert` must be provided together for file-key signing, and `--demo-key` generates distinct ephemeral seal material.
+
+The OCSP signing key and the seal key must be distinct. ECDSA signers (software file keys, the PKCS#11 bridge, and the dual-algorithm classical signer) prove separation by signing the domain-separated message `hoike:seal-ocsp-key-separation:v1`; a signature that verifies under the seal public key — the same key material configured under different file names or a symlink — fails the signing pass before anything is produced or published, as does any signer or encoding error. An ML-DSA OCSP signer is algorithm-distinct from the configured P-256 seal key. Generated demo certificates now carry a fresh validity window anchored at generation time instead of a fixed 2024–2034 range. Configure the live/seal backend matrix explicitly: configured seals are P-256 software keys, batch OCSP covers ECDSA software/PKCS#11 and ML-DSA software keys, and live nonce signing covers the configured ECDSA software key; other combinations are separate extensions.
+
+### Read-only verification (October audit F01)
+
+Migrate bare `ahu verify FILE` invocations to one of these explicit modes:
+
+- `ahu verify FILE --config PATH [--entries]` authenticates the seal with the
+  supplied trust/profile and producer/CA authorization policy. Missing trust,
+  corrupt seals, expired seal certificates, and unauthorized scopes fail.
+- `ahu verify FILE --structure-only` checks structure and digests, and prints
+  `Structure valid; authenticity not checked.` This mode conflicts with
+  `--config` and `--entries`; no configuration is discovered implicitly.
+
+`--entries` uses embedded responder keys, not general responder-chain PKIX
+validation. Successful responses without certificates fail as incomplete;
+protocol-defined unsigned errors are counted separately. Authenticated success
+states `Installation eligibility not checked.` Freshness and rollback eligibility
+remain installation checks.
+
+The admin verify route uses the running configuration, preserving structural
+fields and adding `trust_status`, `trust_error`, and `signer_sha256`. Structurally
+valid but untrusted input returns HTTP 200 with `trust_status: "failed"` and
+`overall_ok: false`; malformed input returns HTTP 400. Inspection reports only
+seal presence. `hoike check` uses the same admission policy without opening or
+writing rollback state or installing snapshots; demo admission is explicitly
+reported as unauthenticated.
+
+Entry-point regressions: CLI `verify_rejects_corrupt_or_untrusted_cms`,
+`verify_requires_an_explicit_mode`, `structure_only_never_claims_authentication`,
+`entries_rejects_unchecked_successful_responses`, and
+`check_authenticates_without_creating_or_changing_state`; admin HTTP
+`admin_verify_uses_running_trust_policy`. These cover fresh synthetic inputs,
+expired certificates, scope failures, and read-only state preservation. They do
+not qualify a deployment or extend the supported certificate profile.
+
+### Explicit state initialization and exclusive writers (October audit F04)
+
+State directories are now operator-acknowledged state, not a cache. `StateStore::open` is strict: a missing state file is an error pointing at explicit initialization or recovery, never a silently fresh timeline that would forget recorded high-water marks and accept an older epoch. Committed state is validated on open — high-water marks must be paired with manifest-digest records, and every committed snapshot must exist, hash to the digest in its filename, and carry marks at or above its epoch. Corrupt JSON, a missing mark for an active snapshot, a mismatched snapshot digest, and a missing snapshot are all recovery failures. Valid legacy JSON remains readable.
+
+`hoike init-state --config PATH` (or `StateStore::initialize`) is the explicit bootstrap: it refuses an existing state file and refuses a directory containing any recovery material, ignoring only the `.writer.lock` file when checking emptiness. There is no automatic reset and no `--force` escape hatch; recovery means restoring marks and snapshots together. `hoike check`, `serve`, and restarts never initialize implicitly, and `ahu verify` remains read-only. Signer epoch derivation (`sign_ca_scope`) reads state with the same strictness — a signer never starts a fresh timeline silently.
+
+One writer per state directory is enforced in addition to being documented. `hoike serve`, `hoike init-state`, and offline `hoike import` hold an OS advisory exclusive nonblocking `flock` on `.writer.lock` inside the state directory for their full lifetime; a second process is rejected immediately. The lock file is never unlinked (removing a live lock inode would let a new writer bypass exclusion), and a persistent PID file is not used. `ResponderState::load(config, guard)` validates that its guard protects the configured directory and retains the guard, so every detached writer (background signer loop, admin on-demand signing) keeps the lock held until it finishes; a listener exit does not release it while writers still run. Read-only paths (`hoike check`, `sign_ca_scope`'s state read) do not take or reacquire the lock. This enforces the single-host writer rule; it is not distributed signer fencing.
+
+Deployment migration: initialize each new state directory once with `hoike init-state` before the first `serve`. Existing valid state continues to work unchanged. Stop the previous writer process before starting a new one against the same state directory. Back up and restore the state directory (marks, snapshots, and lock file) as one unit.
+
+Entry-point regressions: `state_lock::missing_state_after_epoch_99_rejects_epoch_5`, `initialization_refuses_existing_or_orphaned_state`, `incomplete_committed_state_requires_recovery`, `state_directory_lock_is_process_exclusive`, and `writer_guard_outlives_listener_owner` (real subprocesses with a pipe handshake); `state_initialization::init_state_initializes_once_and_never_resets`, `serve_requires_explicit_state_initialization`, and `serve_is_process_exclusive_and_restart_preserves_state` at the CLI boundary; `orchestrate::urgent_tests::sign_ca_scope_requires_existing_state` for signer epoch derivation. flock behavior is exercised on macOS and Linux by the same tests; both platforms are required before release.
+
+### Offline authenticated import (October audit F05)
+
+`hoike import --bundle PATH --ca LABEL --config PATH` is now an offline, recoverable authenticated installation (`hoike-core/src/install.rs::install_bundle`), not a staging copy. The label is required and selects the destination through `Config::bundle_destination` — the CA's `bundle_file` when selected, otherwise `bundle_dir/<label>.ahu`; never a name inferred from the uploaded file. Unknown labels, legacy unscoped configuration (no `[[ca]]` entries), unsafe label components, and a destination shared with another configured label are rejected. The signer (`orchestrate::write_bundle`) resolves destinations through the same method and publishes through the same durable primitive.
+
+Import always authenticates the input under the configured CMS seal trust and scope authorizations and enforces the supported serving profile, even when `allow_unauthenticated_bundles` permits unauthenticated demo *serving*; rollback and predecessor-continuity checks run against the committed state, which must already have been initialized. The source is read exactly once before installation, so everything published comes from the checked bytes even if the source path changes afterwards. The commit order is fixed: write and fsync the immutable generation snapshot, atomically commit the state descriptor (the installation commit point), then publish the configured bundle path. A failure before the descriptor commit preserves the previous generation byte-for-byte — marks, snapshots, and configured files. If the descriptor's directory fsync fails after its rename, installation returns the typed `CoreError::DurabilityUncertain` instructing the operator to stop and reopen the state descriptor; it never claims a rollback or undoes marks, and reopening yields a coherent generation. If the post-commit publication of the configured path fails, the import still succeeds with a `publication_warning` (the CLI prints it); startup recovers from the committed snapshot and retrying the identical import repairs the path. A single-label installation preserves every other label's committed snapshots and marks; a full reload explicitly rebuilds a replacement working set. Import holds the exclusive writer lock for its full lifetime, so a running server excludes it; `--force` is removed, and completion instructs the operator to start the server — no SIGHUP is suggested. The authenticated admin reload endpoint is unchanged.
+
+Entry-point regressions: `installation::import_rejects_untrusted_input_without_changes`, `import_uses_selected_ca_destination`, `import_recovers_committed_snapshot_when_alias_publish_fails`, plus destination/guard/rollback/fork/predecessor/buffer-replacement/idempotent-retry/other-label coverage in the same suite; commit-order fault injection at snapshot write, descriptor pre-rename, descriptor post-rename fsync, and alias publication in `install::fault_tests` and `storage::tests` (test-only thread-local injection, no production filesystem abstraction); CLI subprocess regressions `import::import_requires_a_label_and_rejects_unknown_labels`, `import_rejects_untrusted_input_without_changes`, `import_requires_initialized_state`, `import_rejects_active_writer_and_force`, `import_offline_install_and_restart_serves_selected_generation`, and `import_reports_committed_warning_when_publication_fails_and_retry_repairs`. Storage-specific power-loss recovery remains a deployment qualification gate, not a test claim.
 
 ### Directory checkpoints and durable state
 
 Dogtag checkpoints use source-identity-qualified filenames derived from the configured cookie path. The identity includes endpoint, base/filter, requested attributes, bind identity, transport configuration, and CA identity; passwords are excluded. The checkpoint stores the population and cookie together. Old cookie-only files are ignored and a full refresh is required. A failed or malformed refresh does not publish partial updates. Rebuild capacity must accommodate a full directory refresh before enabling the source after migration.
 
-Use one writer process per state directory and one active signer per CA. In-process serialization does not fence competing processes. The state directory includes immutable committed bundle snapshots referenced by rollback marks; back it up and restore it as one coherent unit. Do not delete high-water marks to recover from failures. Old binaries are not qualified to read the new snapshot state. Use a local filesystem whose rename and fsync semantics have been qualified for the deployment; network filesystems and real power-cut recovery were not tested here.
+Use one writer process per state directory and one active signer per CA; the exclusive `.writer.lock` described above now rejects a second writer process, while in-process serialization fences competing threads. The state directory includes immutable committed bundle snapshots referenced by rollback marks; back it up and restore it as one coherent unit. Do not delete high-water marks to recover from failures, and do not re-initialize over recovery material — restore marks and snapshots together. Old binaries are not qualified to read the new snapshot state. Use a local filesystem whose rename and fsync semantics have been qualified for the deployment; network filesystems and real power-cut recovery were not tested here, and flock exclusion is not qualified on them either.
 
 ### Gossip, transport, and administration
 
-Replace legacy `gossip.peer_keys` with `gossip.peer_identities`, mapping exact node names to their public-key files. Nonempty legacy peer lists fail configuration. Stage authorized node/key mappings consistently across the fleet; unsigned permissive mode is not equivalent to authenticated operation. This authenticates broadcast origins, not SWIM liveness traffic, and does not add confidentiality or automatic bundle pulling.
+Replace legacy `gossip.peer_keys` with `gossip.peer_identities`, mapping exact node names to their public-key files. Nonempty legacy peer lists fail configuration. Inbound authentication is now an explicit policy, `gossip.auth_mode = "required"` (default) or `"permissive"`, instead of a stance inferred from which key files are present. Required mode needs a local `gossip.identity_key`, verifies every origin against the provisioned named identities (a single-node deployment may trust only its own key), and rejects unsigned, unknown, and forged broadcasts. Permissive mode is the documented rollout mode: unsigned legacy broadcasts are accepted while signed frames are still verified — unknown or forged signatures reject in both modes, including with an empty trusted set. An enabled gossip section with missing/unreadable key material, a required mode without an identity key, or a `peer_identities` mapping for the local node name that disagrees with the local `identity_key` is a fatal startup error (and fails `hoike check`, which reports the effective mode through the same policy loading). A disabled gossip section never loads key material.
 
-Build with `tls` when configuring TLS/mTLS and with `dogtag-sync`/`pkcs11` when using those sources/keys. No configured TLS requirement may fall back to plaintext. HTTPS forwarding requires a valid endpoint certificate; redirects are not followed. Login currently admits at most four active jobs, sixty attempts per minute process-wide, and a 4096-byte body with a five-second read timeout. These bounds are safety limits, not capacity claims; monitor legitimate administrative access before production rollout.
+Rollout sequence (requires a frame-aware fleet — every node understands the signed frame wire tag; the tag alone does not qualify historical binaries): provision per-node identities and the complete `peer_identities` mappings; switch the fleet to `auth_mode = "permissive"`; enable `identity_key` signing on every node; then switch to `auth_mode = "required"`. This authenticates broadcast origins, not SWIM liveness traffic, and does not add confidentiality or automatic bundle pulling. Unreachable gossip peers degrade only the gossip plane — OCSP serving continues.
+
+Entry-point regressions: `crypto::tests::permissive_accepts_known_signed_and_unsigned_peers`, `permissive_rejects_unknown_and_forged_signed_frames`, `required_rejects_unsigned_and_missing_identity`, `local_identity_conflict_rejects`, `node::tests::loopback_transition_permissive_signing_to_required` (real loopback two-node transition with channel-based deadlines); CLI boundary `gossip_startup::enabled_gossip_key_failure_aborts_startup`, `disabled_gossip_requires_no_key_material`, `partitioned_gossip_peers_never_stop_ocsp_serving` (valid local OCSP query under a partitioned gossip plane), and `check_reports_effective_gossip_auth_mode`; config surface `config_validation::gossip_auth_mode_defaults_to_required_and_rejects_unknown_values` and `gossip_legacy_peer_keys_rejected`.
+
+Build with `tls` when configuring TLS/mTLS and with `dogtag-sync`/`pkcs11` when using those sources/keys. No configured TLS requirement may fall back to plaintext. HTTPS forwarding requires a valid endpoint certificate; redirects are not followed. Forwarding trust is per CA: `forward_ca` pins a private PEM root bundle for that CA's client only (built-in WebPKI roots disabled, hostname and validity checking kept on), and a CA without `forward_ca` uses the bundled WebPKI roots — not the system trust store. Unreadable, empty, or malformed root files, a root pinned to a non-HTTPS target, and duplicate CA labels fail startup and `hoike check`, which constructs the same clients without opening a listener. Login currently admits at most four active jobs, sixty attempts per minute process-wide, and a 4096-byte body with a five-second read timeout. These bounds are safety limits, not capacity claims; monitor legitimate administrative access before production rollout.
 
 ### Delta output
 
@@ -72,7 +142,7 @@ Build with `tls` when configuring TLS/mTLS and with `dogtag-sync`/`pkcs11` when 
 
 ## Validation record and remaining release gates
 
-`cargo test -p hoike-sign --features dogtag-sync,pkcs11 --offline` passed **69 library tests and all 6 ML-DSA bundle integration tests** after updating historical integration fixtures to fresh source windows. This includes AWS-LC RSA verification and PEM/DER issuer equivalence, real-signature PKCS#11 encoding, atomic output destination/failure, and PEM rotation regressions. Final local validation also passed:
+`cargo test -p hoike-sign --features dogtag-sync,pkcs11 --offline` passed **69 library tests and all 6 ML-DSA bundle integration tests** after updating historical integration fixtures to fresh source windows. This includes AWS-LC RSA verification and PEM/DER issuer equivalence, real-signature PKCS#11 encoding, atomic output destination/failure, and PEM rotation regressions. Intermediate validation during the September remediation also passed:
 
 - Default workspace: **197 tests**.
 - Workspace with `tls,metrics,pkcs11,dogtag-sync,hoike-server/embed-webui`: **221 tests**.
@@ -81,7 +151,17 @@ Build with `tls` when configuring TLS/mTLS and with `dogtag-sync`/`pkcs11` when 
 - Web UI production build and TypeScript `tsc --noEmit`.
 - Rust all-target, all-feature Clippy with `-D warnings`, formatting, and whitespace checks.
 
-The UI `npm run lint` command cannot execute because the existing project has no ESLint configuration file; this is a tooling follow-up, not a passing lint result. CI requests default workspace tests, TLS/metrics/PKCS#11/Dogtag feature tests, no-default-feature ahu tests, and release-mode parser regression. Feature-enabled unit tests do not exercise real 389 DS or a hardware HSM.
+**October 2026 closure validation** (branch `fix/audit-remediation` after the
+F01–F12 fixes; transcripts in the plan workspace, summarized in the
+[closure ledger](audit-remediation-2026-10-23.md)): default workspace
+**305 tests** and feature workspace (`tls,metrics,pkcs11,dogtag-sync`)
+**332 tests**, all passing; all-features clippy `-D warnings`, fmt,
+`git diff --check`, the minimal-library ahu checks, the release-mode parser
+regression, the web UI build, and a full scripted demo run (authenticated
+admission, OCSP queries, offline import rollback rejection, restart
+continuity) all passed on macOS.
+
+The UI `npm run lint` command cannot execute because the existing project has no ESLint configuration file; this is a tooling follow-up, not a passing lint result. CI requests default workspace tests, TLS/metrics/PKCS#11/Dogtag feature tests, no-default-feature ahu tests, the release-mode parser regression, and — added with the October closure — a **Linux + macOS matrix** running the hoike-core `state_lock`, `anti_rollback`, and `installation` suites, plus a web-UI build feeding the all-features clippy gate. Feature-enabled unit tests do not exercise real 389 DS or a hardware HSM.
 
 Still required before qualifying a deployment: live 389 DS delete/present/restart/stale-cookie tests; intended HSM and key-renewal integration; process restart and real power-loss recovery on the intended filesystem; adversarial upstream and login load; independent-client interoperability; configuration migration/canary; and a fresh security review. No production deployment or certification is asserted.
 

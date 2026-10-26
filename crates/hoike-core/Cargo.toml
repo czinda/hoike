@@ -26,6 +26,13 @@ hex = { workspace = true }
 arc-swap = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Already in Cargo.lock (via tempfile); used directly for the state-directory
+# flock writer lock (F04). Keep the locked version pinned.
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [dev-dependencies]
+hoike-sign = { path = "../hoike-sign" }
+p256 = { version = "0.13", features = ["ecdsa"] }
 tempfile = "3"
 uuid = { workspace = true }

@@ -205,11 +205,18 @@ async fn process_request_inner(
                     "forward" => {
                         crate::obs::record_nonce(&ca, "forward", "forwarded");
                         if let Some(url) = &result.forward_to {
-                            debug!(
-                                ca = result.ca_label,
-                                url = url,
-                                "forwarding nonce-bearing request upstream"
-                            );
+                            // F10/S8: select the startup-validated client built
+                            // for this CA's trust policy (pinned forward_ca
+                            // roots or bundled WebPKI defaults). A missing
+                            // client is a config mismatch — never a fallback
+                            // to another CA's roots.
+                            let Some(client) = state.forward_client_for(&ca) else {
+                                warn!(
+                                    ca = result.ca_label,
+                                    "forward policy but no forwarding client was built for this CA"
+                                );
+                                return (ocsp_error_response(INTERNAL_ERROR), ca, "internalError");
+                            };
                             let insecure = state
                                 .admin
                                 .config
@@ -218,7 +225,7 @@ async fn process_request_inner(
                                 .find(|c| c.label == ca)
                                 .is_some_and(|c| c.forward_insecure);
                             return (
-                                forward_request(url, der_bytes, insecure).await,
+                                forward_request(client, url, der_bytes, insecure).await,
                                 ca,
                                 "forwarded",
                             );
@@ -282,25 +289,18 @@ fn presigned_status_label(_response_bytes: &[u8]) -> &'static str {
     "served"
 }
 
-/// Shared outbound client for nonce forwarding.
-///
-/// Built once (not per request): `reqwest`'s rustls-tls stack validates the
-/// upstream certificate against the system trust store by default, giving the
-/// forward channel a real trusted channel (FTP_ITC.1). Constructed lazily so a
-/// responder that never forwards pays nothing.
-static FORWARD_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-fn forward_client() -> &'static reqwest::Client {
-    FORWARD_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build HTTP client for forwarding")
-    })
-}
-
-async fn forward_request(url: &str, der_bytes: &[u8], allow_insecure: bool) -> Response {
+/// Forward a nonce-bearing OCSP request upstream over `client` — the
+/// startup-validated per-CA client selected by the resolved lookup's CA label
+/// (F10/S8), so the upstream certificate is validated against exactly that
+/// CA's configured trust policy (pinned `forward_ca` roots or the bundled
+/// WebPKI defaults). Timeout, redirect, and response-validation policy are
+/// those of `forwarding::build_forward_clients` plus the checks below.
+async fn forward_request(
+    client: &reqwest::Client,
+    url: &str,
+    der_bytes: &[u8],
+    allow_insecure: bool,
+) -> Response {
     let permitted = reqwest::Url::parse(url)
         .is_ok_and(|u| u.scheme() == "https" || (allow_insecure && u.scheme() == "http"));
     if !permitted {
@@ -317,8 +317,7 @@ async fn forward_request(url: &str, der_bytes: &[u8], allow_insecure: bool) -> R
         );
     }
 
-    let client = forward_client();
-
+    debug!(url = url, "forwarding nonce-bearing request upstream");
     match client
         .post(url)
         .header("Content-Type", CONTENT_TYPE_OCSP_REQUEST)
@@ -523,6 +522,17 @@ mod forwarding_regressions {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A client mirroring `forwarding::base_client_builder` (same timeout and
+    /// no-redirect policy); root material is irrelevant for the cleartext
+    /// regressions below.
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test client")
+    }
+
     async fn body(response: Response) -> Vec<u8> {
         axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -535,7 +545,7 @@ mod forwarding_regressions {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         assert_eq!(
-            body(forward_request(&url, b"request", false).await).await,
+            body(forward_request(&test_client(), &url, b"request", false).await).await,
             INTERNAL_ERROR
         );
         assert!(
@@ -558,7 +568,7 @@ mod forwarding_regressions {
             socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
         });
         assert_eq!(
-            body(forward_request(&url, b"request", true).await).await,
+            body(forward_request(&test_client(), &url, b"request", true).await).await,
             TRY_LATER
         );
         server.await.unwrap();
@@ -594,7 +604,7 @@ mod forwarding_regressions {
         });
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            forward_request(&url, b"request", true),
+            forward_request(&test_client(), &url, b"request", true),
         )
         .await
         .unwrap();

@@ -4,6 +4,6 @@ pub mod crypto;
 pub mod node;
 
 pub use broadcast::GossipMessage;
-pub use config::GossipConfig;
-pub use crypto::{GossipSigner, GossipVerifier, VerifyPolicy};
+pub use config::{AuthMode, GossipConfig};
+pub use crypto::{GossipSigner, GossipVerifier, load_authentication};
 pub use node::GossipNode;

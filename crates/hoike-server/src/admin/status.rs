@@ -289,7 +289,6 @@ pub async fn get_config(State(state): State<AppState>, auth: Authenticated) -> i
         "storage": {
             "bundle_dir": config.storage.bundle_dir.display().to_string(),
             "state_db": config.storage.state_db.display().to_string(),
-            "max_chain": config.storage.max_chain,
             "seal_trust_anchors": config.storage.seal_trust_anchors.as_ref().map(|v| v.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
         },
         "cas": config.ca.iter().map(|ca| serde_json::json!({

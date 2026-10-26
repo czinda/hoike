@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -22,7 +23,13 @@ enum Commands {
         #[arg(long, default_value = "hoike.toml")]
         config: PathBuf,
     },
-    /// Validate configuration, bundle, and connectivity
+    /// Explicitly initialize a fresh state directory (refuses existing state)
+    InitState {
+        /// Config file path
+        #[arg(long, default_value = "hoike.toml")]
+        config: PathBuf,
+    },
+    /// Check configuration and bundle trust without installing or changing state
     Check {
         /// Config file path
         #[arg(long, default_value = "hoike.toml")]
@@ -63,9 +70,14 @@ enum Commands {
         /// Path to PKCS#8 PEM or DER signing key file
         #[arg(long, conflicts_with = "demo_key")]
         signing_key: Option<PathBuf>,
-        /// Path to PKCS#8 PEM or DER P-256 seal key file (separate from signing key)
+        /// Path to PKCS#8 PEM or DER P-256 seal key file (required with --seal-cert
+        /// for file/HSM production signing; must be distinct from the signing key)
         #[arg(long)]
         seal_key: Option<PathBuf>,
+        /// Path to PEM or DER seal certificate (required with --seal-key for
+        /// file/HSM production signing)
+        #[arg(long)]
+        seal_cert: Option<PathBuf>,
         /// Produce a dual-algorithm bundle: --sig-alg is the classical algorithm,
         /// --dual-alg is the post-quantum algorithm (e.g. ml-dsa-87)
         #[arg(long)]
@@ -95,17 +107,18 @@ enum Commands {
         #[arg(long)]
         prefer: Option<String>,
     },
-    /// Import a bundle into the responder's bundle directory (for enclave/air-gap deployments)
+    /// Install an authenticated bundle into a configured CA destination
+    /// (offline; enclave/air-gap deployments)
     Import {
-        /// Path to the .ahu bundle to import
+        /// Path to the .ahu bundle to install
         #[arg(long)]
         bundle: PathBuf,
-        /// Config file (to determine bundle_dir)
+        /// Configured CA label whose destination to install into
+        #[arg(long)]
+        ca: String,
+        /// Config file (to determine the CA destination and state directory)
         #[arg(long, default_value = "hoike.toml")]
         config: PathBuf,
-        /// Skip anti-rollback check (for first import into a fresh enclave)
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -124,6 +137,9 @@ fn main() {
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             rt.block_on(run_server(config));
         }
+        Commands::InitState { config } => {
+            run_init_state(config);
+        }
         Commands::Check { config } => {
             run_check(config);
         }
@@ -140,6 +156,7 @@ fn main() {
             issuer_key_b64,
             signing_key,
             seal_key,
+            seal_cert,
             dual_alg,
             pq_signing_key,
             demo_key,
@@ -157,6 +174,7 @@ fn main() {
                 issuer_key_b64,
                 signing_key,
                 seal_key,
+                seal_cert,
                 dual_alg,
                 pq_signing_key,
                 demo_key,
@@ -171,12 +189,8 @@ fn main() {
         } => {
             run_query(url, serial, issuer_name_b64, issuer_key_b64, prefer);
         }
-        Commands::Import {
-            bundle,
-            config,
-            force,
-        } => {
-            run_import(bundle, config, force);
+        Commands::Import { bundle, ca, config } => {
+            run_import(bundle, ca, config);
         }
     }
 }
@@ -189,6 +203,40 @@ async fn run_server(config_path: PathBuf) {
 
     if let Err(e) = config.validate_transport(cfg!(feature = "tls")) {
         eprintln!("Configuration error: {e}");
+        std::process::exit(1);
+    }
+
+    // F04: hold the exclusive writer lock on the state directory for the
+    // entire lifetime of this server — listener, background signer loop, and
+    // admin on-demand writers all retain it through the responder.
+    let writer_guard = std::sync::Arc::new(
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to lock state directory {}: {e}",
+                config.storage.state_db.display()
+            );
+            std::process::exit(1);
+        }),
+    );
+
+    // Validate existing state before any preflight, signing, or source
+    // mutation. State is never initialized implicitly: a missing or incomplete
+    // state directory is an operator error, not a fresh timeline.
+    let state_file = config.storage.state_db.join("state.json");
+    if let Err(e) = hoike_core::StateStore::open(&state_file) {
+        eprintln!("State directory validation failed: {e}");
+        if state_file.exists() {
+            eprintln!(
+                "Recovery means restoring the state directory — marks and committed \
+                 snapshots together — from backup; it is never reset in place."
+            );
+        } else {
+            eprintln!(
+                "Run `hoike init-state --config {path}` once to initialize a new state \
+                 directory.",
+                path = config_path.display()
+            );
+        }
         std::process::exit(1);
     }
 
@@ -240,23 +288,31 @@ async fn run_server(config_path: PathBuf) {
         info!("Prometheus metrics recorder installed");
     }
 
-    let state = hoike_core::ResponderState::load(config.clone()).unwrap_or_else(|e| {
-        hoike_server::obs::record_bundle_load_failure(
-            "all",
-            hoike_server::obs::load_failure_reason(&e),
-        );
-        hoike_server::obs::audit!(
-            event = "bundle_load_failed",
-            trigger = "initial_load",
-            reason = hoike_server::obs::load_failure_reason(&e),
-            error = %e,
-            "initial bundle load failed"
-        );
-        eprintln!("Failed to initialize responder: {e}");
+    let state = hoike_core::ResponderState::load(config.clone(), writer_guard.clone())
+        .unwrap_or_else(|e| {
+            hoike_server::obs::record_bundle_load_failure(
+                "all",
+                hoike_server::obs::load_failure_reason(&e),
+            );
+            hoike_server::obs::audit!(
+                event = "bundle_load_failed",
+                trigger = "initial_load",
+                reason = hoike_server::obs::load_failure_reason(&e),
+                error = %e,
+                "initial bundle load failed"
+            );
+            eprintln!("Failed to initialize responder: {e}");
+            std::process::exit(1);
+        });
+
+    // F10: per-CA forwarding clients are validated here — an unreadable,
+    // empty, or malformed `forward_ca` bundle (or a root pinned to a
+    // non-HTTPS target) aborts startup instead of degrading the forward
+    // channel at request time.
+    let mut app_state = hoike_server::AppState::new(state, config.clone()).unwrap_or_else(|e| {
+        eprintln!("Failed to build per-CA forwarding clients: {e}");
         std::process::exit(1);
     });
-
-    let mut app_state = hoike_server::AppState::new(state, config.clone());
 
     // Attach the shared signing context (holds the persistent sources behind a
     // mutex) so the admin API and the background loop serialize on one lock.
@@ -285,69 +341,84 @@ async fn run_server(config_path: PathBuf) {
             let (msg_tx, mut msg_rx) =
                 tokio::sync::mpsc::channel::<hoike_gossip::GossipMessage>(256);
 
+            // Bridge the core TOML string to the explicit policy (already
+            // validated by Config::validate_for_mode; a mismatch here is still
+            // fatal rather than defaulted).
+            let auth_mode =
+                hoike_gossip::AuthMode::from_str(&gossip_cfg.auth_mode).unwrap_or_else(|e| {
+                    eprintln!("Invalid gossip configuration: {e}");
+                    std::process::exit(1);
+                });
+
             let gc = hoike_gossip::GossipConfig {
                 enabled: true,
                 bind: gossip_cfg.bind.clone(),
                 seeds: gossip_cfg.seeds.clone(),
                 node_name: gossip_cfg.node_name.clone(),
+                auth_mode,
                 identity_key: gossip_cfg.identity_key.clone(),
                 peer_keys: gossip_cfg.peer_keys.clone(),
                 peer_identities: gossip_cfg.peer_identities.clone(),
             };
 
-            match hoike_gossip::GossipNode::start(gc, msg_tx).await {
-                Ok(gossip_node) => {
-                    info!("gossip node started");
-                    let gossip_node = std::sync::Arc::new(gossip_node);
-                    app_state = app_state.with_gossip(gossip_node.clone());
-
-                    // Consumer: fold received announcements into the generation
-                    // table so the fleet view can attribute epochs to nodes and
-                    // compute per-node staleness.
-                    let consumer_node = gossip_node.clone();
-                    tokio::spawn(async move {
-                        while let Some(msg) = msg_rx.recv().await {
-                            match &msg {
-                                hoike_gossip::GossipMessage::GenerationAnnouncement {
-                                    producer_id,
-                                    epoch,
-                                    origin_node,
-                                    bundle_url,
-                                    ..
-                                } => {
-                                    info!(
-                                        origin = %origin_node,
-                                        producer = %producer_id,
-                                        epoch,
-                                        url = bundle_url.as_deref().unwrap_or("none"),
-                                        "received generation announcement"
-                                    );
-                                    consumer_node.record_generation(&msg).await;
-                                    // Bundle pull-on-announce is future work: fetch
-                                    // from bundle_url, verify anti-rollback, then
-                                    // swap into the router via responder.reload().
-                                }
-                                hoike_gossip::GossipMessage::UrgentRevocation {
-                                    producer_id,
-                                    epoch,
-                                    origin_node,
-                                    ..
-                                } => {
-                                    info!(
-                                        origin = %origin_node,
-                                        producer = %producer_id,
-                                        epoch,
-                                        "received urgent revocation notice — would pull delta"
-                                    );
-                                }
-                            }
-                        }
-                    });
-                }
+            // F09: an invalid enabled gossip configuration or unreadable key
+            // material is a fatal startup error — never a warning-and-continue
+            // that would silently run unauthenticated gossip. Partitioned or
+            // unreachable peers are NOT startup failures; they only degrade
+            // gossip, never OCSP serving.
+            let gossip_node = match hoike_gossip::GossipNode::start(gc, msg_tx).await {
+                Ok(node) => node,
                 Err(e) => {
-                    warn!(error = %e, "gossip startup failed, continuing without gossip");
+                    eprintln!("gossip startup failed: {e}");
+                    std::process::exit(1);
                 }
-            }
+            };
+            info!("gossip node started");
+            let gossip_node = std::sync::Arc::new(gossip_node);
+            app_state = app_state.with_gossip(gossip_node.clone());
+
+            // Consumer: fold received announcements into the generation
+            // table so the fleet view can attribute epochs to nodes and
+            // compute per-node staleness.
+            let consumer_node = gossip_node.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = msg_rx.recv().await {
+                    match &msg {
+                        hoike_gossip::GossipMessage::GenerationAnnouncement {
+                            producer_id,
+                            epoch,
+                            origin_node,
+                            bundle_url,
+                            ..
+                        } => {
+                            info!(
+                                origin = %origin_node,
+                                producer = %producer_id,
+                                epoch,
+                                url = bundle_url.as_deref().unwrap_or("none"),
+                                "received generation announcement"
+                            );
+                            consumer_node.record_generation(&msg).await;
+                            // Bundle pull-on-announce is future work: fetch
+                            // from bundle_url, verify anti-rollback, then
+                            // swap into the router via responder.reload().
+                        }
+                        hoike_gossip::GossipMessage::UrgentRevocation {
+                            producer_id,
+                            epoch,
+                            origin_node,
+                            ..
+                        } => {
+                            info!(
+                                origin = %origin_node,
+                                producer = %producer_id,
+                                epoch,
+                                "received urgent revocation notice — would pull delta"
+                            );
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -923,6 +994,25 @@ fn run_query(
                                 println!("  Signature:   {sig_len} bytes");
                                 let resp_count = basic.tbs_response_data.responses.len();
                                 println!("  Responses:   {resp_count}");
+
+                                // Print cert status for each single response
+                                for (idx, single_resp) in
+                                    basic.tbs_response_data.responses.iter().enumerate()
+                                {
+                                    print!("    [{idx}] ");
+                                    match &single_resp.cert_status {
+                                        x509_ocsp::CertStatus::Good(_) => println!("Status: GOOD"),
+                                        x509_ocsp::CertStatus::Revoked(info) => {
+                                            println!("Status: REVOKED");
+                                            if let Some(reason) = &info.revocation_reason {
+                                                println!("        Reason: {:?}", reason);
+                                            }
+                                        }
+                                        x509_ocsp::CertStatus::Unknown(_) => {
+                                            println!("Status: UNKNOWN")
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!("  Failed to parse BasicOcspResponse: {e}");
@@ -988,7 +1078,15 @@ fn build_preferred_sig_algs_extension(prefer_str: &str) -> Vec<u8> {
     })
 }
 
-fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
+/// Offline, recoverable authenticated installation (design §S5, audit
+/// remediation F05).
+///
+/// The source is read exactly once; everything published comes from those
+/// checked bytes. The writer guard is acquired (and validated by
+/// installation) so a running server — which holds the same exclusive lock —
+/// makes this fail promptly. There is no `--force` escape hatch and no
+/// SIGHUP suggestion: completion instructs the operator to start the server.
+fn run_import(bundle_path: PathBuf, ca_label: String, config_path: PathBuf) {
     let config = match hoike_core::Config::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -998,84 +1096,88 @@ fn run_import(bundle_path: PathBuf, config_path: PathBuf, force: bool) {
     };
 
     println!("Loading bundle: {}", bundle_path.display());
-    let bundle = match ahu::Bundle::from_file(&bundle_path) {
+    let bytes = match std::fs::read(&bundle_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Failed to load bundle: {e}");
+            eprintln!("Failed to read bundle {}: {e}", bundle_path.display());
             std::process::exit(1);
         }
     };
 
-    println!("Verifying structure...");
-    match ahu::verify_structure(&bundle) {
+    // Offline operation: hold the exclusive writer lock on the state
+    // directory for the full lifetime of the installation. A running server
+    // holds the same lock, so import fails promptly instead of racing it.
+    let guard = match hoike_core::StateDirectoryLock::acquire(&config.storage.state_db) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("  Writer lock:  FAIL — {e}");
+            eprintln!("  Import is offline: stop the writer process holding the state directory.");
+            std::process::exit(1);
+        }
+    };
+
+    println!("Authenticating and installing for CA \'{ca_label}\'...");
+    match hoike_core::install_bundle(&config, &ca_label, &bytes, &guard) {
         Ok(result) => {
-            if !result.warnings.is_empty() {
-                for w in &result.warnings {
-                    eprintln!("  WARNING: {w}");
+            if let Ok(bundle) = ahu::Bundle::from_bytes(&bytes) {
+                println!("  Producer:  {}", bundle.manifest.producer_id);
+                println!("  Entries:   {}", bundle.manifest.entry_count);
+                for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
+                    println!("    [{i}] epoch={}", scope.epoch);
                 }
             }
-            println!("  Structure:  OK");
+            println!("\n  Installed → {}", result.destination.display());
+            if let Some(warning) = &result.publication_warning {
+                eprintln!("\n  WARNING: {warning}");
+            }
+            println!(
+                "\n  To serve: hoike serve --config {}",
+                config_path.display()
+            );
+            println!("  Import is offline by design; start the server to serve this generation.");
         }
         Err(e) => {
-            eprintln!("  Structure:  FAIL — {e}");
+            eprintln!("Import failed: {e}");
             std::process::exit(1);
         }
     }
+}
 
-    if !force {
-        let state_store =
-            match hoike_core::StateStore::open(&config.storage.state_db.join("state.json")) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("  Anti-rollback: FAIL — cannot open state store: {e}");
-                    std::process::exit(1);
-                }
-            };
-        if let Err(e) = state_store.check_rollback(&bundle) {
-            eprintln!("  Anti-rollback: REJECTED — {e}");
-            eprintln!("  Use --force to skip this check (e.g., first import into an enclave)");
+/// Explicitly initialize a fresh state directory (F04). Initialization is the
+/// operator's acknowledgment that the directory is new: an existing state file
+/// or any recovery material in the directory is refused. There is no `--force`
+/// reset; recovery means restoring marks and snapshots together.
+fn run_init_state(config_path: PathBuf) {
+    let config = hoike_core::Config::from_file(&config_path).unwrap_or_else(|e| {
+        eprintln!("Failed to load config from {}: {e}", config_path.display());
+        std::process::exit(1);
+    });
+
+    // Hold the writer lock while initializing so a concurrent writer cannot
+    // race the emptiness check.
+    let _guard =
+        hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap_or_else(|e| {
+            eprintln!("Failed to lock state directory: {e}");
+            std::process::exit(1);
+        });
+
+    let state_path = config.storage.state_db.join("state.json");
+    match hoike_core::StateStore::initialize(&state_path) {
+        Ok(_store) => {
+            println!(
+                "Initialized empty state directory: {}",
+                config.storage.state_db.display()
+            );
+            println!("  State file: {}", state_path.display());
+            println!(
+                "  Existing state is never reset; to recover, restore marks and snapshots together."
+            );
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize state: {e}");
             std::process::exit(1);
         }
-        println!("  Anti-rollback: OK");
-    } else {
-        println!("  Anti-rollback: SKIPPED (--force)");
     }
-
-    let bundle_dir = &config.storage.bundle_dir;
-    if let Err(e) = std::fs::create_dir_all(bundle_dir) {
-        eprintln!(
-            "Failed to create bundle directory {}: {e}",
-            bundle_dir.display()
-        );
-        std::process::exit(1);
-    }
-
-    let dest_filename = bundle_path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("imported.ahu"));
-    let dest_path = bundle_dir.join(dest_filename);
-
-    if let Err(e) = std::fs::copy(&bundle_path, &dest_path) {
-        eprintln!("Failed to copy bundle to {}: {e}", dest_path.display());
-        std::process::exit(1);
-    }
-
-    println!(
-        "\n  Imported {} → {}",
-        bundle_path.display(),
-        dest_path.display()
-    );
-    println!("  Producer:  {}", bundle.manifest.producer_id);
-    println!("  Entries:   {}", bundle.manifest.entry_count);
-    println!("  Scopes:    {}", bundle.manifest.ca_scopes.len());
-    for (i, scope) in bundle.manifest.ca_scopes.iter().enumerate() {
-        println!("    [{}] epoch={}", i, scope.epoch);
-    }
-    println!(
-        "\n  To serve: hoike serve --config {}",
-        config_path.display()
-    );
-    println!("  To reload a running server: send SIGHUP (not yet implemented)");
 }
 
 fn run_check(config_path: PathBuf) {
@@ -1142,21 +1244,79 @@ fn run_check(config_path: PathBuf) {
     // CMS/signature-authenticated) and is not flagged here.
     check_trusted_channels(&config);
 
-    match hoike_core::ResponderState::load(config) {
-        Ok(state) => {
-            println!("  Bundles:   {}", state.bundle_count());
-            println!("  Scopes:    {}", state.scope_count());
-            println!("  Entries:   {}", state.total_entries());
-            for (label, epoch, completeness) in state.scope_info() {
-                println!("    [{label}] epoch={epoch} completeness={completeness}");
-            }
-            println!("\n  All checks passed.");
-        }
+    // Resolve bundle selection before checking bundles so configuration and
+    // selection errors (unscoped legacy config, duplicate destinations, an
+    // empty bundle directory, invalid nonce policy) are labeled as config
+    // failures rather than masquerading as bundle verification failures.
+    let bundle_paths = match hoike_core::router::configured_bundle_paths(&config) {
+        Ok(paths) => paths,
         Err(e) => {
-            eprintln!("  Bundle:    FAIL — {e}");
+            eprintln!("  Bundle selection: FAIL — {e}");
             std::process::exit(1);
         }
+    };
+
+    if let Err(e) = check_bundles(&config, &bundle_paths) {
+        eprintln!("  Bundle:    FAIL — {e}");
+        std::process::exit(1);
     }
+}
+
+fn check_bundles(
+    config: &hoike_core::Config,
+    paths: &[std::path::PathBuf],
+) -> hoike_core::error::Result<()> {
+    use hoike_core::admission::{AdmissionTrust, admit_bundle};
+    use std::collections::HashSet;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| hoike_core::CoreError::Config(e.to_string()))?
+        .as_secs();
+    let mut checked = HashSet::new();
+    let mut scopes = HashSet::new();
+    let mut entries = 0;
+    let mut demo = false;
+    for path in paths {
+        if !checked.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
+            continue;
+        }
+        let bundle = ahu::Bundle::from_file(path)?;
+        let trust = admit_bundle(&bundle, &config.storage, now)?;
+        println!("\n  Bundle:    {}", path.display());
+        match trust {
+            AdmissionTrust::Authenticated { signer_sha256 } => {
+                println!("    Seal: authenticated (signer SHA-256: {signer_sha256})");
+            }
+            AdmissionTrust::UnauthenticatedDemo => {
+                println!("    Unauthenticated demo admission; authenticity not checked.");
+                demo = true;
+            }
+        }
+        entries += bundle.manifest.entry_count;
+        for scope in &bundle.manifest.ca_scopes {
+            scopes.insert((
+                scope.issuer_name_hash.clone(),
+                scope.issuer_key_hash.clone(),
+            ));
+            println!(
+                "    Scope: {} epoch={} completeness={:?}",
+                hex::encode(&scope.issuer_key_hash),
+                scope.epoch,
+                scope.completeness,
+            );
+        }
+    }
+    println!("\n  Bundles:   {}", checked.len());
+    println!("  Scopes:    {}", scopes.len());
+    println!("  Entries:   {entries}");
+    if demo {
+        println!("\n  Read-only demo checks passed; bundle authenticity not checked.");
+    } else {
+        println!("\n  Read-only configuration and bundle authentication checks passed.");
+    }
+    println!("  Installation eligibility not checked.");
+    Ok(())
 }
 
 /// Validate transport-security posture for the management and inter-component
@@ -1207,11 +1367,31 @@ fn check_trusted_channels(config: &hoike_core::Config) {
         _ => {}
     }
 
-    // Forward proxy channel (FTP_ITC.1).
+    // Forward proxy channel (FTP_ITC.1). The clients are built exactly as
+    // `serve` builds them, so a broken `forward_ca` fails `hoike check` the
+    // same way startup would — without opening a listener or sending a
+    // request.
+    let forward_clients = match hoike_server::build_forward_clients(config) {
+        Ok(clients) => clients,
+        Err(e) => {
+            eprintln!("    FAIL: forwarding client configuration: {e}");
+            hard_fail = true;
+            std::collections::HashMap::new()
+        }
+    };
     for ca in &config.ca {
         if let Some(url) = &ca.forward_to {
             if url.starts_with("https://") {
                 println!("    Forward ({}): https (FTP_ITC.1)", ca.label);
+                if ca.forward_ca.is_some() {
+                    if forward_clients.contains_key(&ca.label) {
+                        println!(
+                            "      forward_ca: pinned private root(s), built-in roots disabled"
+                        );
+                    }
+                } else {
+                    println!("      trust: bundled WebPKI roots");
+                }
             } else if ca.forward_insecure {
                 eprintln!(
                     "    WARNING: CA '{}' forwards to cleartext {url} (forward_insecure=true) — \
@@ -1225,12 +1405,6 @@ fn check_trusted_channels(config: &hoike_core::Config) {
                     ca.label
                 );
                 hard_fail = true;
-            }
-            if ca.forward_ca.is_some() && url.starts_with("https://") {
-                println!(
-                    "      note: forward_ca must be installed in the system trust store; \
-                     per-target custom roots are not yet wired into the forward path."
-                );
             }
         }
     }
@@ -1290,37 +1464,50 @@ fn check_trusted_channels(config: &hoike_core::Config) {
         }
     }
 
-    // Gossip message authentication (FPT_ITT.1).
-    if let Some(g) = &config.gossip {
-        if g.enabled {
-            match (&g.identity_key, g.peer_identities.is_empty()) {
-                (Some(_), false) => {
-                    println!(
-                        "    Gossip:    signed + enforced ({} peer key(s)) (FPT_ITT.1)",
-                        g.peer_identities.len()
-                    );
+    // Gossip message authentication (FPT_ITT.1, F09). The same auth-loading
+    // helper GossipNode::start uses decides the effective policy, so check
+    // reports what serve would actually run — and fails on the same invalid
+    // configurations that would abort startup.
+    if let Some(g) = config.gossip.as_ref().filter(|g| g.enabled) {
+        let auth = hoike_gossip::AuthMode::from_str(&g.auth_mode).and_then(|mode| {
+            let gc = hoike_gossip::GossipConfig {
+                enabled: true,
+                bind: g.bind.clone(),
+                seeds: g.seeds.clone(),
+                node_name: g.node_name.clone(),
+                auth_mode: mode,
+                identity_key: g.identity_key.clone(),
+                peer_keys: g.peer_keys.clone(),
+                peer_identities: g.peer_identities.clone(),
+            };
+            hoike_gossip::load_authentication(&gc).map(|(signer, _)| (mode, signer))
+        });
+        match auth {
+            Ok((mode, signer)) => {
+                let peers = g.peer_identities.len();
+                let identities = if peers == 1 { "identity" } else { "identities" };
+                match mode {
+                    hoike_gossip::AuthMode::Required => println!(
+                        "    Gossip:    auth_mode=required — signed outbound; unsigned, forged, \
+                         and unknown-origin broadcasts rejected ({peers} peer {identities} + \
+                         self) (FPT_ITT.1)"
+                    ),
+                    hoike_gossip::AuthMode::Permissive => println!(
+                        "    Gossip:    auth_mode=permissive — ROLLOUT MODE ({}): unsigned \
+                         broadcasts are still accepted; signed frames are verified against \
+                         {peers} provisioned {identities}. Switch to auth_mode=\"required\" \
+                         once every node signs (FPT_ITT.1).",
+                        if signer.is_some() {
+                            "signing outbound"
+                        } else {
+                            "not yet signing"
+                        }
+                    ),
                 }
-                (Some(_), true) => {
-                    eprintln!(
-                        "    WARNING: gossip signs outbound messages (identity_key set) but \
-                         peer_identities is empty — verification is permissive, so unsigned/forged \
-                         messages from peers are still accepted. Populate gossip.peer_identities to \
-                         enforce (FPT_ITT.1)."
-                    );
-                }
-                (None, false) => {
-                    eprintln!(
-                        "    WARNING: gossip.peer_identities is set but this node has no identity_key — \
-                         it enforces inbound signatures but broadcasts its own messages unsigned, \
-                         which enforcing peers will drop. Set gossip.identity_key (FPT_ITT.1)."
-                    );
-                }
-                (None, true) => {
-                    eprintln!(
-                        "    WARNING: gossip is enabled but unauthenticated (no identity_key / \
-                         peer_identities) — membership and generation messages are unsigned (FPT_ITT.1)."
-                    );
-                }
+            }
+            Err(e) => {
+                eprintln!("    FAIL: gossip authentication configuration: {e}");
+                hard_fail = true;
             }
         }
     }
@@ -1344,6 +1531,7 @@ fn run_sign(
     issuer_key_b64: Option<String>,
     signing_key_path: Option<PathBuf>,
     seal_key_path: Option<PathBuf>,
+    seal_cert_path: Option<PathBuf>,
     dual_alg: Option<String>,
     pq_signing_key_path: Option<PathBuf>,
     demo_key: bool,
@@ -1515,40 +1703,45 @@ fn run_sign(
         ..Default::default()
     };
 
-    // Seal key resolution: --seal-key > ECDSA signing key fallback > demo key.
-    // In production, the seal key should be separate (per ahu spec §2.3).
-    let is_ml_dsa = matches!(sig_alg.as_str(), "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87");
-    let cli_seal_key: hoike_sign::SealKey = if let Some(seal_path) = &seal_key_path {
-        let ecdsa_key = hoike_sign::load_ecdsa_p256_key(seal_path).unwrap_or_else(|e| {
-            eprintln!("Failed to load seal key from {}: {e}", seal_path.display());
+    // F07: seal material resolution. The policy — complete persistent pair,
+    // half-pair error, demo-only distinct ephemeral fallback, and the F08 CMS
+    // pair preflight — lives in the shared `load_or_generate_seal_material`
+    // helper the configured orchestration path also uses. The CLI only adds
+    // flag-name guidance and exits nonzero on failure.
+    let seal_inputs_missing = seal_key_path.is_none() && seal_cert_path.is_none();
+    let (cli_seal_key, cli_seal_cert) =
+        hoike_sign::load_or_generate_seal_material(
+            seal_key_path.as_deref(),
+            seal_cert_path.as_deref(),
+            demo_key,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            if seal_inputs_missing && !demo_key {
+                eprintln!(
+                    "\nProvide a complete persistent pair:\n  \
+                     --seal-key PATH    PKCS#8 PEM or DER P-256 seal key (distinct from the signing key)\n  \
+                     --seal-cert PATH   PEM or DER seal certificate\n\n\
+                     Or use --demo-key, which generates a distinct ephemeral seal \
+                     pair for testing only (NOT FOR PRODUCTION)."
+                );
+            }
             std::process::exit(1);
         });
-        hoike_sign::SealKey::EcdsaP256(ecdsa_key)
-    } else if !is_ml_dsa {
-        if let Some(key_path) = &signing_key_path {
-            warn!("using OCSP signing key as seal key — provide --seal-key for production");
-            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
-                eprintln!("Failed to load seal key: {e}");
-                std::process::exit(1);
-            });
-            hoike_sign::SealKey::EcdsaP256(ecdsa_key)
-        } else {
-            hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
-        }
-    } else if signing_key_path.is_some() {
-        warn!(
-            "ML-DSA signing key cannot be used as P-256 seal key — \
-             provide --seal-key for production use"
-        );
-        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
-    } else {
-        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
+    // F07: prove the classical ECDSA OCSP signing key is distinct from the
+    // seal key before producing anything. Runs per loaded signer below; a
+    // failure exits before any bundle is written.
+    let separation_preflight = |signer: &p256::ecdsa::SigningKey| {
+        hoike_sign::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
+            signer,
+            &cli_seal_key,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Seal/OCSP key separation preflight failed: {e}");
+            std::process::exit(1);
+        });
     };
-    let cli_seal_cert = hoike_sign::generate_seal_cert_for_key(&cli_seal_key).unwrap_or_else(|e| {
-        eprintln!("Failed to generate seal cert: {e}");
-        std::process::exit(1);
-    });
-    let seal_fn = move |m: &[u8]| -> hoike_sign::Result<Vec<u8>> {
+    let seal_fn = |m: &[u8]| -> hoike_sign::Result<Vec<u8>> {
         hoike_sign::create_cms_seal(m, &cli_seal_key, &cli_seal_cert)
     };
 
@@ -1563,13 +1756,19 @@ fn run_sign(
             }
         };
         let mut ecdsa_signer = if let Some(key_path) = &signing_key_path {
-            hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+            let key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load classical signing key: {e}");
                 std::process::exit(1);
-            })
+            });
+            // F07: the dual-algorithm classical ECDSA signer must stay
+            // distinct from the seal key before anything is produced.
+            separation_preflight(&key);
+            key
         } else if demo_key {
             warn!("using ephemeral ECDSA demo key — NOT FOR PRODUCTION");
-            hoike_sign::demo_ecdsa_p256_key()
+            let key = hoike_sign::demo_ecdsa_p256_key();
+            separation_preflight(&key);
+            key
         } else {
             eprintln!("--dual-alg requires --signing-key (classical) or --demo-key");
             std::process::exit(1);
@@ -1617,13 +1816,20 @@ fn run_sign(
     } else { match sig_alg.as_str() {
         "ecdsa-p256" => {
             let mut signer = if let Some(key_path) = &signing_key_path {
-                hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+                let key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                     eprintln!("Failed to load signing key: {e}");
                     std::process::exit(1);
-                })
+                });
+                // F07: prove the OCSP signing key is not the seal key before
+                // producing anything — the same key under a different file
+                // name is still rejected.
+                separation_preflight(&key);
+                key
             } else if demo_key {
                 warn!("using ephemeral ECDSA demo key — NOT FOR PRODUCTION");
-                hoike_sign::demo_ecdsa_p256_key()
+                let key = hoike_sign::demo_ecdsa_p256_key();
+                separation_preflight(&key);
+                key
             } else {
                 eprintln!("No signing key provided. Use --signing-key <path> for a PKCS#8 key file, or --demo-key for testing.");
                 std::process::exit(1);

@@ -129,8 +129,8 @@ Status legend as in the [package README](README.md#cross-pp-sfr-index).
 | **FCS_TLSS_EXT.1** | TLS server, server authentication | **Met** | rustls 0.23 + explicit `aws_lc_rs` provider, TLS 1.2 floor + 1.3 (`tls.rs:29-72`, `tls.rs:34,39-41`), `tls` feature; terminates on admin + metrics listeners. |
 | **FCS_TLSS_EXT.2** | TLS server, mutual (client-cert) auth | **Partial** | Wired but off by default: `admin_tls.client_ca` builds a `WebPkiClientVerifier` (`tls.rs:43-62`); flip-the-flag, no code change. |
 | **FTP_TRP.1** | Trusted path for remote administration | **Met** | Admin API + UI on a dedicated TLS listener (`admin_listen`/`admin_tls`; `build_admin_router_standalone` `lib.rs:136-142`); bcrypt/RBAC login over TLS; `hoike check` warns on admin-on-OCSP-port cleartext (`main.rs:1005-1029`). |
-| **FTP_ITC.1** | Trusted channel between TOE components | **Met** | *Forward proxy:* `https://` enforced, shared TLS-verified client (`handlers.rs:287-296`; `hoike check` hard-fails cleartext w/o `forward_insecure` `main.rs:1045-1071`). *Syncrepl:* LDAPS / StartTLS-before-bind so bind password never crosses cleartext (`dogtag_sync.rs:190-216`, `client_config_with_ca:210-251`). *Gossip:* Ed25519-signed — see FPT_ITT.1. |
-| **FPT_ITT.1** | Protection of TSF data between nodes | **Met** (broadcasts) | Generation / urgent-revocation broadcasts Ed25519-signed at the payload boundary, verified on receive; forged/unsigned dropped before re-propagation (`crypto.rs:9-42,112-120,161-188`; `broadcast.rs:150-183`). `gossip.identity_key` signs; `gossip.peer_keys` = trusted set + enforcement flip. **Note 1:** SWIM liveness (foca ping/ack) is **not** authenticated and payloads are **not** encrypted — signing covers the trust-bearing broadcasts only. **Note 2 (rollout caveat):** the verifier's *trust set* and *enforcement stance* are coupled to one field (`node.rs:184-189`): a signing node with empty `peer_keys` is `Permissive` but trusts **only its own key** (`node.rs:177-178`), and a signed frame must match a trusted key regardless of policy (`crypto.rs:161-178`). Consequently two signing-but-not-yet-peered nodes reject each other's signed announcements — there is no single config that simultaneously accepts unsigned-legacy traffic *and* signed traffic from peers, so the "mixed-fleet upgrade without partitioning" property is **not** fully achieved. Closing work: a `require_signed` knob decoupling trust set from enforcement. |
+| **FTP_ITC.1** | Trusted channel between TOE components | **Met** | *Forward proxy:* `https://` enforced with redirects disabled and bounded upstream reads; each forwarding CA gets a startup-validated client (`forwarding.rs::build_forward_clients`) whose optional `forward_ca` PEM bundle is that CA's only trusted roots (built-in roots disabled, hostname/validity kept on), falling back to bundled WebPKI roots — never the system trust store. Unreadable/empty/malformed roots, a root on a non-HTTPS target, or a duplicate label fails startup and `hoike check`. *Syncrepl:* LDAPS / StartTLS-before-bind so bind password never crosses cleartext (`dogtag_sync.rs:190-216`, `client_config_with_ca:210-251`). *Gossip:* Ed25519-signed — see FPT_ITT.1. |
+| **FPT_ITT.1** | Protection of TSF data between nodes | **Met** (broadcasts) | Generation / urgent-revocation broadcasts Ed25519-signed at the payload boundary, verified on receive; forged/unsigned dropped before re-propagation (`crypto.rs`, `broadcast.rs::receive_item`). Authentication is an explicit policy — `gossip.auth_mode = "required"` (default) or `"permissive"` — loaded by one helper (`crypto.rs::load_authentication`) shared by `GossipNode::start` and `hoike check`; the verifier is always present. Required mode needs a local `identity_key` and rejects unsigned, unknown, and forged input; permissive mode still accepts unsigned legacy broadcasts during rollout while rejecting unknown/forged signatures, so a mixed fleet provisions mappings, moves to permissive, enables signing fleet-wide, then switches to required (frame-aware versions only). Invalid enabled configuration or unreadable key material aborts startup. **Note 1:** SWIM liveness (foca ping/ack) is **not** authenticated and payloads are **not** encrypted — signing covers the trust-bearing broadcasts only. |
 
 > **OCSP data plane is intentionally plaintext** (`server.listen`): responses are
 > signature-authenticated end to end (FCO_NRO_EXT.2), so transport encryption adds cost
@@ -145,7 +145,7 @@ Status legend as in the [package README](README.md#cross-pp-sfr-index).
 | **FCS_CKM.1 / FCS_CKM.2** | Key generation / establishment | **Partial** | Signing keys via PKCS#8 file (`keyfile.rs:60-93`), PKCS#11/HSM (`pkcs11.rs`), or ephemeral demo; TLS key establishment via `aws-lc-rs`. Lab uses one SoftHSM EC P-256 key across scopes. No in-app production keygen. |
 | **FCS_CKM_EXT / FPT_SKP_EXT.1** | Protection of secret/private keys | **Partial** | HSM custody available (PKCS#11 incl. CKM_ML_DSA `pkcs11.rs:232-302`); seal key kept distinct from signing key (`config.rs:181-187`). **But no `zeroize`** of key material (transitive dep only); PIN redacted in `Debug` only (`pkcs11.rs:82-93`); lab posture is SoftHSM, not validated. |
 | **FCS_RBG_EXT.1** | Random bit generation | **Partial** | OS RNG via `getrandom`; TLS DRBG from `aws-lc-rs`; ECDSA deterministic RFC 6979. Not a claimed/validated entropy source in the lab. |
-| **FCS_COP crypto-module validation (FIPS)** | Validated cryptographic module | **Gap (by posture)** | `aws-lc-rs` is FIPS-capable but not built in `fips` mode. Closing work = build-profile change (`aws-lc-rs/fips` + `rustls/fips`), not code. |
+| **FCS_COP crypto-module validation (FIPS)** | Validated cryptographic module | **Gap (by posture)** | `aws-lc-rs` is FIPS-capable but not built in `fips` mode. Closing work = build with `aws-lc-rs/fips` + `rustls/fips` **and** a validation/evaluation of the deployed module boundary and environment — the build flags alone do not make a deployment FIPS-validated. |
 
 ### 5.4 Identification, authentication & management
 
@@ -153,7 +153,7 @@ Status legend as in the [package README](README.md#cross-pp-sfr-index).
 |-----|-------------|--------|----------|
 | **FIA_UAU.* / FIA_UID.*** | Admin I&A | **Met** | bcrypt password hashes + role (`config.rs:103-116`); `bcrypt::verify` in spawn_blocking with a constant DUMMY_HASH timing defense against user enumeration (`auth.rs:10-14,50-68`); 256-bit session tokens, 3600 s TTL (`auth.rs:128-133`, `config.rs:111-113`). Over TLS once FTP_TRP.1 configured. |
 | **FMT_SMR.* / FMT_MOF.* / FMT_SMF.1** | Roles & functions | **Met** | Ranked RBAC Administrator(3) > Operator(2) > Viewer(1) (`state.rs:49-69`), enforced by `require_role`/`has_at_least` (`rbac.rs:20-22`): read = Viewer, mutation/signing = Operator, `rotate_ca` = Administrator (`signing.rs:210`). Management surface = admin API + UI. |
-| **FMT_MTD.*** | Management of TSF data | **Met** | Bundle production/reload share the signer mutex so epoch derivation + `.ahu` writes never race (`orchestrate.rs`); `import --force` anti-rollback override for air-gap (`main.rs:18-110`). |
+| **FMT_MTD.*** | Management of TSF data | **Met** | Bundle production/reload share the signer mutex so epoch derivation + `.ahu` writes never race (`orchestrate.rs`); offline `hoike import --ca LABEL` authenticates and installs through the same admission policy, state descriptor commit, and exclusive writer lock (`install.rs`, `main.rs`). |
 
 ### 5.5 Security audit
 
@@ -184,7 +184,7 @@ architecture level:
 | Functional spec / design (ADV) | This ST §5, `hoike-design.md` (§2.2 trust boundary, §6.3 gossip), `ahu-format-spec.md`. |
 | Guidance (AGD) | `README.md`, config comments, `hoike check` operator diagnostics. |
 | Life-cycle (ALC) | Git + `Cargo.lock`; monthly `cargo audit`; **update authenticity is a gap** (cf. App PP FPT_TUD_EXT.1). |
-| Tests (ATE) | 175 test functions incl. anti-rollback, TLS config, gossip verify, and the 20-check OCSP conformance suite. |
+| Tests (ATE) | Workspace test suites in CI (incl. anti-rollback, TLS config, gossip verify, CLI subprocess, platform state-machine suites) and the 20-check OCSP conformance suite. |
 | Vulnerability (AVA) | Rust memory safety; keyless edge tier; single audited `unsafe`. |
 
 ---
@@ -208,8 +208,9 @@ architecture level:
   of the profile; dual-algorithm bundles let a fleet migrate to PQC without a flag day.
 - **Honest Partials/Gap.** Key custody (SoftHSM, no zeroize), RBG validation, and FIPS
   module validation are **lab-posture** limitations, not design defects — each closes
-  with a validated-HSM deployment and a `fips` build. FAU_GEN.2 operator attribution is
-  a small code change.
+  with a validated-HSM deployment and a `fips` build *plus* the validation/evaluation
+  of the deployed module (the build flag alone is not validation). FAU_GEN.2 operator
+  attribution is a small code change.
 
 ### PPCA conformance summary
 
@@ -222,5 +223,6 @@ architecture level:
 
 **Bottom line:** for the OCSP-responder role, hoike **meets the core PPCA
 certificate-status and trusted-channel obligations**. The residual items are
-lab-posture crypto validation (SoftHSM → validated HSM, `fips` build) and a small
-audit-attribution enhancement — not gaps in the profile's certificate-status contract.
+lab-posture crypto validation (SoftHSM → validated HSM, `fips` build followed by
+module validation) and a small audit-attribution enhancement — not gaps in the
+profile's certificate-status contract.
