@@ -21,8 +21,10 @@ state-mldsa/
 .issuer-name-b64
 .issuer-key-b64
 
-# Configs synthesized by run.sh (create_edge_config); the *-docker.toml and
-# test-edge.toml variants are hand-maintained and stay tracked.
+# Configs synthesized by run.sh (create_edge_config); the *-docker.toml
+# variants are hand-maintained and stay tracked. (The historical
+# test-edge.toml was removed 2026-10-26: absolute paths of the original
+# checkout, incoherent committed state.)
 configs/edge-ecdsa.toml
 configs/edge-mldsa.toml
 configs/trusted-edge.toml

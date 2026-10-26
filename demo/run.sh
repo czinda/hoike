@@ -195,7 +195,11 @@ verify_authenticated() {
     cp "$BUNDLES_DIR/demo-ecdsa-epoch1.ahu" "$TAMPER"
     TAMPER_SIZE=$(wc -c < "$TAMPER" | tr -d ' ')
     LAST_BYTE=$(tail -c 1 "$TAMPER" | od -An -tu1 | tr -d ' ')
-    printf "$(printf '\\x%02x' $((LAST_BYTE ^ 0xFF)))" \
+    NEW_BYTE=$((LAST_BYTE ^ 0xFF))
+    # Command substitution strips NUL bytes, so a 0x00 replacement would
+    # leave the copy byte-identical; flip to a nonzero byte instead.
+    (( NEW_BYTE == 0 )) && NEW_BYTE=1
+    printf "$(printf '\\x%02x' "$NEW_BYTE")" \
         | dd of="$TAMPER" bs=1 seek=$((TAMPER_SIZE - 1)) conv=notrunc status=none
     if "$AHU_BIN" verify "$TAMPER" \
         --config "$CONFIG_DIR/trusted-edge.toml" >/dev/null 2>&1; then
