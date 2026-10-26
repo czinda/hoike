@@ -16,6 +16,7 @@ use der_v08::asn1::{ObjectIdentifier, OctetString, SetOfVec};
 use der_v08::{Any, Decode, Encode};
 use sha2::{Digest, Sha256};
 use signature::Verifier as _;
+use tracing::warn;
 use x509_cert_v03::attr::{Attribute, AttributeValue, Attributes};
 use x509_cert_v03::certificate::Certificate;
 
@@ -382,6 +383,65 @@ pub fn demo_ephemeral_seal_key() -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::random(&mut OsRng)
 }
 
+/// Resolve seal material under the shared F07 policy — the single source of
+/// truth for the seal-material decision, consumed by the configured loader
+/// (`orchestrate::load_seal_materials`) and the one-shot `hoike sign` path.
+/// (`hoike-core`'s config validation mirrors the structural rules; it cannot
+/// depend on `hoike-sign`.)
+///
+/// - both `seal_key` and `seal_cert` → load the persistent pair (the
+///   certificate is PEM/DER-normalized) and prove it with the real CMS
+///   preflight;
+/// - exactly one → error: a half-configured seal pair is always an error;
+/// - neither → error for production; explicit demo generates a distinct
+///   ephemeral pair (warned, NOT FOR PRODUCTION) and proves it the same way.
+///
+/// Errors are policy messages without caller context; callers prefix their
+/// own scope (CA label, flag-name guidance).
+pub fn load_or_generate_seal_material(
+    seal_key: Option<&std::path::Path>,
+    seal_cert: Option<&std::path::Path>,
+    demo: bool,
+) -> std::result::Result<(SealKey, Vec<u8>), String> {
+    let (seal_key, seal_cert_der) = match (seal_key, seal_cert) {
+        (Some(key_path), Some(cert_path)) => {
+            let ecdsa_key = crate::load_ecdsa_p256_key(key_path)
+                .map_err(|e| format!("load seal key {}: {e}", key_path.display()))?;
+            let cert =
+                load_seal_certificate(cert_path).map_err(|e| format!("load seal cert: {e}"))?;
+            (SealKey::EcdsaP256(ecdsa_key), cert)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("seal_key and seal_cert must be configured together — \
+                 a half-configured seal pair is always an error"
+                .into());
+        }
+        (None, None) => {
+            if !demo {
+                return Err("production signing requires a persistent seal_key and \
+                     seal_cert pair — configure both, or use the demo signing \
+                     key for testing"
+                    .into());
+            }
+            warn!(
+                "no seal material configured — generating a distinct ephemeral \
+                 demo seal pair (NOT FOR PRODUCTION)"
+            );
+            let key = demo_ephemeral_seal_key();
+            let cert = generate_seal_cert_for_key(&SealKey::EcdsaP256(key.clone()))
+                .map_err(|e| format!("generate demo seal cert: {e}"))?;
+            (SealKey::EcdsaP256(key), cert)
+        }
+    };
+    // F08: prove the pair on every load — callers run this per signing pass
+    // (background loop, on-demand signing, post-rotation reload), so the
+    // verdict is never a startup-only cache. Failures propagate before any
+    // bundle is produced or published.
+    let now = crate::source::unix_now().map_err(|e| format!("clock: {e}"))?;
+    validate_seal_materials(&seal_key, &seal_cert_der, now).map_err(|e| e.to_string())?;
+    Ok((seal_key, seal_cert_der))
+}
+
 /// Generate a self-signed seal certificate for any `SealKey` type.
 pub fn generate_seal_cert_for_key(seal_key: &SealKey) -> Result<Vec<u8>> {
     let (pub_key_bytes, alg_id_der) = match seal_key {
@@ -581,6 +641,83 @@ mod tests {
         let cert_der = generate_seal_cert(&key).unwrap();
         let cert = Certificate::from_der(&cert_der).unwrap();
         assert_eq!(cert.tbs_certificate().serial_number().as_bytes(), &[0x01]);
+    }
+
+    /// F07: the shared seal-material policy decision. One implementation,
+    /// unit-tested here, consumed by the configured loader and the one-shot
+    /// CLI sign path.
+    #[test]
+    fn load_or_generate_seal_material_policy() {
+        use p256::pkcs8::EncodePrivateKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let key = test_key();
+        let cert_der = generate_seal_cert(&key).unwrap();
+        let key_path = dir.path().join("seal.p8");
+        std::fs::write(&key_path, key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+        let cert_path = dir.path().join("seal.der");
+        std::fs::write(&cert_path, &cert_der).unwrap();
+        let missing = dir.path().join("missing");
+
+        // A complete pair loads and passes the CMS preflight.
+        let (loaded, cert) =
+            load_or_generate_seal_material(Some(&key_path), Some(&cert_path), false).unwrap();
+        assert!(matches!(loaded, SealKey::EcdsaP256(_)));
+        assert_eq!(cert, cert_der);
+
+        // Exactly one input is always an error, in either direction, demo or
+        // not.
+        for demo in [false, true] {
+            let err = load_or_generate_seal_material(Some(&key_path), None, demo)
+                .err()
+                .expect("half pair (key only) must error");
+            assert!(err.contains("half-configured"), "demo={demo}: {err}");
+            let err = load_or_generate_seal_material(None, Some(&cert_path), demo)
+                .err()
+                .expect("half pair (cert only) must error");
+            assert!(err.contains("half-configured"), "demo={demo}: {err}");
+        }
+
+        // Neither input errors for production...
+        let err = load_or_generate_seal_material(None, None, false)
+            .err()
+            .expect("production without seal material must error");
+        assert!(err.contains("persistent"), "{err}");
+
+        // ...and generates distinct ephemeral material for explicit demo.
+        let (demo_seal, demo_cert) = load_or_generate_seal_material(None, None, true).unwrap();
+        let SealKey::EcdsaP256(demo_key) = &demo_seal else {
+            panic!("demo seal material must be ECDSA P-256");
+        };
+        assert_ne!(
+            demo_key.verifying_key(),
+            crate::demo_ecdsa_p256_key().verifying_key(),
+            "demo seal key must be distinct from the demo OCSP key"
+        );
+        let (second, _) = load_or_generate_seal_material(None, None, true).unwrap();
+        let SealKey::EcdsaP256(second_key) = &second else {
+            panic!("demo seal material must be ECDSA P-256");
+        };
+        assert_ne!(
+            second_key.verifying_key(),
+            demo_key.verifying_key(),
+            "ephemeral demo seal keys must be freshly generated"
+        );
+        assert!(validate_seal_materials(&demo_seal, &demo_cert, now).is_ok());
+
+        // Load failures propagate: unreadable key or certificate files.
+        assert!(
+            load_or_generate_seal_material(Some(&missing), Some(&cert_path), false).is_err(),
+            "unreadable seal key must fail the load"
+        );
+        assert!(
+            load_or_generate_seal_material(Some(&key_path), Some(&missing), false).is_err(),
+            "unreadable seal certificate must fail the load"
+        );
     }
 
     #[test]

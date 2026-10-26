@@ -643,62 +643,26 @@ pub fn load_responder_cert(ca: &CaConfig) -> std::result::Result<Option<Vec<u8>>
 
 /// Load the seal key and certificate for CMS bundle sealing.
 ///
-/// F07: production (persistent signing keys) requires a complete, persistent
-/// `seal_key` + `seal_cert` pair — implicit OCSP-signing-key reuse and
-/// non-demo ephemeral fallback are removed. Explicit demo signing may
-/// generate a distinct ephemeral seal pair only when *neither* seal input is
-/// supplied; a half-configured pair is always an error. The pair is proven
-/// with a real CMS preflight on every load, and the OCSP/seal key-separation
-/// proof runs in the loaded-signer branches that consume this material.
+/// F07: delegates the seal-material policy — complete persistent pair,
+/// half-pair error, demo-only distinct ephemeral fallback, and the F08 CMS
+/// pair preflight — to the shared `load_or_generate_seal_material` helper
+/// (the same decision the one-shot CLI sign path uses), prefixing this CA's
+/// label. Implicit OCSP-signing-key reuse and non-demo ephemeral fallback are
+/// removed. The OCSP/seal key-separation proof runs in the loaded-signer
+/// branches that consume this material.
 pub fn load_seal_materials(
     ca_config: &CaConfig,
 ) -> std::result::Result<(SealKey, Vec<u8>), String> {
-    let label = &ca_config.label;
-    let (seal_key, seal_cert_der) = match (&ca_config.seal_key, &ca_config.seal_cert) {
-        (Some(key_path), Some(cert_path)) => {
-            let ecdsa_key = crate::load_ecdsa_p256_key(key_path)
-                .map_err(|e| format!("CA '{label}': load seal key: {e}"))?;
-            let cert = crate::load_seal_certificate(cert_path)
-                .map_err(|e| format!("CA '{label}': {e}"))?;
-            (SealKey::EcdsaP256(ecdsa_key), cert)
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(format!(
-                "CA '{label}': seal_key and seal_cert must be configured together — \
-                 a half-configured seal pair is always an error"
-            ));
-        }
-        (None, None) => {
-            if !matches!(
-                &ca_config.signing_key,
-                Some(hoike_core::config::SigningKeyConfig::Demo)
-            ) {
-                return Err(format!(
-                    "CA '{label}': production signing requires a persistent seal_key and \
-                     seal_cert pair — configure both, or use the demo signing key for testing"
-                ));
-            }
-            warn!(
-                ca = label,
-                "no seal_key/seal_cert configured — generating a distinct ephemeral demo \
-                 seal pair (NOT FOR PRODUCTION)"
-            );
-            let key = crate::demo_ephemeral_seal_key();
-            let cert = crate::generate_seal_cert_for_key(&SealKey::EcdsaP256(key.clone()))
-                .map_err(|e| format!("CA '{label}': generate demo seal cert: {e}"))?;
-            (SealKey::EcdsaP256(key), cert)
-        }
-    };
-
-    // Preflight the pair on every load — this function runs per signing pass
-    // (background loop, on-demand signing, post-rotation material reload), so
-    // the verdict is never a startup-only cache. Failures propagate before
-    // any bundle is produced or published.
-    let now = crate::source::unix_now().map_err(|e| format!("CA '{label}': clock: {e}"))?;
-    crate::validate_seal_materials(&seal_key, &seal_cert_der, now)
-        .map_err(|e| format!("CA '{label}': {e}"))?;
-
-    Ok((seal_key, seal_cert_der))
+    let demo = matches!(
+        &ca_config.signing_key,
+        Some(hoike_core::config::SigningKeyConfig::Demo)
+    );
+    crate::load_or_generate_seal_material(
+        ca_config.seal_key.as_deref(),
+        ca_config.seal_cert.as_deref(),
+        demo,
+    )
+    .map_err(|e| format!("CA '{}': {e}", ca_config.label))
 }
 
 /// Resolve a PKCS#11 config from a CA's signing-key config. PIN resolution is

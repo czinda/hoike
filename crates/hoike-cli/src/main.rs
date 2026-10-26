@@ -1638,77 +1638,29 @@ fn run_sign(
         ..Default::default()
     };
 
-    // F07: seal material resolution. Production one-shot signing (file keys,
-    // any algorithm) requires a complete persistent `--seal-key`/`--seal-cert`
-    // pair — implicit OCSP-signing-key reuse and non-demo ephemeral fallback
-    // are removed. A half-configured pair is always an error. Explicit
-    // `--demo-key` generates a distinct ephemeral seal pair only when neither
-    // seal input is supplied.
-    let cli_seal_key: hoike_sign::SealKey;
-    let cli_seal_cert: Vec<u8>;
-    match (&seal_key_path, &seal_cert_path) {
-        (Some(seal_path), Some(cert_path)) => {
-            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(seal_path).unwrap_or_else(|e| {
-                eprintln!("Failed to load seal key from {}: {e}", seal_path.display());
-                std::process::exit(1);
-            });
-            let cert = hoike_sign::load_seal_certificate(cert_path).unwrap_or_else(|e| {
+    // F07: seal material resolution. The policy — complete persistent pair,
+    // half-pair error, demo-only distinct ephemeral fallback, and the F08 CMS
+    // pair preflight — lives in the shared `load_or_generate_seal_material`
+    // helper the configured orchestration path also uses. The CLI only adds
+    // flag-name guidance and exits nonzero on failure.
+    let seal_inputs_missing = seal_key_path.is_none() && seal_cert_path.is_none();
+    let (cli_seal_key, cli_seal_cert) =
+        hoike_sign::load_or_generate_seal_material(
+            seal_key_path.as_deref(),
+            seal_cert_path.as_deref(),
+            demo_key,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            if seal_inputs_missing && !demo_key {
                 eprintln!(
-                    "Failed to load seal certificate from {}: {e}",
-                    cert_path.display()
-                );
-                std::process::exit(1);
-            });
-            cli_seal_key = hoike_sign::SealKey::EcdsaP256(ecdsa_key);
-            cli_seal_cert = cert;
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            eprintln!(
-                "Error: --seal-key and --seal-cert must be provided together — \
-                 a half-configured seal pair is always an error."
-            );
-            std::process::exit(1);
-        }
-        (None, None) => {
-            if !demo_key {
-                eprintln!(
-                    "Error: no seal material specified.\n\n\
-                     Provide a complete persistent pair:\n  \
+                    "\nProvide a complete persistent pair:\n  \
                      --seal-key PATH    PKCS#8 PEM or DER P-256 seal key (distinct from the signing key)\n  \
                      --seal-cert PATH   PEM or DER seal certificate\n\n\
                      Or use --demo-key, which generates a distinct ephemeral seal \
                      pair for testing only (NOT FOR PRODUCTION)."
                 );
-                std::process::exit(1);
             }
-            warn!(
-                "no --seal-key/--seal-cert provided — generating a distinct ephemeral \
-                 demo seal pair (NOT FOR PRODUCTION)"
-            );
-            let key = hoike_sign::demo_ephemeral_seal_key();
-            let cert = hoike_sign::generate_seal_cert_for_key(&hoike_sign::SealKey::EcdsaP256(
-                key.clone(),
-            ))
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to generate demo seal certificate: {e}");
-                std::process::exit(1);
-            });
-            cli_seal_key = hoike_sign::SealKey::EcdsaP256(key);
-            cli_seal_cert = cert;
-        }
-    }
-    // F08: prove the seal pair before producing anything — the same preflight
-    // the configured orchestration path runs on every signing pass.
-    let preflight_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|e| {
-            eprintln!("Clock error: {e}");
-            std::process::exit(1);
-        })
-        .as_secs();
-    hoike_sign::validate_seal_materials(&cli_seal_key, &cli_seal_cert, preflight_now)
-        .unwrap_or_else(|e| {
-            eprintln!("Seal material preflight failed: {e}");
             std::process::exit(1);
         });
     // F07: prove the classical ECDSA OCSP signing key is distinct from the
