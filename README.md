@@ -93,8 +93,9 @@ cargo test --workspace
 ## Quick start
 
 ```bash
-# Produce a bundle from a CRL (requires explicit key source)
-hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --signing-key responder.p8 -o bundle.ahu
+# Produce a bundle from a CRL (requires explicit key source and seal pair)
+hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der \
+  --signing-key responder.p8 --seal-key seal.p8 --seal-cert seal-cert.pem -o bundle.ahu
 
 # Or with ML-DSA post-quantum signing (demo key for testing)
 hoike sign --ca my-ca --crl revoked.crl --issuer issuer.der --sig-alg ml-dsa-65 --demo-key -o bundle.ahu
@@ -145,9 +146,17 @@ hoike query --url http://localhost:2560 --serial 0A1B2C --issuer-name-b64 ... --
 - `--issuer-name-b64`: base64-encoded DER issuer name (for correct CertID hashes)
 - `--issuer-key-b64`: base64-encoded issuer public key bytes
 - `--issuer PATH`: issuer certificate (DER) for CertID computation
-- `--seal-key PATH`: PKCS#8 PEM or DER P-256 seal key file (separate from signing key)
+- `--seal-key PATH`: PKCS#8 PEM or DER P-256 seal key file — required together with `--seal-cert` for file-key signing (any algorithm); must hold a key distinct from the OCSP signing key
+- `--seal-cert PATH`: PEM or DER seal certificate matching the seal key
 - `--dual-alg ALG`: produce a dual-algorithm bundle (e.g. `ml-dsa-87`) alongside the classical `--sig-alg`
 - `--pq-signing-key PATH`: PKCS#8 PEM or DER PQ signing key file (for `--dual-alg`)
+
+File-key signing requires a complete persistent seal pair: provide both
+`--seal-key` and `--seal-cert` or neither. A half-configured pair is always an
+error, the signing key is never implicitly reused for sealing, and a seal key
+whose public key equals the OCSP signing key is rejected even when configured
+under a different file name. `--demo-key` (with no seal inputs) generates a
+distinct ephemeral seal pair for testing only.
 
 ### ahu
 
@@ -286,12 +295,21 @@ unaffected.
 
 For a signer or combined process, configure the CA's signing key,
 `responder_cert`, separate `seal_key`/`seal_cert`, source, and refresh cadence.
-`seal_cert` may be PEM or DER; it is normalized to DER and the seal
+`seal_key` and `seal_cert` must be configured together — a half-configured pair
+fails validation, and persistent signing keys (file or PKCS#11) require the
+complete pair. Only `type = "demo"` signing may omit both, which generates a
+distinct ephemeral seal pair for testing. `seal_cert` may be PEM or DER; it is
+normalized to DER and the seal
 key/certificate pair is proven with a real CMS preflight seal before anything
 is published — and re-proven on every signing pass (background loop, on-demand
 signing, post-rotation material reload), so a mismatched or expired
 replacement certificate fails closed and leaves the previous generation in
-place. CRL sources require an independently authorized issuer certificate;
+place. The OCSP signing key and the seal key must be distinct: an ECDSA
+signer whose signature over the domain-separated separation message verifies
+under the seal public key is rejected before production, even when the same
+key material is configured under different file names. (An ML-DSA OCSP signer
+is algorithm-distinct from the configured P-256 seal key.) CRL sources
+require an independently authorized issuer certificate;
 its identity is used when explicit issuer-name/key bytes are not configured:
 
 ```toml
@@ -320,6 +338,14 @@ an HTTPS `forward_to`; `live` belongs on signer/combined nodes. CRL enumeration
 cannot establish authoritative completeness. Dogtag's `authoritative-complete`
 mode additionally requires a successful complete source refresh; see the migration
 guide for source-bound snapshot/cookie checkpoints and full-refresh requirements.
+
+The live/seal backend matrix is deliberately narrow: configured bundle seals
+are P-256 software keys (`seal_key` PKCS#8 file; ML-DSA seals remain available
+through the library and `ahu apply --seal-key` path), batch OCSP signing
+covers ECDSA software, ECDSA PKCS#11, and ML-DSA software keys, and live nonce
+signing covers the configured ECDSA software key. ML-DSA live nonce signing
+and HSM-backed seal keys are separate extensions, not implied by the signing
+key's backend.
 
 ## Workspace layout
 

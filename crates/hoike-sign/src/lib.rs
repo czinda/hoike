@@ -42,8 +42,8 @@ pub use rotation::{
     run_rotation_command,
 };
 pub use seal::{
-    SealKey, create_cms_seal, generate_seal_cert, generate_seal_cert_for_key,
-    load_seal_certificate, validate_seal_materials,
+    SealKey, create_cms_seal, demo_ephemeral_seal_key, ensure_distinct_ecdsa_seal_key,
+    generate_seal_cert, generate_seal_cert_for_key, load_seal_certificate, validate_seal_materials,
 };
 pub use source::{
     CaIdentity, CertificateStatus, Epoch, RevocationSource, StatusChange, StatusSnapshot,

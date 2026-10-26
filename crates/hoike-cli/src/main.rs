@@ -69,9 +69,14 @@ enum Commands {
         /// Path to PKCS#8 PEM or DER signing key file
         #[arg(long, conflicts_with = "demo_key")]
         signing_key: Option<PathBuf>,
-        /// Path to PKCS#8 PEM or DER P-256 seal key file (separate from signing key)
+        /// Path to PKCS#8 PEM or DER P-256 seal key file (required with --seal-cert
+        /// for file/HSM production signing; must be distinct from the signing key)
         #[arg(long)]
         seal_key: Option<PathBuf>,
+        /// Path to PEM or DER seal certificate (required with --seal-key for
+        /// file/HSM production signing)
+        #[arg(long)]
+        seal_cert: Option<PathBuf>,
         /// Produce a dual-algorithm bundle: --sig-alg is the classical algorithm,
         /// --dual-alg is the post-quantum algorithm (e.g. ml-dsa-87)
         #[arg(long)]
@@ -150,6 +155,7 @@ fn main() {
             issuer_key_b64,
             signing_key,
             seal_key,
+            seal_cert,
             dual_alg,
             pq_signing_key,
             demo_key,
@@ -167,6 +173,7 @@ fn main() {
                 issuer_key_b64,
                 signing_key,
                 seal_key,
+                seal_cert,
                 dual_alg,
                 pq_signing_key,
                 demo_key,
@@ -1459,6 +1466,7 @@ fn run_sign(
     issuer_key_b64: Option<String>,
     signing_key_path: Option<PathBuf>,
     seal_key_path: Option<PathBuf>,
+    seal_cert_path: Option<PathBuf>,
     dual_alg: Option<String>,
     pq_signing_key_path: Option<PathBuf>,
     demo_key: bool,
@@ -1630,39 +1638,65 @@ fn run_sign(
         ..Default::default()
     };
 
-    // Seal key resolution: --seal-key > ECDSA signing key fallback > demo key.
-    // In production, the seal key should be separate (per ahu spec §2.3).
-    let is_ml_dsa = matches!(sig_alg.as_str(), "ml-dsa-44" | "ml-dsa-65" | "ml-dsa-87");
-    let cli_seal_key: hoike_sign::SealKey = if let Some(seal_path) = &seal_key_path {
-        let ecdsa_key = hoike_sign::load_ecdsa_p256_key(seal_path).unwrap_or_else(|e| {
-            eprintln!("Failed to load seal key from {}: {e}", seal_path.display());
-            std::process::exit(1);
-        });
-        hoike_sign::SealKey::EcdsaP256(ecdsa_key)
-    } else if !is_ml_dsa {
-        if let Some(key_path) = &signing_key_path {
-            warn!("using OCSP signing key as seal key — provide --seal-key for production");
-            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
-                eprintln!("Failed to load seal key: {e}");
+    // F07: seal material resolution. Production one-shot signing (file keys,
+    // any algorithm) requires a complete persistent `--seal-key`/`--seal-cert`
+    // pair — implicit OCSP-signing-key reuse and non-demo ephemeral fallback
+    // are removed. A half-configured pair is always an error. Explicit
+    // `--demo-key` generates a distinct ephemeral seal pair only when neither
+    // seal input is supplied.
+    let cli_seal_key: hoike_sign::SealKey;
+    let cli_seal_cert: Vec<u8>;
+    match (&seal_key_path, &seal_cert_path) {
+        (Some(seal_path), Some(cert_path)) => {
+            let ecdsa_key = hoike_sign::load_ecdsa_p256_key(seal_path).unwrap_or_else(|e| {
+                eprintln!("Failed to load seal key from {}: {e}", seal_path.display());
                 std::process::exit(1);
             });
-            hoike_sign::SealKey::EcdsaP256(ecdsa_key)
-        } else {
-            hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
+            let cert = hoike_sign::load_seal_certificate(cert_path).unwrap_or_else(|e| {
+                eprintln!(
+                    "Failed to load seal certificate from {}: {e}",
+                    cert_path.display()
+                );
+                std::process::exit(1);
+            });
+            cli_seal_key = hoike_sign::SealKey::EcdsaP256(ecdsa_key);
+            cli_seal_cert = cert;
         }
-    } else if signing_key_path.is_some() {
-        warn!(
-            "ML-DSA signing key cannot be used as P-256 seal key — \
-             provide --seal-key for production use"
-        );
-        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
-    } else {
-        hoike_sign::SealKey::EcdsaP256(hoike_sign::demo_ecdsa_p256_key())
-    };
-    let cli_seal_cert = hoike_sign::generate_seal_cert_for_key(&cli_seal_key).unwrap_or_else(|e| {
-        eprintln!("Failed to generate seal cert: {e}");
-        std::process::exit(1);
-    });
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!(
+                "Error: --seal-key and --seal-cert must be provided together — \
+                 a half-configured seal pair is always an error."
+            );
+            std::process::exit(1);
+        }
+        (None, None) => {
+            if !demo_key {
+                eprintln!(
+                    "Error: no seal material specified.\n\n\
+                     Provide a complete persistent pair:\n  \
+                     --seal-key PATH    PKCS#8 PEM or DER P-256 seal key (distinct from the signing key)\n  \
+                     --seal-cert PATH   PEM or DER seal certificate\n\n\
+                     Or use --demo-key, which generates a distinct ephemeral seal \
+                     pair for testing only (NOT FOR PRODUCTION)."
+                );
+                std::process::exit(1);
+            }
+            warn!(
+                "no --seal-key/--seal-cert provided — generating a distinct ephemeral \
+                 demo seal pair (NOT FOR PRODUCTION)"
+            );
+            let key = hoike_sign::demo_ephemeral_seal_key();
+            let cert = hoike_sign::generate_seal_cert_for_key(&hoike_sign::SealKey::EcdsaP256(
+                key.clone(),
+            ))
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to generate demo seal certificate: {e}");
+                std::process::exit(1);
+            });
+            cli_seal_key = hoike_sign::SealKey::EcdsaP256(key);
+            cli_seal_cert = cert;
+        }
+    }
     // F08: prove the seal pair before producing anything — the same preflight
     // the configured orchestration path runs on every signing pass.
     let preflight_now = std::time::SystemTime::now()
@@ -1677,7 +1711,20 @@ fn run_sign(
             eprintln!("Seal material preflight failed: {e}");
             std::process::exit(1);
         });
-    let seal_fn = move |m: &[u8]| -> hoike_sign::Result<Vec<u8>> {
+    // F07: prove the classical ECDSA OCSP signing key is distinct from the
+    // seal key before producing anything. Runs per loaded signer below; a
+    // failure exits before any bundle is written.
+    let separation_preflight = |signer: &p256::ecdsa::SigningKey| {
+        hoike_sign::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
+            signer,
+            &cli_seal_key,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Seal/OCSP key separation preflight failed: {e}");
+            std::process::exit(1);
+        });
+    };
+    let seal_fn = |m: &[u8]| -> hoike_sign::Result<Vec<u8>> {
         hoike_sign::create_cms_seal(m, &cli_seal_key, &cli_seal_cert)
     };
 
@@ -1692,13 +1739,19 @@ fn run_sign(
             }
         };
         let mut ecdsa_signer = if let Some(key_path) = &signing_key_path {
-            hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+            let key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load classical signing key: {e}");
                 std::process::exit(1);
-            })
+            });
+            // F07: the dual-algorithm classical ECDSA signer must stay
+            // distinct from the seal key before anything is produced.
+            separation_preflight(&key);
+            key
         } else if demo_key {
             warn!("using ephemeral ECDSA demo key — NOT FOR PRODUCTION");
-            hoike_sign::demo_ecdsa_p256_key()
+            let key = hoike_sign::demo_ecdsa_p256_key();
+            separation_preflight(&key);
+            key
         } else {
             eprintln!("--dual-alg requires --signing-key (classical) or --demo-key");
             std::process::exit(1);
@@ -1746,13 +1799,20 @@ fn run_sign(
     } else { match sig_alg.as_str() {
         "ecdsa-p256" => {
             let mut signer = if let Some(key_path) = &signing_key_path {
-                hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
+                let key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                     eprintln!("Failed to load signing key: {e}");
                     std::process::exit(1);
-                })
+                });
+                // F07: prove the OCSP signing key is not the seal key before
+                // producing anything — the same key under a different file
+                // name is still rejected.
+                separation_preflight(&key);
+                key
             } else if demo_key {
                 warn!("using ephemeral ECDSA demo key — NOT FOR PRODUCTION");
-                hoike_sign::demo_ecdsa_p256_key()
+                let key = hoike_sign::demo_ecdsa_p256_key();
+                separation_preflight(&key);
+                key
             } else {
                 eprintln!("No signing key provided. Use --signing-key <path> for a PKCS#8 key file, or --demo-key for testing.");
                 std::process::exit(1);

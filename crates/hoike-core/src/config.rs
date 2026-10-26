@@ -235,11 +235,14 @@ pub struct CaConfig {
     /// Key rotation monitoring configuration.
     pub key_rotation: Option<KeyRotationConfigToml>,
     /// Path to PKCS#8 PEM/DER key for bundle seal signing.
-    /// If absent, falls back to the OCSP signing key (with a warning).
-    /// The seal key SHOULD be different from the OCSP signing key.
+    /// Required together with `seal_cert` for production signing keys
+    /// (file/PKCS#11); must hold a key distinct from the OCSP signing key.
+    /// Demo signing may omit both (a distinct ephemeral pair is generated),
+    /// but configuring exactly one of the two is always an error.
     pub seal_key: Option<PathBuf>,
     /// Path to the DER/PEM certificate for the seal signer.
-    /// If absent, generates a self-signed cert (for testing only).
+    /// Required together with `seal_key` for production signing keys;
+    /// a half-configured pair is always an error.
     pub seal_cert: Option<PathBuf>,
 }
 
@@ -584,6 +587,30 @@ impl Config {
                          or type='demo' for testing only.",
                         ca.label, self.server.mode
                     )));
+                }
+                // F07: production signing requires a complete persistent seal
+                // pair. Demo signing may generate a distinct ephemeral seal
+                // pair only when neither seal input is supplied; a
+                // half-configured pair is always an error.
+                match (&ca.seal_key, &ca.seal_cert) {
+                    (None, None) => {
+                        if !matches!(&ca.signing_key, Some(SigningKeyConfig::Demo)) {
+                            return Err(crate::error::CoreError::Config(format!(
+                                "CA '{}': production signing requires a persistent seal_key \
+                                 and seal_cert pair — configure both, or use the demo signing \
+                                 key for testing",
+                                ca.label
+                            )));
+                        }
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(crate::error::CoreError::Config(format!(
+                            "CA '{}': seal_key and seal_cert must be configured together — a \
+                             half-configured seal pair is always an error",
+                            ca.label
+                        )));
+                    }
+                    (Some(_), Some(_)) => {}
                 }
             }
             if self.ca.is_empty() {

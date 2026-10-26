@@ -155,6 +155,9 @@ bundle_dir = "{dir}"
 [[ca]]
 label = "test-ca"
 
+seal_key = "{seal_key}"
+seal_cert = "{seal_cert}"
+
 [ca.source]
 type = "crl"
 path = "{crl}"
@@ -167,6 +170,8 @@ key_label = "hoike-responder"
 "#,
             dir = dir.path().display(),
             crl = crl_path.display(),
+            seal_key = dir.path().join("seal-key.p8").display(),
+            seal_cert = dir.path().join("seal-signer.pem").display(),
         ),
     )
     .unwrap();
@@ -185,8 +190,12 @@ fn file_signing_key_config_parses() {
     let config_path = dir.path().join("hoike.toml");
     let crl_path = dir.path().join("test.crl");
     let key_path = dir.path().join("responder.pem");
+    let seal_key_path = dir.path().join("seal-key.p8");
+    let seal_cert_path = dir.path().join("seal-signer.pem");
     std::fs::write(&crl_path, b"placeholder").unwrap();
     std::fs::write(&key_path, b"placeholder").unwrap();
+    std::fs::write(&seal_key_path, b"placeholder").unwrap();
+    std::fs::write(&seal_cert_path, b"placeholder").unwrap();
 
     std::fs::write(
         &config_path,
@@ -201,6 +210,9 @@ bundle_dir = "{dir}"
 [[ca]]
 label = "test-ca"
 
+seal_key = "{seal_key}"
+seal_cert = "{seal_cert}"
+
 [ca.source]
 type = "crl"
 path = "{crl}"
@@ -212,6 +224,8 @@ path = "{key}"
             dir = dir.path().display(),
             crl = crl_path.display(),
             key = key_path.display(),
+            seal_key = seal_key_path.display(),
+            seal_cert = seal_cert_path.display(),
         ),
     )
     .unwrap();
@@ -300,6 +314,108 @@ fn parse_config(text: &str) -> Config {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, text).unwrap();
     Config::from_file(&path).unwrap()
+}
+
+/// F07: signer/combined CAs with a persistent signing key must configure a
+/// complete `seal_key` + `seal_cert` pair. Demo signing may omit both, but a
+/// half-configured pair is always an error.
+#[test]
+fn seal_pair_must_be_complete_for_production_and_optional_only_in_demo() {
+    let seal_key = "/etc/hoike/seal-key.p8";
+    let seal_cert = "/etc/hoike/seal-signer.pem";
+    let ca = |signing: &str, seal: &str| {
+        format!(
+            r#"
+[server]
+mode = "signer"
+
+[storage]
+bundle_dir = "/tmp/bundles"
+
+[[ca]]
+label = "test-ca"
+{seal}
+
+[ca.source]
+type = "crl"
+path = "/tmp/test.crl"
+
+[ca.signing_key]
+{signing}
+"#
+        )
+    };
+
+    // Persistent file signing key: neither or exactly one seal input fails.
+    for (name, seal) in [
+        ("neither", ""),
+        ("seal key only", &format!("seal_key = \"{seal_key}\"\n")),
+        ("seal cert only", &format!("seal_cert = \"{seal_cert}\"\n")),
+    ] {
+        let config = parse_config(&ca("type = \"file\"\npath = \"/tmp/ocsp.p8\"", seal));
+        let result = config.validate_for_mode();
+        assert!(result.is_err(), "{name}: must be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("seal"),
+            "{name}: error must name the seal material: {msg}"
+        );
+    }
+
+    // A complete pair validates for a persistent signing key.
+    let config = parse_config(&ca(
+        "type = \"file\"\npath = \"/tmp/ocsp.p8\"",
+        &format!("seal_key = \"{seal_key}\"\nseal_cert = \"{seal_cert}\"\n"),
+    ));
+    assert!(config.validate_for_mode().is_ok());
+
+    // Demo signing without seal inputs still validates (distinct ephemeral
+    // seal material is generated at signing time).
+    let config = parse_config(&ca("type = \"demo\"", ""));
+    assert!(config.validate_for_mode().is_ok());
+
+    // Demo signing with a complete explicit pair validates too.
+    let config = parse_config(&ca(
+        "type = \"demo\"",
+        &format!("seal_key = \"{seal_key}\"\nseal_cert = \"{seal_cert}\"\n"),
+    ));
+    assert!(config.validate_for_mode().is_ok());
+
+    // A half-configured pair is an error even in demo mode.
+    for (name, seal) in [
+        (
+            "demo seal key only",
+            &format!("seal_key = \"{seal_key}\"\n"),
+        ),
+        (
+            "demo seal cert only",
+            &format!("seal_cert = \"{seal_cert}\"\n"),
+        ),
+    ] {
+        let config = parse_config(&ca("type = \"demo\"", seal));
+        let result = config.validate_for_mode();
+        assert!(result.is_err(), "{name}: must be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("seal"),
+            "{name}: error must name the seal material: {msg}"
+        );
+    }
+
+    // Edge mode does not sign, so seal material is not required.
+    let config = parse_config(
+        r#"
+[server]
+mode = "edge"
+
+[storage]
+bundle_dir = "/tmp/bundles"
+
+[[ca]]
+label = "test-ca"
+"#,
+    );
+    assert!(config.validate_for_mode().is_ok());
 }
 
 #[test]
