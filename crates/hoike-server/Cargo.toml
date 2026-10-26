@@ -47,7 +47,7 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:axum-server"]
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Use der 0.7 to match x509-ocsp in tests
 der = { version = "0.7", features = ["alloc"] }
 x509-ocsp = { workspace = true }

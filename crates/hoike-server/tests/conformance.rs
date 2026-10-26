@@ -219,7 +219,7 @@ completeness = "authoritative-complete"
         hoike_core::StateDirectoryLock::acquire(&config.storage.state_db).unwrap(),
     );
     let state = hoike_core::ResponderState::load(config.clone(), guard).unwrap();
-    let app_state = hoike_server::AppState::new(state, config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

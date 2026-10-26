@@ -224,7 +224,7 @@ bundle_file = "{bundle}"
     let config = hoike_core::Config::from_file(&config_path).unwrap();
     init_state(&config);
     let state = load(&config);
-    let app_state = hoike_server::AppState::new(state, config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -378,7 +378,7 @@ allow_unauthenticated_bundles = true
     let config = hoike_core::Config::from_file(&config_path).unwrap();
     init_state(&config);
     let state = load(&config);
-    let app_state = hoike_server::AppState::new(state, config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -898,7 +898,9 @@ type = "demo"
         validity_secs: 86400,
         responder_cert_der: None,
     };
-    let app_state = hoike_server::AppState::new(state, config).with_live_signer(live);
+    let app_state = hoike_server::AppState::new(state, config)
+        .unwrap()
+        .with_live_signer(live);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1151,7 +1153,9 @@ type = "demo"
     let ctx = hoike_server::SignerContext {
         sources: tokio::sync::Mutex::new(sources),
     };
-    let app_state = hoike_server::AppState::new(state, config).with_signer_context(ctx);
+    let app_state = hoike_server::AppState::new(state, config)
+        .unwrap()
+        .with_signer_context(ctx);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1341,7 +1345,9 @@ type = "demo"
     let ctx = hoike_server::SignerContext {
         sources: tokio::sync::Mutex::new(sources),
     };
-    let app_state = hoike_server::AppState::new(state, config).with_signer_context(ctx);
+    let app_state = hoike_server::AppState::new(state, config)
+        .unwrap()
+        .with_signer_context(ctx);
     let app = hoike_server::build_router(app_state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1429,7 +1435,7 @@ async fn expired_first_ca_does_not_block_fresh_second_ca() {
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
     init_state(&cfg);
     let state = load(&cfg);
-    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg));
+    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg).unwrap());
     let req = build_ocsp_request(&build_certid_for_ca(42, b"CA2", b"KEY2"));
     let response = app
         .oneshot(
@@ -1466,7 +1472,7 @@ async fn cache_lifetime_is_capped_by_remaining_validity() {
     let cfg: hoike_core::Config = toml::from_str(&conf).unwrap();
     init_state(&cfg);
     let state = load(&cfg);
-    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg));
+    let app = hoike_server::build_router(hoike_server::AppState::new(state, cfg).unwrap());
     let req = build_ocsp_request(&build_certid(42));
     let response = app
         .oneshot(
@@ -1790,7 +1796,7 @@ async fn check_live_signers_by_ca(default_paths: bool) {
     .unwrap();
     init_state(&config);
     let state = load(&config);
-    let mut app_state = hoike_server::AppState::new(state, config);
+    let mut app_state = hoike_server::AppState::new(state, config).unwrap();
     for (i, (key, public, _)) in identities.iter().enumerate() {
         app_state = app_state.with_live_signer_for(
             &format!("ca-{}", i + 1),
@@ -1981,7 +1987,7 @@ bundle_file = "{bundle}"
     let config = hoike_core::Config::from_file(&config_path).unwrap();
     init_state(&config);
     let state = load(&config);
-    let app_state = hoike_server::AppState::new(state, config);
+    let app_state = hoike_server::AppState::new(state, config).unwrap();
     let responder = std::sync::Arc::clone(&app_state.responder);
     let app = hoike_server::build_router(app_state);
 

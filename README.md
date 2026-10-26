@@ -360,7 +360,13 @@ pin_env = "HOIKE_HSM_PIN"
 Build with `pkcs11` for that signing key, `dogtag-sync` for directory sources,
 and `tls` when configuring TLS/mTLS. A configured security feature that is not
 available must fail rather than fall back. `nonce_policy = "forward"` requires
-an HTTPS `forward_to`; `live` belongs on signer/combined nodes. CRL enumeration
+an HTTPS `forward_to`; `live` belongs on signer/combined nodes. Each forwarding
+CA gets its own startup-validated outbound client: an optional `forward_ca`
+PEM bundle pins that CA's private roots (built-in roots disabled, hostname and
+validity checking kept on), while a CA without `forward_ca` validates the
+upstream against the bundled WebPKI roots — not the system trust store. An
+unreadable, empty, or malformed `forward_ca`, a root pinned to a non-HTTPS
+target, or a duplicate CA label fails startup and `hoike check`. CRL enumeration
 cannot establish authoritative completeness. Dogtag's `authoritative-complete`
 mode additionally requires a successful complete source refresh; see the migration
 guide for source-bound snapshot/cookie checkpoints and full-refresh requirements.

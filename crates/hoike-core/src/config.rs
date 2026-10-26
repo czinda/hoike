@@ -187,11 +187,13 @@ pub struct CaConfig {
     pub forward_insecure: bool,
     /// Optional PEM CA bundle for the forward target's server certificate.
     ///
-    /// NOTE: per-target custom roots are not yet wired into the forward path.
-    /// The shared outbound client validates the forward target against the
-    /// system trust store, so this CA must currently be installed system-wide to
-    /// take effect; setting it alone does not change validation. `hoike check`
-    /// emits the same caveat. Retained as forward-looking config.
+    /// When set, the CA's forwarding client trusts only these roots (the
+    /// bundled WebPKI roots are disabled) and the bundle must parse to at
+    /// least one certificate; an unreadable, empty, or malformed file fails
+    /// startup and `hoike check`. A `forward_ca` on a non-HTTPS `forward_to`
+    /// is a configuration error. Without `forward_ca`, the forward channel
+    /// validates against reqwest's bundled WebPKI roots (the `rustls-tls`
+    /// feature) — not the operating system trust store.
     pub forward_ca: Option<PathBuf>,
     /// Revocation source (required for combined/signer mode)
     pub source: Option<SourceConfig>,

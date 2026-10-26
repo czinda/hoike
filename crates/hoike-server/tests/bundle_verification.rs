@@ -178,7 +178,7 @@ impl Server {
             hoike_core::StateDirectoryLock::acquire(&f.config.storage.state_db).unwrap(),
         );
         let responder = hoike_core::ResponderState::load(f.config.clone(), guard).unwrap();
-        let state = hoike_server::AppState::new(responder, f.config.clone());
+        let state = hoike_server::AppState::new(responder, f.config.clone()).unwrap();
         let responder = state.responder.clone();
         let app = hoike_server::build_admin_router_standalone(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

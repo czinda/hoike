@@ -305,7 +305,14 @@ async fn run_server(config_path: PathBuf) {
             std::process::exit(1);
         });
 
-    let mut app_state = hoike_server::AppState::new(state, config.clone());
+    // F10: per-CA forwarding clients are validated here — an unreadable,
+    // empty, or malformed `forward_ca` bundle (or a root pinned to a
+    // non-HTTPS target) aborts startup instead of degrading the forward
+    // channel at request time.
+    let mut app_state = hoike_server::AppState::new(state, config.clone()).unwrap_or_else(|e| {
+        eprintln!("Failed to build per-CA forwarding clients: {e}");
+        std::process::exit(1);
+    });
 
     // Attach the shared signing context (holds the persistent sources behind a
     // mutex) so the admin API and the background loop serialize on one lock.
@@ -1345,11 +1352,31 @@ fn check_trusted_channels(config: &hoike_core::Config) {
         _ => {}
     }
 
-    // Forward proxy channel (FTP_ITC.1).
+    // Forward proxy channel (FTP_ITC.1). The clients are built exactly as
+    // `serve` builds them, so a broken `forward_ca` fails `hoike check` the
+    // same way startup would — without opening a listener or sending a
+    // request.
+    let forward_clients = match hoike_server::build_forward_clients(config) {
+        Ok(clients) => clients,
+        Err(e) => {
+            eprintln!("    FAIL: forwarding client configuration: {e}");
+            hard_fail = true;
+            std::collections::HashMap::new()
+        }
+    };
     for ca in &config.ca {
         if let Some(url) = &ca.forward_to {
             if url.starts_with("https://") {
                 println!("    Forward ({}): https (FTP_ITC.1)", ca.label);
+                if ca.forward_ca.is_some() {
+                    if forward_clients.contains_key(&ca.label) {
+                        println!(
+                            "      forward_ca: pinned private root(s), built-in roots disabled"
+                        );
+                    }
+                } else {
+                    println!("      trust: bundled WebPKI roots");
+                }
             } else if ca.forward_insecure {
                 eprintln!(
                     "    WARNING: CA '{}' forwards to cleartext {url} (forward_insecure=true) — \
@@ -1363,12 +1390,6 @@ fn check_trusted_channels(config: &hoike_core::Config) {
                     ca.label
                 );
                 hard_fail = true;
-            }
-            if ca.forward_ca.is_some() && url.starts_with("https://") {
-                println!(
-                    "      note: forward_ca must be installed in the system trust store; \
-                     per-target custom roots are not yet wired into the forward path."
-                );
             }
         }
     }

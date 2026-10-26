@@ -1,10 +1,12 @@
 mod admin;
+mod forwarding;
 mod handlers;
 pub mod obs;
 mod state;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+pub use forwarding::build_forward_clients;
 pub use state::{AppState, LiveSignerState, SignerContext};
 
 use axum::Router;
