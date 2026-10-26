@@ -132,17 +132,18 @@ impl foca::Invalidates for BroadcastKey {
 /// BroadcastHandler that processes GossipMessage broadcasts.
 pub struct HoikeBroadcastHandler {
     tx: tokio::sync::mpsc::Sender<GossipMessage>,
-    /// Inbound message authentication (FPT_ITT.1). `None` disables verification
-    /// entirely — today's unauthenticated behavior — used when no gossip
-    /// `identity_key`/`peer_keys` are configured.
-    verifier: Option<crate::crypto::GossipVerifier>,
+    /// Inbound message authentication (FPT_ITT.1). Always present: the
+    /// authentication policy is explicit (`gossip.auth_mode`), so there is no
+    /// verifier-less bypass. A permissive verifier is the documented rollout
+    /// stance — it still rejects signed frames from unprovisioned keys.
+    verifier: crate::crypto::GossipVerifier,
     admitted: std::collections::HashMap<(String, Vec<u8>), std::time::Instant>,
 }
 
 impl HoikeBroadcastHandler {
     pub fn new(
         tx: tokio::sync::mpsc::Sender<GossipMessage>,
-        verifier: Option<crate::crypto::GossipVerifier>,
+        verifier: crate::crypto::GossipVerifier,
     ) -> Self {
         Self {
             tx,
@@ -176,22 +177,15 @@ impl<T> foca::BroadcastHandler<T> for HoikeBroadcastHandler {
             return Ok(None);
         }
         // Authenticate before decoding. A dropped message returns `Ok(None)` so
-        // foca neither stores nor re-broadcasts it — the forgery dies at this hop.
-        let payload: &[u8] = match &self.verifier {
-            Some(v) => match v.check(data) {
-                crate::crypto::VerifyOutcome::Accept(p) => p,
-                crate::crypto::VerifyOutcome::Reject(reason) => {
-                    tracing::warn!(reason, "gossip message rejected (authentication)");
-                    return Ok(None);
-                }
-            },
-            // No verifier configured: this node has opted out of authentication.
-            // It must still strip a signing peer's frame to reach the inner JSON,
-            // or a signed broadcast would fail to decode and die at this hop —
-            // breaking mixed-fleet interop during a rolling upgrade. Accepting
-            // the unverified payload is no weaker than the unsigned messages this
-            // node already accepts.
-            None => crate::crypto::unwrap_frame(data),
+        // foca neither stores nor re-broadcasts it — the forgery dies at this
+        // hop. The verifier is always present; even permissive mode verifies
+        // signed frames against the provisioned named identities.
+        let payload: &[u8] = match self.verifier.check(data) {
+            crate::crypto::VerifyOutcome::Accept(p) => p,
+            crate::crypto::VerifyOutcome::Reject(reason) => {
+                tracing::warn!(reason, "gossip message rejected (authentication)");
+                return Ok(None);
+            }
         };
 
         let msg: GossipMessage =
@@ -227,9 +221,16 @@ mod tests {
 
     #[test]
     fn handler_bounds_new_scopes_and_payloads() {
+        use crate::config::AuthMode;
+        use crate::crypto::GossipVerifier;
         use foca::BroadcastHandler;
         let (tx, _rx) = tokio::sync::mpsc::channel(8192);
-        let mut handler = HoikeBroadcastHandler::new(tx, None);
+        // Explicit permissive verifier: unsigned payloads admitted, so the
+        // bounds/deduplication logic below is what is under test.
+        let mut handler = HoikeBroadcastHandler::new(
+            tx,
+            GossipVerifier::for_identities(vec![], AuthMode::Permissive),
+        );
         for n in 0..4100 {
             let msg = GossipMessage::UrgentRevocation {
                 producer_id: format!("p{n}"),
@@ -304,17 +305,17 @@ mod tests {
     // silently drop a forged one — foca sees `Ok(None)` so nothing propagates.
     #[test]
     fn handler_drops_forged_and_admits_signed() {
-        use crate::crypto::{GossipSigner, GossipVerifier, VerifyPolicy};
+        use crate::config::AuthMode;
+        use crate::crypto::{GossipSigner, GossipVerifier};
         use ed25519_dalek::SigningKey;
         use foca::BroadcastHandler;
 
         let trusted_key = SigningKey::from_bytes(&[1u8; 32]);
         let signer = GossipSigner::new(trusted_key.clone());
-        let verifier =
-            GossipVerifier::new(vec![trusted_key.verifying_key()], VerifyPolicy::Required);
+        let verifier = GossipVerifier::new(vec![trusted_key.verifying_key()], AuthMode::Required);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<GossipMessage>(4);
-        let mut handler = HoikeBroadcastHandler::new(tx, Some(verifier));
+        let mut handler = HoikeBroadcastHandler::new(tx, verifier);
 
         let msg = GossipMessage::GenerationAnnouncement {
             producer_id: "signer-a".into(),
@@ -357,18 +358,27 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    // A node with no gossip keys (verifier: None) has opted out of auth, but a
-    // *signing* peer still frames its broadcasts. The keyless node must strip the
-    // frame and decode the inner payload — otherwise every signed announcement
-    // dies at this hop and a mid-upgrade mixed fleet partitions.
+    // The mixed-fleet property that survives F09: a permissive node that has
+    // provisioned a signing peer's key decodes that peer's signed frames and
+    // the same peer's legacy unsigned frames — that is the provision →
+    // permissive → sign rollout window. There is no keyless bypass anymore:
+    // permissive nodes that did NOT provision the signer reject its frames.
     #[test]
-    fn none_verifier_decodes_signed_frame_from_peer() {
-        use crate::crypto::GossipSigner;
+    fn permissive_handler_decodes_signed_and_unsigned_from_provisioned_peer() {
+        use crate::config::AuthMode;
+        use crate::crypto::{GossipSigner, GossipVerifier};
         use ed25519_dalek::SigningKey;
         use foca::BroadcastHandler;
 
+        let peer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let signer = GossipSigner::new(peer_key.clone());
+        let verifier = GossipVerifier::for_identities(
+            vec![("node-a".into(), peer_key.verifying_key())],
+            AuthMode::Permissive,
+        );
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<GossipMessage>(4);
-        let mut handler = HoikeBroadcastHandler::new(tx, None);
+        let mut handler = HoikeBroadcastHandler::new(tx, verifier);
 
         let msg = GossipMessage::GenerationAnnouncement {
             producer_id: "signer-a".into(),
@@ -380,21 +390,30 @@ mod tests {
         };
         let payload = serde_json::to_vec(&msg).unwrap();
 
-        // Signed frame from a peer → keyless node strips the frame and decodes.
-        let signer = GossipSigner::new(SigningKey::from_bytes(&[7u8; 32]));
+        // Signed frame from the provisioned peer → verified and admitted.
         let framed = signer.frame(&payload);
         let key = handler
             .receive_item(&framed, None::<&()>)
-            .expect("keyless node must decode a signed frame, not error");
-        assert!(key.is_some(), "signed frame accepted by keyless node");
-        assert_eq!(rx.try_recv().unwrap().epoch(), 11);
-
-        // Plain unsigned payload still decodes on the same node.
-        let key = handler
-            .receive_item(&payload, None::<&()>)
-            .expect("keyless node decodes unsigned too");
+            .expect("permissive node must decode a provisioned peer's frame");
         assert!(key.is_some());
         assert_eq!(rx.try_recv().unwrap().epoch(), 11);
+
+        // Plain unsigned payload from the same peer → still admitted.
+        let key = handler
+            .receive_item(&payload, None::<&()>)
+            .expect("permissive node decodes unsigned too");
+        assert!(key.is_some());
+        assert_eq!(rx.try_recv().unwrap().epoch(), 11);
+
+        // A signed frame from a key this node never provisioned is dropped:
+        // permissive is not a no-auth bypass for signed input.
+        let unprovisioned = GossipSigner::new(SigningKey::from_bytes(&[9u8; 32]));
+        let forged = unprovisioned.frame(&payload);
+        let key = handler
+            .receive_item(&forged, None::<&()>)
+            .expect("drop is not a decode error");
+        assert!(key.is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

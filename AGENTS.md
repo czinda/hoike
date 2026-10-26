@@ -111,10 +111,19 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 - **Gossip message authentication (FPT_ITT.1)**: Generation/urgent-revocation broadcasts
   are Ed25519-signed at the JSON payload boundary and verified on receive
   (`hoike-gossip/src/crypto.rs`, `broadcast.rs::receive_item`); forged/unsigned messages
-  are dropped before re-propagation. `gossip.identity_key` signs; `gossip.peer_identities` maps
-  node names to authorized public-key files. Legacy nonempty `peer_keys` is rejected.
-  One-byte frame tag (`0x01`, unambiguous vs. legacy `{` JSON) keeps a mixed fleet
-  interoperable. `hoike check` reports the gossip auth posture.
+  are dropped before re-propagation. Authentication is an explicit policy —
+  `gossip.auth_mode = "required"` (default) or `"permissive"` — loaded by one helper
+  (`crypto.rs::load_authentication`) used by both `GossipNode::start` and `hoike check`;
+  the broadcast handler always has a verifier (no bypass). Required mode needs a local
+  `gossip.identity_key`, verifies every origin against `gossip.peer_identities`
+  (node name → authorized public-key file; a single node may trust only its own key), and
+  rejects a local-name mapping that conflicts with the local key. Permissive mode accepts
+  unsigned legacy broadcasts but still rejects unknown/forged signed frames (including with
+  an empty trusted set). Invalid enabled config or unreadable key material aborts startup;
+  disabled gossip loads no key material. Legacy nonempty `peer_keys` is rejected.
+  One-byte frame tag (`0x01`, unambiguous vs. legacy `{` JSON) keeps a frame-aware mixed
+  fleet interoperable; the documented rollout is provision → permissive → sign → required.
+  `hoike check` reports the effective mode and unsigned-acceptance posture.
 
 ## What is NOT implemented
 

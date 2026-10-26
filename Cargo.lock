@@ -1309,6 +1309,7 @@ dependencies = [
  "cryptoki",
  "der 0.7.10",
  "ecdsa 0.16.9",
+ "ed25519-dalek",
  "hex",
  "hoike-core",
  "hoike-gossip",
@@ -1373,6 +1374,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

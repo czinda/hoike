@@ -22,16 +22,21 @@ pub struct GossipConfigSection {
     pub seeds: Vec<String>,
     #[serde(default = "default_gossip_node_name")]
     pub node_name: String,
+    /// Explicit inbound authentication policy for gossip broadcasts (FPT_ITT.1,
+    /// F09): "required" (default) or "permissive". Validated against those two
+    /// values here; the CLI bridges the string to hoike-gossip's `AuthMode`.
+    /// `required` drops unsigned/unknown/forged broadcasts and needs an
+    /// `identity_key`; `permissive` is the documented rollout mode that still
+    /// accepts unsigned legacy broadcasts while verifying signed ones.
+    #[serde(default = "default_gossip_auth_mode")]
+    pub auth_mode: String,
     /// Path to an Ed25519 PKCS#8 private key used to sign outbound gossip
-    /// messages (design §6.3, FPT_ITT.1). When set, every message this node
-    /// broadcasts is signed; peers with the matching public key verify and drop
-    /// unauthenticated messages. When unset, gossip stays unauthenticated
-    /// (backward compatible).
+    /// messages (design §6.3, FPT_ITT.1). Required when gossip is enabled in
+    /// `auth_mode = "required"`; optional while rolling out in permissive mode.
     pub identity_key: Option<PathBuf>,
-    /// Paths to Ed25519 public keys (PEM/DER) trusted to sign peer gossip
-    /// messages. When `identity_key` is set and this is empty, a node verifies
-    /// only its own signature scheme is well-formed; populate with peer keys to
-    /// authenticate the mesh.
+    /// Deprecated unbound key list. Nonempty values fail configuration with
+    /// migration instructions; use peer_identities to authorize each key's
+    /// node identity.
     #[serde(default)]
     pub peer_keys: Vec<PathBuf>,
     #[serde(default)]
@@ -43,6 +48,9 @@ fn default_gossip_bind() -> String {
 }
 fn default_gossip_node_name() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "hoike-node".into())
+}
+fn default_gossip_auth_mode() -> String {
+    "required".into()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -510,12 +518,16 @@ impl Config {
     }
 
     pub fn validate_for_mode(&self) -> crate::error::Result<()> {
-        if self
-            .gossip
-            .as_ref()
-            .is_some_and(|g| g.enabled && !g.peer_keys.is_empty())
-        {
-            return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));
+        if let Some(g) = self.gossip.as_ref() {
+            if !g.peer_keys.is_empty() {
+                return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));
+            }
+            if !matches!(g.auth_mode.as_str(), "required" | "permissive") {
+                return Err(crate::error::CoreError::Config(format!(
+                    "gossip.auth_mode must be \"required\" or \"permissive\" (got '{}')",
+                    g.auth_mode
+                )));
+            }
         }
         let mut labels = std::collections::HashSet::new();
         for ca in &self.ca {

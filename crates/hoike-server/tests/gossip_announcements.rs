@@ -78,10 +78,11 @@ fn full_bundle(epoch: u64, produced_at: u64) -> (Vec<u8>, Bundle) {
     (bytes, bundle)
 }
 
-/// Bind a real but isolated gossip node (ephemeral port, no seeds, no gossip
-/// identity keys — today's unsigned permissive default; explicit auth modes
-/// arrive with C2). Returns the node and the channel every locally delivered
-/// broadcast lands on.
+/// Bind a real but isolated gossip node (ephemeral port, no seeds) in the
+/// explicit permissive auth mode — this delivery-level test captures
+/// announcements, it does not exercise authentication policy (F09 covers
+/// that in hoike-gossip and hoike-cli). Returns the node and the channel
+/// every locally delivered broadcast lands on.
 async fn ephemeral_node(name: &str) -> (GossipNode, mpsc::Receiver<GossipMessage>) {
     let (tx, rx) = mpsc::channel(16);
     let config = GossipConfig {
@@ -89,6 +90,7 @@ async fn ephemeral_node(name: &str) -> (GossipNode, mpsc::Receiver<GossipMessage
         bind: "127.0.0.1:0".into(),
         seeds: vec![],
         node_name: name.into(),
+        auth_mode: hoike_gossip::AuthMode::Permissive,
         identity_key: None,
         peer_keys: vec![],
         peer_identities: Default::default(),

@@ -235,13 +235,39 @@ enabled = false
 bind = "0.0.0.0:7946"
 seeds = []
 node_name = "edge-01"
-# Before enabling authenticated gossip, provision the local signing key and
-# mappings for each authorized origin (including this node where needed):
+# Explicit inbound authentication policy (FPT_ITT.1): "required" (default)
+# or "permissive". Required mode needs the local signing key below and drops
+# unsigned, forged, and unknown-origin broadcasts.
+auth_mode = "required"
 # identity_key = "/etc/hoike/gossip/edge-01.ed25519.p8"
 # [gossip.peer_identities]
 # edge-01 = "/etc/hoike/gossip/edge-01.pub.pem"
 # edge-02 = "/etc/hoike/gossip/edge-02.pub.pem"
 ```
+
+Gossip authentication is enabled through an explicit rollout sequence, not
+implicit key presence:
+
+1. **Provision** — generate an Ed25519 identity per node and distribute every
+   node's `peer_identities` mapping (including each node's own name/key pair)
+   while gossip is disabled or unsigned.
+2. **Permissive** — set `auth_mode = "permissive"` fleet-wide. Unsigned legacy
+   broadcasts are still accepted; signed frames are verified against the
+   provisioned identities, and unknown/forged signatures are already rejected.
+3. **Sign** — configure `identity_key` on every node so all outbound
+   broadcasts carry signatures.
+4. **Required** — set `auth_mode = "required"` fleet-wide. Unsigned traffic is
+   now rejected; a required node without a local identity key fails startup.
+
+This sequence assumes a *frame-aware* fleet: every node runs a binary that
+understands the signed frame wire tag. The one-byte tag keeps such a mixed
+fleet interoperable, but it does not make every historical binary compatible.
+`required` mode with missing or unreadable key material, a legacy nonempty
+`peer_keys` list, or a `peer_identities` entry for the local node name that
+disagrees with the local `identity_key` is a fatal startup error. `hoike check`
+reports the effective mode and its unsigned-acceptance posture using the same
+policy loading. Unreachable gossip peers (a partition) only degrade gossip;
+OCSP serving continues independently.
 
 Bundle admission requires configured seal trust by default, including startup,
 hot reload, and recovery from committed snapshots. Existing deployments with no
@@ -385,8 +411,11 @@ changes, regression evidence, migration requirements, and remaining release gate
 
 - **Gossip: broadcasts signed, channel not encrypted** — generation/urgent-revocation
   broadcasts are Ed25519-signed and verified by named-origin mappings
-  (`gossip.identity_key` + `gossip.peer_identities`, design §6.3). Enforced mode
-  rejects unsigned, forged, or misattributed broadcasts. Not yet
+  (`gossip.auth_mode` + `gossip.identity_key` + `gossip.peer_identities`, design
+  §6.3). The explicit `auth_mode = "required"` default rejects unsigned, forged,
+  or misattributed broadcasts; `permissive` is the documented rollout mode and
+  still rejects unknown/forged signed frames. Invalid enabled configurations or
+  unreadable key material abort startup. Not yet
   covered: payload *confidentiality* and authentication of foca's SWIM liveness traffic
   (pings/acks).
 - **Bounded CMS trust profile** — explicit certificate pins or direct-issued

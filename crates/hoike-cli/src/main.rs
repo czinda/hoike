@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -333,69 +334,84 @@ async fn run_server(config_path: PathBuf) {
             let (msg_tx, mut msg_rx) =
                 tokio::sync::mpsc::channel::<hoike_gossip::GossipMessage>(256);
 
+            // Bridge the core TOML string to the explicit policy (already
+            // validated by Config::validate_for_mode; a mismatch here is still
+            // fatal rather than defaulted).
+            let auth_mode =
+                hoike_gossip::AuthMode::from_str(&gossip_cfg.auth_mode).unwrap_or_else(|e| {
+                    eprintln!("Invalid gossip configuration: {e}");
+                    std::process::exit(1);
+                });
+
             let gc = hoike_gossip::GossipConfig {
                 enabled: true,
                 bind: gossip_cfg.bind.clone(),
                 seeds: gossip_cfg.seeds.clone(),
                 node_name: gossip_cfg.node_name.clone(),
+                auth_mode,
                 identity_key: gossip_cfg.identity_key.clone(),
                 peer_keys: gossip_cfg.peer_keys.clone(),
                 peer_identities: gossip_cfg.peer_identities.clone(),
             };
 
-            match hoike_gossip::GossipNode::start(gc, msg_tx).await {
-                Ok(gossip_node) => {
-                    info!("gossip node started");
-                    let gossip_node = std::sync::Arc::new(gossip_node);
-                    app_state = app_state.with_gossip(gossip_node.clone());
-
-                    // Consumer: fold received announcements into the generation
-                    // table so the fleet view can attribute epochs to nodes and
-                    // compute per-node staleness.
-                    let consumer_node = gossip_node.clone();
-                    tokio::spawn(async move {
-                        while let Some(msg) = msg_rx.recv().await {
-                            match &msg {
-                                hoike_gossip::GossipMessage::GenerationAnnouncement {
-                                    producer_id,
-                                    epoch,
-                                    origin_node,
-                                    bundle_url,
-                                    ..
-                                } => {
-                                    info!(
-                                        origin = %origin_node,
-                                        producer = %producer_id,
-                                        epoch,
-                                        url = bundle_url.as_deref().unwrap_or("none"),
-                                        "received generation announcement"
-                                    );
-                                    consumer_node.record_generation(&msg).await;
-                                    // Bundle pull-on-announce is future work: fetch
-                                    // from bundle_url, verify anti-rollback, then
-                                    // swap into the router via responder.reload().
-                                }
-                                hoike_gossip::GossipMessage::UrgentRevocation {
-                                    producer_id,
-                                    epoch,
-                                    origin_node,
-                                    ..
-                                } => {
-                                    info!(
-                                        origin = %origin_node,
-                                        producer = %producer_id,
-                                        epoch,
-                                        "received urgent revocation notice — would pull delta"
-                                    );
-                                }
-                            }
-                        }
-                    });
-                }
+            // F09: an invalid enabled gossip configuration or unreadable key
+            // material is a fatal startup error — never a warning-and-continue
+            // that would silently run unauthenticated gossip. Partitioned or
+            // unreachable peers are NOT startup failures; they only degrade
+            // gossip, never OCSP serving.
+            let gossip_node = match hoike_gossip::GossipNode::start(gc, msg_tx).await {
+                Ok(node) => node,
                 Err(e) => {
-                    warn!(error = %e, "gossip startup failed, continuing without gossip");
+                    eprintln!("gossip startup failed: {e}");
+                    std::process::exit(1);
                 }
-            }
+            };
+            info!("gossip node started");
+            let gossip_node = std::sync::Arc::new(gossip_node);
+            app_state = app_state.with_gossip(gossip_node.clone());
+
+            // Consumer: fold received announcements into the generation
+            // table so the fleet view can attribute epochs to nodes and
+            // compute per-node staleness.
+            let consumer_node = gossip_node.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = msg_rx.recv().await {
+                    match &msg {
+                        hoike_gossip::GossipMessage::GenerationAnnouncement {
+                            producer_id,
+                            epoch,
+                            origin_node,
+                            bundle_url,
+                            ..
+                        } => {
+                            info!(
+                                origin = %origin_node,
+                                producer = %producer_id,
+                                epoch,
+                                url = bundle_url.as_deref().unwrap_or("none"),
+                                "received generation announcement"
+                            );
+                            consumer_node.record_generation(&msg).await;
+                            // Bundle pull-on-announce is future work: fetch
+                            // from bundle_url, verify anti-rollback, then
+                            // swap into the router via responder.reload().
+                        }
+                        hoike_gossip::GossipMessage::UrgentRevocation {
+                            producer_id,
+                            epoch,
+                            origin_node,
+                            ..
+                        } => {
+                            info!(
+                                origin = %origin_node,
+                                producer = %producer_id,
+                                epoch,
+                                "received urgent revocation notice — would pull delta"
+                            );
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -1412,37 +1428,50 @@ fn check_trusted_channels(config: &hoike_core::Config) {
         }
     }
 
-    // Gossip message authentication (FPT_ITT.1).
-    if let Some(g) = &config.gossip {
-        if g.enabled {
-            match (&g.identity_key, g.peer_identities.is_empty()) {
-                (Some(_), false) => {
-                    println!(
-                        "    Gossip:    signed + enforced ({} peer key(s)) (FPT_ITT.1)",
-                        g.peer_identities.len()
-                    );
+    // Gossip message authentication (FPT_ITT.1, F09). The same auth-loading
+    // helper GossipNode::start uses decides the effective policy, so check
+    // reports what serve would actually run — and fails on the same invalid
+    // configurations that would abort startup.
+    if let Some(g) = config.gossip.as_ref().filter(|g| g.enabled) {
+        let auth = hoike_gossip::AuthMode::from_str(&g.auth_mode).and_then(|mode| {
+            let gc = hoike_gossip::GossipConfig {
+                enabled: true,
+                bind: g.bind.clone(),
+                seeds: g.seeds.clone(),
+                node_name: g.node_name.clone(),
+                auth_mode: mode,
+                identity_key: g.identity_key.clone(),
+                peer_keys: g.peer_keys.clone(),
+                peer_identities: g.peer_identities.clone(),
+            };
+            hoike_gossip::load_authentication(&gc).map(|(signer, _)| (mode, signer))
+        });
+        match auth {
+            Ok((mode, signer)) => {
+                let peers = g.peer_identities.len();
+                let identities = if peers == 1 { "identity" } else { "identities" };
+                match mode {
+                    hoike_gossip::AuthMode::Required => println!(
+                        "    Gossip:    auth_mode=required — signed outbound; unsigned, forged, \
+                         and unknown-origin broadcasts rejected ({peers} peer {identities} + \
+                         self) (FPT_ITT.1)"
+                    ),
+                    hoike_gossip::AuthMode::Permissive => println!(
+                        "    Gossip:    auth_mode=permissive — ROLLOUT MODE ({}): unsigned \
+                         broadcasts are still accepted; signed frames are verified against \
+                         {peers} provisioned {identities}. Switch to auth_mode=\"required\" \
+                         once every node signs (FPT_ITT.1).",
+                        if signer.is_some() {
+                            "signing outbound"
+                        } else {
+                            "not yet signing"
+                        }
+                    ),
                 }
-                (Some(_), true) => {
-                    eprintln!(
-                        "    WARNING: gossip signs outbound messages (identity_key set) but \
-                         peer_identities is empty — verification is permissive, so unsigned/forged \
-                         messages from peers are still accepted. Populate gossip.peer_identities to \
-                         enforce (FPT_ITT.1)."
-                    );
-                }
-                (None, false) => {
-                    eprintln!(
-                        "    WARNING: gossip.peer_identities is set but this node has no identity_key — \
-                         it enforces inbound signatures but broadcasts its own messages unsigned, \
-                         which enforcing peers will drop. Set gossip.identity_key (FPT_ITT.1)."
-                    );
-                }
-                (None, true) => {
-                    eprintln!(
-                        "    WARNING: gossip is enabled but unauthenticated (no identity_key / \
-                         peer_identities) — membership and generation messages are unsigned (FPT_ITT.1)."
-                    );
-                }
+            }
+            Err(e) => {
+                eprintln!("    FAIL: gossip authentication configuration: {e}");
+                hard_fail = true;
             }
         }
     }

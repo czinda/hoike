@@ -260,6 +260,7 @@ enabled = true
 bind = "0.0.0.0:7947"
 seeds = ["edge-a.pki.example:7946", "edge-b.pki.example:7946"]
 node_name = "test-edge-01"
+auth_mode = "permissive"
 
 [[ca]]
 label = "test-ca"
@@ -278,6 +279,51 @@ label = "test-ca"
     assert_eq!(gossip.bind, "0.0.0.0:7947");
     assert_eq!(gossip.seeds.len(), 2);
     assert_eq!(gossip.node_name, "test-edge-01");
+    assert_eq!(gossip.auth_mode, "permissive");
+    config.validate_for_mode().unwrap();
+}
+
+/// F09: `gossip.auth_mode` is an explicit policy string. It defaults to
+/// "required" and unknown values are configuration errors; "permissive" is
+/// the only documented rollout mode.
+#[test]
+fn gossip_auth_mode_defaults_to_required_and_rejects_unknown_values() {
+    let config = parse_config(
+        "[server]\nmode = 'edge'\n[storage]\nbundle_dir = 'b'\n[gossip]\nenabled = true\n[[ca]]\nlabel = 't'\n",
+    );
+    let gossip = config.gossip.as_ref().expect("gossip section present");
+    assert_eq!(gossip.auth_mode, "required");
+    config.validate_for_mode().unwrap();
+
+    let config = parse_config(
+        "[server]\nmode = 'edge'\n[storage]\nbundle_dir = 'b'\n[gossip]\nauth_mode = 'permissive'\n[[ca]]\nlabel = 't'\n",
+    );
+    config.validate_for_mode().unwrap();
+
+    let config = parse_config(
+        "[server]\nmode = 'edge'\n[storage]\nbundle_dir = 'b'\n[gossip]\nauth_mode = 'strict'\n[[ca]]\nlabel = 't'\n",
+    );
+    let err = config.validate_for_mode().unwrap_err();
+    assert!(
+        err.to_string().contains("auth_mode"),
+        "error must identify auth_mode: {err}"
+    );
+}
+
+/// F09 (retained): nonempty legacy `gossip.peer_keys` fails configuration
+/// with migration instructions — an unbound key list cannot authorize node
+/// identities.
+#[test]
+fn gossip_legacy_peer_keys_rejected() {
+    let config = parse_config(
+        "[server]\nmode = 'edge'\n[storage]\nbundle_dir = 'b'\n[gossip]\nenabled = true\n\
+         peer_keys = ['a.pub', 'b.pub']\n[[ca]]\nlabel = 't'\n",
+    );
+    let err = config.validate_for_mode().unwrap_err();
+    assert!(
+        err.to_string().contains("peer_identities"),
+        "error must point at the migration target: {err}"
+    );
 }
 
 #[test]
