@@ -32,7 +32,7 @@ jobs:
       # Build the web UI first so the `embed-webui` feature (include_dir over
       # webui/dist) compiles against a real UI build, never a stale or empty
       # directory. The all-features clippy gate below depends on this output.
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6870020 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
