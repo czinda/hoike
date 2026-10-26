@@ -3,6 +3,11 @@ mod tests {
     use ahu::*;
     use uuid::Uuid;
 
+    // The frozen CMS seal profile (detached SignedData over id-data with the
+    // content-type and message-digest signed attributes required) is pinned
+    // against independently encoded golden vectors in wire_profile.rs; the
+    // tests here cover seal trust policy and tampering behavior.
+
     fn build_test_manifest() -> Manifest {
         Manifest {
             format_version: 1,

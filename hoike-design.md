@@ -233,7 +233,10 @@ RFC 9919 §7.1 makes that a MUST, and it is the constraint that ties
 Per RFC 9919 §3.2.1, one `BasicOCSPResponse` may carry two `SingleResponse`
 elements for the same certificate, one with a SHA-1 `CertID` and one with
 SHA-256. For pre-production this is strictly better than generating two
-responses: one signature, one payload, two index records in the bundle.
+responses: one signature, one payload, two index records in the bundle —
+both records carry the same algorithm discriminator, which is a separate
+dimension from the dual-CertID alias (see `ahu-format-spec.md` §2.4.1 for
+the `(entry_key, discriminator)` ordering).
 
 Make it a per-CA switch (`certid_compat = "dual" | "sha256" | "sha1"`), default
 `dual`, and log the CertID hash algorithm on every request so operators can see
@@ -381,8 +384,10 @@ One active signer per CA, standbys warm. A lease in shared state (etcd,
 Consul, or a database row with a fencing token) is sufficient — this does not
 need Raft. If two signers briefly overlap, the failure mode is duplicate
 generations at the same epoch, which mirrors detect via the anti-rollback and
-continuity rules and refuse. Prefer a stall over a fork; make the lease
-conservative.
+continuity rules and refuse — unless the duplicate is byte-identical to the
+recorded generation (same manifest digest), which the identical-generation
+restart exception accepts as a legitimate same-epoch reload. Prefer a stall
+over a fork; make the lease conservative.
 
 ### 6.3 Gossip
 
@@ -549,6 +554,14 @@ the server's runtime.** DER in, DER out, plus the manifest schema and the epoch
 rules. If it will not build with `--no-default-features` in a constrained
 context, the boundary has leaked and the format has quietly become
 implementation-specific.
+
+The ahu wire profile is frozen as implemented: file header 0.1, CBOR manifest
+`format_version` 1 (both distinct from the 0.2 package version), detached CMS
+`id-data` seals with the `content-type` and `message-digest` signed
+attributes, and 48-byte index records with the algorithm discriminator at
+bytes 46–47 sorted by `(entry_key, discriminator)` with duplicate-pair
+rejection. Golden vectors live in `testdata/wire-profile-0.1/`; the normative
+text is `ahu-format-spec.md`.
 
 ### 10.1 Dependencies
 
