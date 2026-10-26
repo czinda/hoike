@@ -12,11 +12,16 @@ use axum::Router;
 /// Announce every CA scope in a freshly produced bundle to the gossip mesh.
 ///
 /// Parses the sealed bundle bytes to recover each scope's `producer_id`,
-/// `issuer_key_hash`, and `epoch`, plus the manifest index digest used as the
-/// generation identifier, then broadcasts one `GenerationAnnouncement` per
-/// scope. Failures are logged, never fatal — gossip is best-effort and must not
-/// break a successful signing pass. Centralized here because this is the only
-/// crate that depends on both `ahu` (to parse) and `hoike-gossip` (to send).
+/// `issuer_key_hash`, and `epoch`, then broadcasts one `GenerationAnnouncement`
+/// per scope. The generation identity is `ahu::manifest_digest` of the
+/// serialized manifest — it changes whenever any signed manifest metadata
+/// (epoch, window, continuity) changes, unlike the index digest, which only
+/// covers the index section. `bundle_url` stays `None` until a bundle
+/// retrieval route actually exists; announcing a fabricated URL would point
+/// receivers at nothing. Failures are logged, never fatal — gossip is
+/// best-effort and must not break a successful signing pass. Centralized
+/// here because this is the only crate that depends on both `ahu` (to parse)
+/// and `hoike-gossip` (to send).
 pub async fn announce_bundle_scopes(gossip: &hoike_gossip::GossipNode, bytes: &[u8]) {
     let bundle = match ahu::Bundle::from_bytes(bytes) {
         Ok(b) => b,
@@ -26,7 +31,7 @@ pub async fn announce_bundle_scopes(gossip: &hoike_gossip::GossipNode, bytes: &[
         }
     };
     let producer_id = bundle.manifest.producer_id.clone();
-    let manifest_digest = bundle.manifest.integrity.index_digest;
+    let manifest_digest = ahu::manifest_digest(&bundle.manifest_bytes);
     for scope in &bundle.manifest.ca_scopes {
         if let Err(e) = gossip
             .announce_generation(
