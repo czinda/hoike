@@ -294,13 +294,16 @@ pub fn load_authentication(
         identities.push((name.clone(), key));
     }
     // Fold the local identity in (it is always authorized for its own name);
-    // skip when an identical self-mapping is already present.
-    if let Some(s) = &signer
-        && !identities
+    // skip when an identical self-mapping is already present. Nested ifs, not
+    // a let-chain: the workspace floor is Rust 1.85, which cannot parse
+    // edition-2024 let-chains.
+    if let Some(s) = &signer {
+        if !identities
             .iter()
             .any(|(name, key)| name == &config.node_name && *key == s.verifying_key())
-    {
-        identities.push((config.node_name.clone(), s.verifying_key()));
+        {
+            identities.push((config.node_name.clone(), s.verifying_key()));
+        }
     }
 
     Ok((
