@@ -893,7 +893,7 @@ type = "demo"
 
     let demo_key = hoike_sign::demo_ecdsa_p256_key();
     let live = hoike_server::LiveSignerState {
-        signer: tokio::sync::Mutex::new(demo_key),
+        signer: tokio::sync::Mutex::new(hoike_sign::live::LiveSignerKey::Software(demo_key)),
         responder_key_bytes: issuer_key.to_vec(),
         validity_secs: 86400,
         responder_cert_der: None,
@@ -1801,7 +1801,9 @@ async fn check_live_signers_by_ca(default_paths: bool) {
         app_state = app_state.with_live_signer_for(
             &format!("ca-{}", i + 1),
             hoike_server::LiveSignerState {
-                signer: tokio::sync::Mutex::new(key.clone()),
+                signer: tokio::sync::Mutex::new(hoike_sign::live::LiveSignerKey::Software(
+                    key.clone(),
+                )),
                 responder_key_bytes: public.clone(),
                 validity_secs: 3600,
                 responder_cert_der: None,
@@ -1877,7 +1879,7 @@ async fn configured_live_material_uses_raw_responder_key_and_refreshes_pair() {
         assert_ne!(loaded.responder_key_bytes, old_public);
         assert_eq!(
             loaded.signer.lock().await.verifying_key(),
-            key.verifying_key()
+            Some(*key.verifying_key())
         );
         old_public = public.to_vec();
     }

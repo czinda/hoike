@@ -23,7 +23,7 @@ pub struct AppState {
 }
 
 pub struct LiveSignerState {
-    pub signer: Mutex<p256::ecdsa::SigningKey>,
+    pub signer: Mutex<hoike_sign::live::LiveSignerKey>,
     pub responder_key_bytes: Vec<u8>,
     pub validity_secs: u64,
     pub responder_cert_der: Option<Vec<u8>>,

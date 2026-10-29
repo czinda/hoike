@@ -155,9 +155,109 @@ where
     ocsp_response.to_der().map_err(SignError::Der)
 }
 
-/// Validated software-key material, shared by startup and rotation.
+/// DER-encoded ECDSA signature produced by either live signer backend.
+///
+/// Both backends emit an ECDSA-Sig-Value DER SEQUENCE; this wrapper gives them
+/// one concrete `Sig` type so `sign_live_response` can be called with either.
+#[derive(Clone)]
+pub struct LiveEcdsaSignature {
+    der_bytes: Vec<u8>,
+}
+
+impl From<LiveEcdsaSignature> for Vec<u8> {
+    fn from(sig: LiveEcdsaSignature) -> Vec<u8> {
+        sig.der_bytes
+    }
+}
+
+impl signature::SignatureEncoding for LiveEcdsaSignature {
+    type Repr = Vec<u8>;
+}
+
+impl TryFrom<&[u8]> for LiveEcdsaSignature {
+    type Error = signature::Error;
+    fn try_from(bytes: &[u8]) -> std::result::Result<Self, Self::Error> {
+        Ok(LiveEcdsaSignature {
+            der_bytes: bytes.to_vec(),
+        })
+    }
+}
+
+impl AsRef<[u8]> for LiveEcdsaSignature {
+    fn as_ref(&self) -> &[u8] {
+        &self.der_bytes
+    }
+}
+
+impl SignatureBitStringEncoding for LiveEcdsaSignature {
+    fn to_bitstring(&self) -> der::Result<der::asn1::BitString> {
+        der::asn1::BitString::from_bytes(&self.der_bytes)
+    }
+}
+
+/// On-demand signer backing: a software P-256 key or a PKCS#11 HSM key.
+///
+/// The enum implements the exact trait set `sign_live_response` requires, so
+/// `nonce_policy = "live"` works with `[ca.signing_key] type = "pkcs11"` —
+/// the same HSM keys the pre-signed batch path uses.
+pub enum LiveSignerKey {
+    Software(p256::ecdsa::SigningKey),
+    #[cfg(feature = "pkcs11")]
+    Pkcs11(crate::pkcs11::Pkcs11SignerBridge),
+}
+
+impl LiveSignerKey {
+    /// The verifying key, when the backing key is software.
+    ///
+    /// `None` for HSM-backed keys — the private key never leaves the module,
+    /// so callers verify key identity by signing (see `load_live_material`).
+    pub fn verifying_key(&self) -> Option<p256::ecdsa::VerifyingKey> {
+        match self {
+            Self::Software(key) => Some(*key.verifying_key()),
+            #[cfg(feature = "pkcs11")]
+            Self::Pkcs11(_) => None,
+        }
+    }
+}
+
+impl signature::Signer<LiveEcdsaSignature> for LiveSignerKey {
+    fn try_sign(&self, msg: &[u8]) -> std::result::Result<LiveEcdsaSignature, signature::Error> {
+        match self {
+            Self::Software(key) => {
+                let sig: p256::ecdsa::DerSignature = key.try_sign(msg)?;
+                Ok(LiveEcdsaSignature {
+                    der_bytes: signature::SignatureEncoding::to_vec(&sig),
+                })
+            }
+            #[cfg(feature = "pkcs11")]
+            Self::Pkcs11(bridge) => {
+                let sig: crate::pkcs11::Pkcs11EcdsaSignature = bridge.try_sign(msg)?;
+                Ok(LiveEcdsaSignature {
+                    der_bytes: sig.into(),
+                })
+            }
+        }
+    }
+}
+
+impl DynSignatureAlgorithmIdentifier for LiveSignerKey {
+    fn signature_algorithm_identifier(&self) -> spki::Result<spki::AlgorithmIdentifierOwned> {
+        match self {
+            // Delegate so each backend keeps its exact current encoding.
+            Self::Software(key) => {
+                DynSignatureAlgorithmIdentifier::signature_algorithm_identifier(key)
+            }
+            #[cfg(feature = "pkcs11")]
+            Self::Pkcs11(bridge) => {
+                DynSignatureAlgorithmIdentifier::signature_algorithm_identifier(bridge)
+            }
+        }
+    }
+}
+
+/// Validated signing material, shared by startup and rotation.
 pub struct LiveSigningMaterial {
-    pub key: p256::ecdsa::SigningKey,
+    pub key: LiveSignerKey,
     pub responder_key_bytes: Vec<u8>,
     pub responder_cert_der: Option<Vec<u8>>,
 }
@@ -168,10 +268,22 @@ pub fn load_live_material(
     use hoike_core::config::SigningKeyConfig;
     let key = match &ca.signing_key {
         Some(SigningKeyConfig::File { path }) => {
-            crate::load_ecdsa_p256_key(path).map_err(|e| e.to_string())?
+            LiveSignerKey::Software(crate::load_ecdsa_p256_key(path).map_err(|e| e.to_string())?)
         }
-        Some(SigningKeyConfig::Demo) => crate::demo_ecdsa_p256_key(),
-        _ => return Err("live signing requires an ECDSA file or explicit demo key".into()),
+        Some(SigningKeyConfig::Demo) => LiveSignerKey::Software(crate::demo_ecdsa_p256_key()),
+        #[cfg(feature = "pkcs11")]
+        Some(SigningKeyConfig::Pkcs11 { .. }) => {
+            let pkcs11_config = crate::orchestrate::resolve_pkcs11_config(ca)?;
+            let signer = crate::Pkcs11Signer::new(&pkcs11_config).map_err(|e| e.to_string())?;
+            LiveSignerKey::Pkcs11(crate::Pkcs11SignerBridge::new(signer))
+        }
+        _ => {
+            return Err(
+                "live signing requires an ECDSA file, PKCS#11 key (pkcs11 feature), \
+                 or explicit demo key"
+                    .into(),
+            );
+        }
     };
     let cert_der = crate::orchestrate::load_responder_cert(ca)?;
     let responder_key_bytes = if let Some(bytes) = &cert_der {
@@ -205,8 +317,19 @@ pub fn load_live_material(
             .ok_or_else(|| "responder public key has unused bits".to_string())?;
         let certificate_key =
             p256::ecdsa::VerifyingKey::from_sec1_bytes(bytes).map_err(|e| e.to_string())?;
-        if certificate_key != *key.verifying_key() {
-            return Err("live signing key does not match responder certificate".into());
+        match &key {
+            LiveSignerKey::Software(software_key) => {
+                if certificate_key != *software_key.verifying_key() {
+                    return Err("live signing key does not match responder certificate".into());
+                }
+            }
+            // An HSM key has no extractable verifying key: prove the match by
+            // signing a preflight message and verifying it with the cert's
+            // public key.
+            #[cfg(feature = "pkcs11")]
+            LiveSignerKey::Pkcs11(_) => {
+                verify_hsm_key_matches(&key, &certificate_key)?;
+            }
         }
         bytes.to_vec()
     } else {
@@ -214,8 +337,18 @@ pub fn load_live_material(
         if !matches!(ca.signing_key, Some(SigningKeyConfig::Demo)) {
             let issuer_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&bytes)
                 .map_err(|e| format!("CA-direct issuer key: {e}"))?;
-            if issuer_key != *key.verifying_key() {
-                return Err("CA-direct signing key does not match issuer key".into());
+            match &key {
+                LiveSignerKey::Software(software_key) => {
+                    if issuer_key != *software_key.verifying_key() {
+                        return Err("CA-direct signing key does not match issuer key".into());
+                    }
+                }
+                #[cfg(feature = "pkcs11")]
+                LiveSignerKey::Pkcs11(_) => {
+                    verify_hsm_key_matches(&key, &issuer_key).map_err(|_| {
+                        "CA-direct signing key does not match issuer key".to_string()
+                    })?;
+                }
             }
         }
         bytes
@@ -225,6 +358,31 @@ pub fn load_live_material(
         responder_key_bytes,
         responder_cert_der: cert_der,
     })
+}
+
+/// Prove an HSM-backed live signing key matches a known public key.
+///
+/// The private key never leaves the HSM, so the software-key equality check is
+/// impossible. Instead, sign a fixed preflight message through the same
+/// `Signer` path live signing uses and verify the signature with the public
+/// key — a mismatch fails exactly like the software path would.
+#[cfg(feature = "pkcs11")]
+fn verify_hsm_key_matches(
+    key: &LiveSignerKey,
+    public_key: &p256::ecdsa::VerifyingKey,
+) -> std::result::Result<(), String> {
+    use signature::{Signer as _, Verifier as _};
+
+    const PREFLIGHT_MESSAGE: &[u8] = b"hoike live-signing material preflight";
+
+    let signature: LiveEcdsaSignature = key
+        .try_sign(PREFLIGHT_MESSAGE)
+        .map_err(|e| format!("HSM preflight signing failed: {e}"))?;
+    let der_signature = p256::ecdsa::DerSignature::from_bytes(signature.as_ref())
+        .map_err(|e| format!("HSM preflight signature parse: {e}"))?;
+    public_key
+        .verify(PREFLIGHT_MESSAGE, &der_signature)
+        .map_err(|_| "live signing key does not match responder certificate".to_string())
 }
 
 /// Status and authenticated freshness from exactly one matching SingleResponse.
@@ -314,6 +472,61 @@ mod tests {
 
     fn test_key() -> SigningKey {
         SigningKey::from_bytes((&[1u8; 32]).into()).unwrap()
+    }
+
+    #[test]
+    fn live_signer_key_software_signs_verifiable_der() {
+        use signature::{Signer as _, Verifier as _};
+
+        let software_key = test_key();
+        let live_key = LiveSignerKey::Software(software_key.clone());
+        let message = b"hoike live signer key test";
+
+        let signature: LiveEcdsaSignature = live_key.try_sign(message).unwrap();
+        let der_signature = p256::ecdsa::DerSignature::from_bytes(signature.as_ref()).unwrap();
+        software_key
+            .verifying_key()
+            .verify(message, &der_signature)
+            .expect("LiveSignerKey software path must produce a verifiable DER signature");
+    }
+
+    #[test]
+    fn sign_live_response_with_live_signer_key() {
+        let sha256_oid = const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+        let cert_id = CertId {
+            hash_algorithm: spki::AlgorithmIdentifierOwned {
+                oid: sha256_oid,
+                parameters: Some(der::asn1::Null.into()),
+            },
+            issuer_name_hash: OctetString::new(vec![0xAA; 32]).unwrap(),
+            issuer_key_hash: OctetString::new(vec![0xBB; 32]).unwrap(),
+            serial_number: x509_cert::serial_number::SerialNumber::new(&[7u8]).unwrap(),
+        };
+        let cert_id_der = cert_id.to_der().unwrap();
+        let nonce = vec![0x42; 16];
+
+        let mut live_key = LiveSignerKey::Software(test_key());
+        let resp_der = sign_live_response::<LiveSignerKey, LiveEcdsaSignature>(
+            &cert_id_der,
+            LiveCertStatus::Good,
+            &nonce,
+            &[0xBB; 32],
+            &mut live_key,
+            1700000000,
+            86400,
+            None,
+        )
+        .unwrap();
+
+        let resp = OcspResponse::from_der(&resp_der).unwrap();
+        assert_eq!(
+            resp.response_status,
+            x509_ocsp::OcspResponseStatus::Successful
+        );
+        let basic =
+            BasicOcspResponse::from_der(resp.response_bytes.unwrap().response.as_bytes()).unwrap();
+        let resp_nonce = basic.nonce().expect("response should contain nonce");
+        assert_eq!(resp_nonce.0.as_bytes(), &nonce);
     }
 
     #[test]

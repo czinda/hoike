@@ -163,7 +163,7 @@ async fn process_request_inner(
                                 .as_secs();
                             match hoike_sign::live::sign_live_response_with_window::<
                                 _,
-                                p256::ecdsa::DerSignature,
+                                hoike_sign::live::LiveEcdsaSignature,
                             >(
                                 &cert_id.certid_der,
                                 source.status,
