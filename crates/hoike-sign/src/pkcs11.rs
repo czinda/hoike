@@ -112,12 +112,24 @@ impl Pkcs11Signer {
             .open_ro_session(slot)
             .map_err(|e| SignError::Pkcs11(format!("open session: {e}")))?;
 
+        // C_Login is token-wide: only one user login may be active per token
+        // at a time. A process that instantiates several PKCS#11 signers for
+        // the same token (batch + live-nonce paths) sees
+        // CKR_USER_ALREADY_LOGGED_IN on every login after the first — the
+        // token is already in exactly the state this signer wants, so treat
+        // it as success.
         session
             .login(
                 UserType::User,
                 Some(&AuthPin::new(config.pin.clone().into())),
             )
-            .map_err(|e| SignError::Pkcs11(format!("login: {e}")))?;
+            .or_else(|e| match e {
+                cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::UserAlreadyLoggedIn,
+                    _,
+                ) => Ok(()),
+                e => Err(SignError::Pkcs11(format!("login: {e}"))),
+            })?;
 
         let key_handle = find_key(&session, config)?;
 
@@ -266,12 +278,24 @@ impl Pkcs11MlDsaSigner {
             .open_ro_session(slot)
             .map_err(|e| SignError::Pkcs11(format!("open session: {e}")))?;
 
+        // C_Login is token-wide: only one user login may be active per token
+        // at a time. A process that instantiates several PKCS#11 signers for
+        // the same token (batch + live-nonce paths) sees
+        // CKR_USER_ALREADY_LOGGED_IN on every login after the first — the
+        // token is already in exactly the state this signer wants, so treat
+        // it as success.
         session
             .login(
                 UserType::User,
                 Some(&AuthPin::new(config.pin.clone().into())),
             )
-            .map_err(|e| SignError::Pkcs11(format!("login: {e}")))?;
+            .or_else(|e| match e {
+                cryptoki::error::Error::Pkcs11(
+                    cryptoki::error::RvError::UserAlreadyLoggedIn,
+                    _,
+                ) => Ok(()),
+                e => Err(SignError::Pkcs11(format!("login: {e}"))),
+            })?;
 
         let key_handle = find_ml_dsa_key(&session, config, parameter_set)?;
 
