@@ -253,6 +253,45 @@ async fn process_request_inner(
             (ocsp_success_response(&result), ca, status)
         }
         None => {
+            // Authoritative-complete live path: when the matching scope sees
+            // the full certificate population, a serial with no entry is
+            // provably never-issued — RFC 6960 certStatus `unknown`, signed
+            // on demand with the delegated responder key rather than the
+            // unsigned `unauthorized` a partial scope must fall back to.
+            if has_nonce {
+                if let Some((ca, authoritative)) = state.responder.scope_for_certid(cert_id) {
+                    if authoritative {
+                        if let Some(live) = state.live_signer_for(&ca) {
+                            let nonce_bytes = parsed.nonce.as_ref().unwrap();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            match hoike_sign::live::sign_live_response::<
+                                _,
+                                hoike_sign::live::LiveEcdsaSignature,
+                            >(
+                                &cert_id.certid_der,
+                                hoike_sign::live::LiveCertStatus::Unknown,
+                                nonce_bytes,
+                                &live.responder_key_bytes,
+                                &mut *live.signer.lock().await,
+                                now,
+                                live.validity_secs,
+                                live.responder_cert_der.as_deref(),
+                            ) {
+                                Ok(response_der) => {
+                                    crate::obs::record_nonce(&ca, "live", "live");
+                                    return (live_response(&response_der), ca, "unknown");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "live unknown signing failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             debug!(
                 entry_key = hex::encode(cert_id.entry_key),
                 serial = hex::encode(&cert_id.serial_number),
