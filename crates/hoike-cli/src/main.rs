@@ -435,6 +435,31 @@ async fn run_server(config_path: PathBuf) {
                 run_signer_loop(signer_state, signer_config, ctx, signer_gossip).await;
             });
         }
+    } else {
+        // Serving-only modes (edge/enclave) never run the signer loop, but
+        // their bundle directory is still live — the signer publishes each
+        // new generation to it (shared transfer volume). Pull-on-announce
+        // over gossip is future work, so poll: hot-reload the router on an
+        // interval. `reload()` re-reads the bundle dir with anti-rollback
+        // checks and is a no-op-safe swap when nothing changed.
+        let edge_state = app_state.responder.clone();
+        tokio::spawn(async move {
+            let interval = std::env::var("HOIKE_RELOAD_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(15);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                if let Err(e) = edge_state.reload() {
+                    hoike_server::obs::record_bundle_load_failure(
+                        "all",
+                        hoike_server::obs::load_failure_reason(&e),
+                    );
+                    warn!(error = %e, "edge bundle reload failed; serving previous generation");
+                }
+            }
+        });
     }
 
     // The recorder was installed earlier (before the initial load). If
