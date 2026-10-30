@@ -424,6 +424,14 @@ impl DogtagSyncSource {
         if result.rc == 4096 {
             return Err(SignError::Config("syncRefreshRequired".into()));
         }
+        if result.rc == 12 {
+            // unavailableCriticalExtension: this directory does not implement
+            // RFC 4533 (389 DS, the Dogtag backend, uses a private replication
+            // protocol and never advertises the Sync Request control). Fall
+            // back to rebuilding the checkpoint from a full plain search.
+            let _ = conn.unbind();
+            return Self::do_full_poll(config, staged.binding);
+        }
         let result = result
             .success()
             .map_err(|e| SignError::Config(format!("LDAP search completion: {e}")))?;
@@ -442,6 +450,56 @@ impl DogtagSyncSource {
             staged.cookie = done.cookie;
         }
         staged.finish(&present, done.refresh_deletes)?;
+        let _ = conn.unbind();
+        Ok(staged)
+    }
+
+    /// Rebuild a checkpoint from a full plain search, for directories that do
+    /// not implement RFC 4533.
+    ///
+    /// The Sync Request control is the efficient path (server cookies, delta
+    /// refreshes). When the directory cannot serve it — 389 DS never
+    /// advertises the control — every batch interval instead reads the whole
+    /// certificate repository and rebuilds the record set from scratch.
+    /// Reading the full population keeps the source authoritative-complete:
+    /// `good`, `revoked`, and `unknown` are all answered from this view, and
+    /// revocations are reflected within one batch interval as before. The
+    /// cost is a full poll per batch, which is negligible at lab scale.
+    /// Records are keyed by certificate serial (unique per CA, checked by
+    /// `Checkpoint::finish`) since no sync UUIDs are available.
+    fn do_full_poll(config: &DogtagSyncConfig, binding: String) -> Result<Checkpoint> {
+        let mut conn = connect(&config.ldap_url, &config.tls, config.ca_cert.as_deref())?;
+        conn.simple_bind(&config.bind_dn, &config.bind_password)
+            .map_err(|e| SignError::Config(format!("LDAP bind: {e}")))?
+            .success()
+            .map_err(|e| SignError::Config(format!("LDAP bind: {e}")))?;
+        let (entries, _refs) = conn
+            .search(
+                &config.base_dn,
+                Scope::Subtree,
+                &config.filter,
+                DogtagSyncConfig::attrs(),
+            )
+            .map_err(|e| SignError::Config(format!("LDAP search: {e}")))?
+            .success()
+            .map_err(|e| SignError::Config(format!("LDAP search: {e}")))?;
+        let mut staged = Checkpoint {
+            version: 1,
+            binding,
+            cookie: None,
+            records: BTreeMap::new(),
+            complete: false,
+        };
+        let mut present = std::collections::BTreeSet::new();
+        for entry in entries {
+            let search_entry = SearchEntry::construct(entry);
+            if let Some(record) = parse_cert_entry(&search_entry)? {
+                let id = hex::encode(&record.serial);
+                present.insert(id.clone());
+                staged.records.insert(id, record);
+            }
+        }
+        staged.finish(&present, false)?;
         let _ = conn.unbind();
         Ok(staged)
     }
