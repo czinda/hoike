@@ -595,8 +595,11 @@ fn parse_cert_entry(entry: &SearchEntry) -> Result<Option<StoredRecord>> {
             }));
         }
         "REVOKED" | "REVOKED_EXPIRED" => {
+            // Dogtag's certificateRepository stores revokedOn in
+            // GeneralizedTime ("20261030173328Z"); tolerate a bare epoch
+            // integer as well.
             let time = attr("revokedOn")
-                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(|s| s.parse::<u64>().ok().or_else(|| parse_generalized_time(s)))
                 .ok_or_else(|| SignError::Config("missing or invalid revocation time".into()))?
                 / 1000;
             let reason = attr("revReason")
