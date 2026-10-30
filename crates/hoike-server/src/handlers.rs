@@ -258,8 +258,12 @@ async fn process_request_inner(
             // provably never-issued — RFC 6960 certStatus `unknown`, signed
             // on demand with the delegated responder key rather than the
             // unsigned `unauthorized` a partial scope must fall back to.
+            // On nodes without a live signer (edges), forward the nonce
+            // request to the scope's signer, which synthesizes it.
             if has_nonce {
-                if let Some((ca, authoritative)) = state.responder.scope_for_certid(cert_id) {
+                if let Some((ca, authoritative, forward_to)) =
+                    state.responder.scope_for_certid(cert_id)
+                {
                     if authoritative {
                         if let Some(live) = state.live_signer_for(&ca) {
                             let nonce_bytes = parsed.nonce.as_ref().unwrap();
@@ -287,6 +291,24 @@ async fn process_request_inner(
                                 Err(e) => {
                                     warn!(error = %e, "live unknown signing failed");
                                 }
+                            }
+                        } else if let Some(url) = forward_to {
+                            // Edge node: no live signer here — forward the
+                            // nonce request to the scope's signer, which
+                            // synthesizes the signed unknown.
+                            if let Some(client) = state.forward_client_for(&ca) {
+                                let insecure = state
+                                    .admin
+                                    .config
+                                    .ca
+                                    .iter()
+                                    .find(|c| c.label == ca)
+                                    .is_some_and(|c| c.forward_insecure);
+                                return (
+                                    forward_request(client, &url, der_bytes, insecure).await,
+                                    ca,
+                                    "forwarded",
+                                );
                             }
                         }
                     }

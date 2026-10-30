@@ -160,11 +160,15 @@ impl ResponderState {
 
     /// Resolve the CA scope a CertID routes to, without requiring an entry.
     ///
-    /// Returns `(ca_label, is_authoritative_complete)` for the first scope
-    /// matching the CertID's issuer hashes. Used by the serving path to
-    /// decide whether a serial with no stored entry is provably
-    /// never-issued (`unknown`) rather than out-of-scope (`unauthorized`).
-    pub fn scope_for_certid(&self, cert_id: &ParsedCertId) -> Option<(String, bool)> {
+    /// Returns `(ca_label, is_authoritative_complete, forward_to)` for the
+    /// first scope matching the CertID's issuer hashes. Used by the serving
+    /// path to decide whether a serial with no stored entry is provably
+    /// never-issued (`unknown`) rather than out-of-scope (`unauthorized`),
+    /// and where to forward a nonce-bearing request for it.
+    pub fn scope_for_certid(
+        &self,
+        cert_id: &ParsedCertId,
+    ) -> Option<(String, bool, Option<String>)> {
         let map = self.scope_map.load();
         let key = (
             cert_id.issuer_name_hash.clone(),
@@ -173,7 +177,11 @@ impl ResponderState {
         let entries = map.entries.get(&key)?;
         entries.first().map(|entry| {
             let authoritative = entry.completeness == "authoritative-complete";
-            (entry.ca_label.clone(), authoritative)
+            (
+                entry.ca_label.clone(),
+                authoritative,
+                entry.forward_to.clone(),
+            )
         })
     }
 
