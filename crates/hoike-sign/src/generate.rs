@@ -770,9 +770,9 @@ mod tests {
             certid_compat: CertIdCompat::Sha256Only,
             ..Default::default()
         };
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -812,9 +812,9 @@ mod tests {
             archive_cutoff_secs: 10,
             ..Default::default()
         };
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -848,8 +848,8 @@ mod tests {
             certid_compat: CertIdCompat::Sha256Only, // one index entry per certificate
             ..Default::default()                     // archive_cutoff_secs = 0
         };
-        let mut key = test_signing_key();
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -870,9 +870,9 @@ mod tests {
             certid_compat: CertIdCompat::Dual,
             ..Default::default()
         };
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -898,9 +898,9 @@ mod tests {
             certid_compat: CertIdCompat::Sha256Only,
             ..Default::default()
         };
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -966,9 +966,9 @@ mod tests {
             bucket_size: 5,
             ..Default::default()
         };
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -996,9 +996,9 @@ mod tests {
             bucket_size: 5,
             ..Default::default()
         };
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
@@ -1040,7 +1040,7 @@ mod tests {
     fn batching_reduces_data_size() {
         let ca = test_ca();
         let snapshot = large_snapshot(50);
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
 
         // Unbatched
         let config_1 = GenerationConfig {
@@ -1048,7 +1048,7 @@ mod tests {
             bucket_size: 1,
             ..Default::default()
         };
-        let unbatched = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let unbatched = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config_1,
@@ -1064,7 +1064,7 @@ mod tests {
             bucket_size: 10,
             ..Default::default()
         };
-        let batched = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let batched = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config_10,
@@ -1092,11 +1092,11 @@ mod tests {
             ..Default::default()
         };
 
-        let mut ecdsa_signer = test_signing_key();
+        let mut ecdsa_signer = crate::EcdsaP256Signer::new(test_signing_key());
         let mut ml_dsa_signer = crate::ml_dsa_87_signer(&[42u8; 32]);
 
         let bundle_bytes =
-            produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, crate::MlDsaSignatureBytes>(
+            produce_dual_bundle::<_, crate::EcdsaSignatureBytes, _, crate::MlDsaSignatureBytes>(
                 &ca,
                 &snapshot,
                 &config,
@@ -1127,11 +1127,11 @@ mod tests {
             ..Default::default()
         };
 
-        let mut ecdsa_signer = test_signing_key();
+        let mut ecdsa_signer = crate::EcdsaP256Signer::new(test_signing_key());
         let mut ml_dsa_signer = crate::ml_dsa_87_signer(&[7u8; 32]);
 
         let bundle_bytes =
-            produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, crate::MlDsaSignatureBytes>(
+            produce_dual_bundle::<_, crate::EcdsaSignatureBytes, _, crate::MlDsaSignatureBytes>(
                 &ca,
                 &snapshot,
                 &config,
@@ -1176,8 +1176,8 @@ mod tests {
             jitter_secs: u64::MAX,
             ..Default::default()
         };
-        let mut key = test_signing_key();
-        let bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
+        let bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &test_ca(),
             &snapshot,
             &config,
@@ -1206,9 +1206,9 @@ mod tests {
         let mut snapshot = test_snapshot();
         snapshot.this_update = 1;
         snapshot.next_update = Some(2);
-        let mut key = test_signing_key();
+        let mut key = crate::EcdsaP256Signer::new(test_signing_key());
         assert!(
-            produce_bundle::<_, p256::ecdsa::DerSignature>(
+            produce_bundle::<_, crate::EcdsaSignatureBytes>(
                 &test_ca(),
                 &snapshot,
                 &GenerationConfig::default(),

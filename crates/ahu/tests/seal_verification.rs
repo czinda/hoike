@@ -54,7 +54,7 @@ mod tests {
     fn seal_created_by_hoike_sign_verifies_in_ahu() {
         // Create a seal using hoike-sign
         let secret = [7u8; 32];
-        let signing_key = p256_v013::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
+        let signing_key = p256::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
         let seal_cert_der = hoike_sign::generate_seal_cert_for_key(
             &hoike_sign::SealKey::EcdsaP256(signing_key.clone()),
         )
@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn tampered_manifest_fails_seal_verification() {
         let secret = [7u8; 32];
-        let signing_key = p256_v013::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
+        let signing_key = p256::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
         let seal_cert_der = hoike_sign::generate_seal_cert_for_key(
             &hoike_sign::SealKey::EcdsaP256(signing_key.clone()),
         )
@@ -135,12 +135,12 @@ mod tests {
     // Synthetic certificates: root and leaf share a test DN, but distinct keys.
     // Re-signing explicitly exercises issuer signature validation rather than DN matching.
     fn issued_cert(
-        subject_key: &p256_v013::ecdsa::SigningKey,
-        issuer_key: &p256_v013::ecdsa::SigningKey,
+        subject_key: &p256::ecdsa::SigningKey,
+        issuer_key: &p256::ecdsa::SigningKey,
         ca: bool,
     ) -> Vec<u8> {
         use der::{Decode, Encode};
-        use p256_v013::ecdsa::signature::Signer;
+        use p256::ecdsa::signature::Signer;
         let original = hoike_sign::generate_seal_cert(subject_key).unwrap();
         let cert = x509_cert::Certificate::from_der(&original).unwrap();
         let tbs_der = cert.tbs_certificate().to_der().unwrap();
@@ -153,7 +153,7 @@ mod tests {
             tbs.extend(wrap(0xa3, &wrap(0x30, &wrap(0x30, &extension))));
         }
         let tbs = wrap(0x30, &tbs);
-        let signature: p256_v013::ecdsa::Signature = issuer_key.sign(&tbs);
+        let signature: p256::ecdsa::Signature = issuer_key.sign(&tbs);
         let mut output = tbs;
         output.extend(cert.signature_algorithm().to_der().unwrap());
         let mut bits = vec![0];
@@ -164,9 +164,9 @@ mod tests {
 
     #[test]
     fn authenticates_direct_issuer_and_rejects_wrong_anchor_and_expiry() {
-        let root = p256_v013::ecdsa::SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
-        let leaf = p256_v013::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
-        let other = p256_v013::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+        let root = p256::ecdsa::SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let leaf = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let other = p256::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
         let anchor = issued_cert(&root, &root, true);
         let cert = issued_cert(&leaf, &root, false);
         let seal =
@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     fn mismatched_embedded_key_is_an_error_not_false_success() {
-        let key = p256_v013::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
-        let wrong = p256_v013::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+        let key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let wrong = p256::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
         let cert = hoike_sign::generate_seal_cert(&wrong).unwrap();
         let seal =
             hoike_sign::create_cms_seal(b"manifest", &hoike_sign::SealKey::EcdsaP256(key), &cert)
@@ -199,8 +199,8 @@ mod tests {
     }
     #[test]
     fn explicit_pin_accepts_demo_cert_but_does_not_trust_another_key() {
-        let key = p256_v013::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
-        let other = p256_v013::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+        let key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let other = p256::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
         let cert = hoike_sign::generate_seal_cert(&key).unwrap();
         let wrong = hoike_sign::generate_seal_cert(&other).unwrap();
         let seal =
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn delta_materialization_supports_a_real_cms_sealing_callback() {
-        let key = p256_v013::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+        let key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
         let cert = hoike_sign::generate_seal_cert(&key).unwrap();
         let seal_key = hoike_sign::SealKey::EcdsaP256(key);
         let mut builder = BundleBuilder::new(build_test_manifest());

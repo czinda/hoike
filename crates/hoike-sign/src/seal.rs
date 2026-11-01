@@ -15,7 +15,6 @@ use cms::signed_data::{
 use der_v08::asn1::{ObjectIdentifier, OctetString, SetOfVec};
 use der_v08::{Any, Decode, Encode};
 use sha2::{Digest, Sha256};
-use signature::Verifier as _;
 use tracing::warn;
 use x509_cert_v03::attr::{Attribute, AttributeValue, Attributes};
 use x509_cert_v03::certificate::Certificate;
@@ -324,6 +323,8 @@ where
             "seal/OCSP key separation signature is not valid DER ECDSA: {e}"
         ))
     })?;
+    // ecdsa 0.17 verifies via signature v3.
+    use p256::ecdsa::signature::Verifier;
     if seal_verifying
         .verify(SEAL_OCSP_KEY_SEPARATION_MESSAGE, &der_sig)
         .is_ok()
@@ -379,8 +380,18 @@ pub fn generate_seal_cert(signing_key: &p256::ecdsa::SigningKey) -> Result<Vec<u
 /// construction, so the demo signing path can never trip — or silently
 /// satisfy — the OCSP/seal key-separation proof.
 pub fn demo_ephemeral_seal_key() -> p256::ecdsa::SigningKey {
-    use rand_core::OsRng;
-    p256::ecdsa::SigningKey::random(&mut OsRng)
+    // The p256 0.14 line draws randomness from rand_core 0.10, which is not
+    // the rand_core hoike-sign depends on — pull raw OS entropy here and
+    // construct the key from a secret scalar, rejecting the (negligible)
+    // zero-scalar case exactly like `Generate::try_generate_from_rng` does.
+    use rand_core::{OsRng, RngCore};
+    loop {
+        let mut bytes = p256::FieldBytes::default();
+        OsRng.fill_bytes(&mut bytes);
+        if let Ok(key) = p256::ecdsa::SigningKey::from_bytes(&bytes) {
+            return key;
+        }
+    }
 }
 
 /// Resolve seal material under the shared F07 policy — the single source of

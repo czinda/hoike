@@ -18,8 +18,8 @@ const-oid = { version = "0.9", features = ["db"] }
 spki = { version = "0.7", features = ["alloc", "std"] }
 
 # Signing (0.10/2.x generation matching x509-ocsp builder)
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+ecdsa = { version = "0.17", features = ["der"] }
 signature = "2"
 digest = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["oid"] }

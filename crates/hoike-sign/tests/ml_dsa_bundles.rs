@@ -188,8 +188,10 @@ fn ml_dsa_65_larger_than_ecdsa() {
 
     // ECDSA bundle
     let secret = [1u8; 32];
-    let mut ecdsa_key = p256::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap();
-    let ecdsa_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+    let mut ecdsa_key = hoike_sign::EcdsaP256Signer::new(
+        p256::ecdsa::SigningKey::from_bytes((&secret).into()).unwrap(),
+    );
+    let ecdsa_bytes = produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
         &ca,
         &snapshot,
         &config,

@@ -224,9 +224,13 @@ impl signature::Signer<LiveEcdsaSignature> for LiveSignerKey {
     fn try_sign(&self, msg: &[u8]) -> std::result::Result<LiveEcdsaSignature, signature::Error> {
         match self {
             Self::Software(key) => {
-                let sig: p256::ecdsa::DerSignature = key.try_sign(msg)?;
+                // ecdsa 0.17 signs via signature v3; bridge to the v2 world.
+                use p256::ecdsa::signature::Signer as SignerV3;
+                let sig: p256::ecdsa::Signature =
+                    SignerV3::try_sign(key, msg).map_err(|_| signature::Error::new())?;
+                let der = sig.to_der();
                 Ok(LiveEcdsaSignature {
-                    der_bytes: signature::SignatureEncoding::to_vec(&sig),
+                    der_bytes: der.as_bytes().to_vec(),
                 })
             }
             #[cfg(feature = "pkcs11")]
@@ -244,9 +248,10 @@ impl DynSignatureAlgorithmIdentifier for LiveSignerKey {
     fn signature_algorithm_identifier(&self) -> spki::Result<spki::AlgorithmIdentifierOwned> {
         match self {
             // Delegate so each backend keeps its exact current encoding.
-            Self::Software(key) => {
-                DynSignatureAlgorithmIdentifier::signature_algorithm_identifier(key)
-            }
+            Self::Software(_) => Ok(spki::AlgorithmIdentifierOwned {
+                oid: const_oid::ObjectIdentifier::new_unwrap(crate::ECDSA_WITH_SHA256_OID),
+                parameters: None,
+            }),
             #[cfg(feature = "pkcs11")]
             Self::Pkcs11(bridge) => {
                 DynSignatureAlgorithmIdentifier::signature_algorithm_identifier(bridge)
@@ -371,7 +376,9 @@ fn verify_hsm_key_matches(
     key: &LiveSignerKey,
     public_key: &p256::ecdsa::VerifyingKey,
 ) -> std::result::Result<(), String> {
-    use signature::{Signer as _, Verifier as _};
+    // LiveSignerKey signs via signature v2; VerifyingKey verifies via v3.
+    use p256::ecdsa::signature::Verifier as _;
+    use signature::Signer as _;
 
     const PREFLIGHT_MESSAGE: &[u8] = b"hoike live-signing material preflight";
 
@@ -476,7 +483,8 @@ mod tests {
 
     #[test]
     fn live_signer_key_software_signs_verifiable_der() {
-        use signature::{Signer as _, Verifier as _};
+        use p256::ecdsa::signature::Verifier as _;
+        use signature::Signer as _;
 
         let software_key = test_key();
         let live_key = LiveSignerKey::Software(software_key.clone());
@@ -548,8 +556,8 @@ mod tests {
             0x0F, 0x10,
         ];
 
-        let mut key = test_key();
-        let resp_der = sign_live_response::<_, p256::ecdsa::DerSignature>(
+        let mut key = crate::EcdsaP256Signer::new(test_key());
+        let resp_der = sign_live_response::<_, crate::EcdsaSignatureBytes>(
             &cert_id_der,
             LiveCertStatus::Good,
             &nonce,
@@ -591,8 +599,8 @@ mod tests {
 
         let nonce = vec![0xAA; 16];
 
-        let mut key = test_key();
-        let resp_der = sign_live_response::<_, p256::ecdsa::DerSignature>(
+        let mut key = crate::EcdsaP256Signer::new(test_key());
+        let resp_der = sign_live_response::<_, crate::EcdsaSignatureBytes>(
             &cert_id_der,
             LiveCertStatus::Revoked {
                 revocation_time: 1699900000,
@@ -628,8 +636,8 @@ mod tests {
         };
         let cert_id_der = cert_id.to_der().unwrap();
 
-        let mut key = test_key();
-        let resp_der = sign_live_response::<_, p256::ecdsa::DerSignature>(
+        let mut key = crate::EcdsaP256Signer::new(test_key());
+        let resp_der = sign_live_response::<_, crate::EcdsaSignatureBytes>(
             &cert_id_der,
             LiveCertStatus::Good,
             &[0xFF; 16],

@@ -43,7 +43,8 @@ fn main() {
 
     let snapshot = build_snapshot(cert_count);
     let secret = [7u8; 32];
-    let mut signing_key = SigningKey::from_bytes((&secret).into()).expect("key");
+    let mut signing_key =
+        hoike_sign::EcdsaP256Signer::new(SigningKey::from_bytes((&secret).into()).expect("key"));
 
     let bucket_sizes = [1, 2, 5, 10, 25, 50, 100];
 
@@ -80,7 +81,7 @@ fn main() {
         };
 
         let start = Instant::now();
-        let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,

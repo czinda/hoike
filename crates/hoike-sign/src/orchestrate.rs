@@ -419,20 +419,21 @@ fn produce_scope_bundle(
     } else {
         match &ca_config.signing_key {
             Some(hoike_core::config::SigningKeyConfig::File { path }) => {
-                let mut signing_key =
-                    crate::load_ecdsa_p256_key(path).map_err(|e| format!("signing key: {e}"))?;
+                let mut signing_key = crate::EcdsaP256Signer::new(
+                    crate::load_ecdsa_p256_key(path).map_err(|e| format!("signing key: {e}"))?,
+                );
                 info!(ca = ca_config.label, key = %path.display(), "using file-based signing key");
                 // F07: prove the OCSP signing key is not the seal key before
                 // producing anything — the same key under different file
                 // names is still rejected.
-                crate::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
+                crate::ensure_distinct_ecdsa_seal_key::<_, crate::EcdsaSignatureBytes>(
                     &signing_key,
                     seal_key,
                 )
                 .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
                 let sk = seal_key.clone();
                 let sc = seal_cert_der.to_vec();
-                crate::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                crate::produce_bundle::<_, crate::EcdsaSignatureBytes>(
                     ca,
                     snapshot,
                     gen_config,
@@ -478,17 +479,18 @@ fn produce_scope_bundle(
             }
             Some(hoike_core::config::SigningKeyConfig::Demo) => {
                 warn!(ca = ca_config.label, "using demo signing key — NOT FOR PRODUCTION");
-                let mut signing_key = crate::demo_ecdsa_p256_key();
+                let mut signing_key =
+                    crate::EcdsaP256Signer::new(crate::demo_ecdsa_p256_key());
                 // F07: even the demo OCSP key must stay distinct from an
                 // explicitly configured seal key.
-                crate::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
+                crate::ensure_distinct_ecdsa_seal_key::<_, crate::EcdsaSignatureBytes>(
                     &signing_key,
                     seal_key,
                 )
                 .map_err(|e| format!("CA '{}': {e}", ca_config.label))?;
                 let sk = seal_key.clone();
                 let sc = seal_cert_der.to_vec();
-                crate::produce_bundle::<_, p256::ecdsa::DerSignature>(
+                crate::produce_bundle::<_, crate::EcdsaSignatureBytes>(
                     ca,
                     snapshot,
                     gen_config,

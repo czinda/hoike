@@ -125,7 +125,8 @@ impl CrlSource {
                     ));
                 }
                 use p256::pkcs8::DecodePublicKey;
-                use signature::Verifier;
+                // ecdsa 0.17 verifies via signature v3 (p256's re-export).
+                use p256::ecdsa::signature::Verifier;
                 let key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki.to_der()?)
                     .map_err(|e| SignError::Verify(format!("CRL P-256 key: {e}")))?;
                 let sig = p256::ecdsa::Signature::from_der(signature)
@@ -415,7 +416,6 @@ mod tests {
         assert!(source.snapshot(&ca).is_err());
     }
     fn authenticated_fixture() -> (CrlSource, CaIdentity) {
-        use signature::Signer;
         let key = crate::demo_ecdsa_p256_key();
         let cert_der = crate::generate_seal_cert(&key).unwrap();
         let cert = x509_cert::Certificate::from_der(&cert_der).unwrap();
@@ -440,8 +440,11 @@ mod tests {
         };
         crl.tbs_cert_list.this_update = time(now - 1);
         crl.tbs_cert_list.next_update = Some(time(now + 3600));
-        let sig: p256::ecdsa::DerSignature = key.sign(&crl.tbs_cert_list.to_der().unwrap());
-        crl.signature = der::asn1::BitString::from_bytes(sig.as_bytes()).unwrap();
+        let sig: p256::ecdsa::Signature = {
+            use p256::ecdsa::signature::Signer;
+            key.sign(&crl.tbs_cert_list.to_der().unwrap())
+        };
+        crl.signature = der::asn1::BitString::from_bytes(sig.to_der().as_bytes()).unwrap();
         (
             CrlSource::from_der(crl.to_der().unwrap())
                 .unwrap()

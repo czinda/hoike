@@ -3,7 +3,7 @@
 use ahu::{Bundle, BundleBuilder};
 use der::{Decode, Encode};
 use hoike_sign::{CertIdCompat, SealKey};
-use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
+use p256::ecdsa::{SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,8 +33,8 @@ fn certificate(key: &SigningKey, start: u64, end: u64) -> Vec<u8> {
         not_before: time(start),
         not_after: time(end),
     };
-    let sig: DerSignature = key.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(sig.as_bytes()).unwrap();
+    let sig: p256::ecdsa::Signature = key.sign(&cert.tbs_certificate.to_der().unwrap());
+    cert.signature = der::asn1::BitString::from_bytes(sig.to_der().as_bytes()).unwrap();
     cert.to_der().unwrap()
 }
 
@@ -58,7 +58,7 @@ impl Fixture {
         // Seal and OCSP keys must be distinct, even in these synthetic fixtures.
         let seal_key = key(7);
         let seal_cert = certificate(&seal_key, now - 60, now + 3600);
-        let mut ocsp_key = key(1);
+        let ocsp_key = key(1);
         let responder_cert = certificate(&ocsp_key, now - 60, now + 3600);
         let ca = hoike_sign::CaIdentity {
             label: "test".into(),
@@ -67,11 +67,7 @@ impl Fixture {
                 .unwrap()
                 .to_der()
                 .unwrap(),
-            issuer_key_bytes: ocsp_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
+            issuer_key_bytes: ocsp_key.verifying_key().to_sec1_bytes().to_vec(),
         };
         let snapshot = hoike_sign::StatusSnapshot {
             entries: [
@@ -90,11 +86,11 @@ impl Fixture {
             jitter_secs: 0,
             ..Default::default()
         };
-        let bundle = hoike_sign::produce_bundle::<_, DerSignature>(
+        let bundle = hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &generation,
-            &mut ocsp_key,
+            &mut hoike_sign::EcdsaP256Signer::new(ocsp_key),
             |m| hoike_sign::create_cms_seal(m, &SealKey::EcdsaP256(seal_key.clone()), &seal_cert),
             embed_cert.then_some(responder_cert.as_slice()),
         )

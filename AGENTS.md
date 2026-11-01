@@ -43,11 +43,21 @@ cargo run --bin hoike -- query --url http://localhost:2560 --serial 0A --issuer-
 - `x509-ocsp` 0.2.1 depends on `der` 0.7, while `ahu` uses `der` 0.8. Any crate
   that parses or constructs OCSP types must use `der` 0.7 (matching x509-ocsp).
   The `ahu` crate uses `der` 0.8 and must not directly encode/decode x509-ocsp types.
-- `ml-dsa` 0.1.1 uses `signature` v3, while `x509-ocsp` builder uses `signature` v2.
-  `hoike-sign/src/ml_dsa_bridge.rs` bridges them with a wrapper type.
+- `ml-dsa` 0.1.1 and the `p256` 0.14 / `ecdsa` 0.17 line use `signature` v3, while
+  the `x509-ocsp` builder uses `signature` v2. `hoike-sign/src/ml_dsa_bridge.rs` and
+  `hoike-sign/src/ecdsa_bridge.rs` bridge them with wrapper types: the software
+  P-256 batch path signs through `EcdsaP256Signer` / `EcdsaSignatureBytes`
+  (DER ECDSA-Sig-Value + spki 0.7 `SignatureBitStringEncoding`, algorithm
+  identifier ecdsa-with-SHA256 with no parameters — byte-identical to the
+  PKCS#11 bridge encoding).
 - `cms` 0.3.0-pre.2 uses `der` 0.8. CMS seal creation in `hoike-sign/src/seal.rs`
   bridges: signs with the `der` 0.7 key, embeds raw bytes into `der` 0.8 CMS structures.
 - `cryptoki` 0.12 is behind the `pkcs11` feature flag (links against C library).
+- Compression in the ahu format is metadata-only: the manifest carries a
+  `Compression` profile but nothing links a compression library, and admission
+  rejects compressed bundles before activation (decompression is unimplemented).
+  The workspace is on a single `p256` 0.14 / `ecdsa` 0.17 line (the old 0.13/0.16
+  line carried RUSTSEC-2026-0387 via `crypto-bigint` 0.5).
 
 ## Conventions
 

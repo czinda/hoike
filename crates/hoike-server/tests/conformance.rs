@@ -29,7 +29,7 @@ fn build_conformance_bundle() -> (Vec<u8>, Vec<u8>) {
     use hoike_sign::{
         CaIdentity, CertIdCompat, CertificateStatus, GenerationConfig, StatusSnapshot,
     };
-    use signature::Signer;
+    use p256::ecdsa::signature::Signer;
     use x509_cert::ext::pkix::CrlReason;
 
     let ca = CaIdentity {
@@ -78,7 +78,7 @@ fn build_conformance_bundle() -> (Vec<u8>, Vec<u8>) {
         bucket_size: 1,
     };
 
-    let mut key = signing_key();
+    let key = signing_key();
     // Independent, current seal certificate provisioned as a pin at the edge.
     let seal_key = p256::ecdsa::SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
     let mut cert =
@@ -95,15 +95,17 @@ fn build_conformance_bundle() -> (Vec<u8>, Vec<u8>) {
         not_before: time(now - 60),
         not_after: time(now + 86400),
     };
-    let signature: p256::ecdsa::DerSignature =
-        seal_key.sign(&cert.tbs_certificate.to_der().unwrap());
+    let signature = {
+        let sig: p256::ecdsa::Signature = seal_key.sign(&cert.tbs_certificate.to_der().unwrap());
+        sig.to_der()
+    };
     cert.signature = der::asn1::BitString::from_bytes(signature.as_bytes()).unwrap();
     let cert = cert.to_der().unwrap();
-    let bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+    let bytes = hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
         &ca,
         &snapshot,
         &config,
-        &mut key,
+        &mut hoike_sign::EcdsaP256Signer::new(key),
         |m| hoike_sign::create_cms_seal(m, &hoike_sign::SealKey::EcdsaP256(seal_key), &cert),
         None,
     )

@@ -73,7 +73,8 @@ fn extract_public_key(basic: &BasicOcspResponse) -> Result<Vec<u8>> {
 
 fn verify_ecdsa_p256(tbs_der: &[u8], sig_bytes: &[u8], pub_key_bytes: &[u8]) -> Result<()> {
     use p256::ecdsa::{DerSignature, VerifyingKey};
-    use signature::Verifier;
+    // ecdsa 0.17 verifies via signature v3 (p256's re-export).
+    use p256::ecdsa::signature::Verifier;
 
     let vk = VerifyingKey::from_sec1_bytes(pub_key_bytes)
         .map_err(|e| SignError::Verify(format!("invalid P-256 public key: {e}")))?;
@@ -121,7 +122,7 @@ mod tests {
         };
         use std::collections::BTreeMap;
 
-        let mut signer = demo_ecdsa_p256_key();
+        let signer = demo_ecdsa_p256_key();
         let seal_key = crate::SealKey::EcdsaP256(demo_ecdsa_p256_key());
         let seal_cert = crate::generate_seal_cert_for_key(&seal_key).unwrap();
         let responder_cert = crate::generate_seal_cert(&signer).unwrap();
@@ -148,11 +149,11 @@ mod tests {
             ..Default::default()
         };
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
-            &mut signer,
+            &mut crate::EcdsaP256Signer::new(signer),
             |m| crate::create_cms_seal(m, &seal_key, &seal_cert),
             Some(&responder_cert),
         )
@@ -225,7 +226,7 @@ mod tests {
         };
         use std::collections::BTreeMap;
 
-        let mut signer = demo_ecdsa_p256_key();
+        let signer = demo_ecdsa_p256_key();
         let seal_key = crate::SealKey::EcdsaP256(demo_ecdsa_p256_key());
         let seal_cert = crate::generate_seal_cert_for_key(&seal_key).unwrap();
 
@@ -249,11 +250,11 @@ mod tests {
             ..Default::default()
         };
 
-        let bundle_bytes = produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bundle_bytes = produce_bundle::<_, crate::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &config,
-            &mut signer,
+            &mut crate::EcdsaP256Signer::new(signer),
             |m| crate::create_cms_seal(m, &seal_key, &seal_cert),
             None,
         )

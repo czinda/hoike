@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use der::{Decode, Encode};
 use sha2::{Digest, Sha256};
-use signature::Signer;
+use p256::ecdsa::signature::Signer;
 use tower::ServiceExt;
 
 fn current_time() -> u64 {
@@ -93,9 +93,10 @@ fn issue(
         });
     }
     cert.tbs_certificate.extensions = Some(exts);
-    let signature: p256::ecdsa::DerSignature =
+    let signature: p256::ecdsa::Signature =
         issuer_key.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(signature.as_bytes()).unwrap();
+    cert.signature =
+        der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
     cert.to_der().unwrap()
 }
 
@@ -466,9 +467,10 @@ async fn forwarding_handler_serves_authenticated_upstream_response() {
     let nonce = [0xAB; 16];
     let cert_id = build_certid(42);
     let now = current_time();
-    let mut upstream_signer = hoike_sign::demo_ecdsa_p256_key();
+    let mut upstream_signer =
+        hoike_sign::EcdsaP256Signer::new(hoike_sign::demo_ecdsa_p256_key());
     let upstream_response =
-        hoike_sign::live::sign_live_response_with_window::<_, p256::ecdsa::DerSignature>(
+        hoike_sign::live::sign_live_response_with_window::<_, hoike_sign::EcdsaSignatureBytes>(
             &cert_id.to_der().unwrap(),
             hoike_sign::LiveCertStatus::Good,
             &nonce,

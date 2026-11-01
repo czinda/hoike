@@ -114,11 +114,11 @@ mod tests {
 
         let loaded = load_ecdsa_p256_key(&key_path).unwrap();
 
-        use signature::Signer;
+        use p256::ecdsa::signature::Signer;
         let msg = b"test message for signing";
-        let sig_orig: p256::ecdsa::DerSignature = original.sign(msg);
-        let sig_loaded: p256::ecdsa::DerSignature = loaded.sign(msg);
-        assert_eq!(sig_orig.to_bytes(), sig_loaded.to_bytes());
+        let sig_orig: p256::ecdsa::Signature = original.sign(msg);
+        let sig_loaded: p256::ecdsa::Signature = loaded.sign(msg);
+        assert_eq!(sig_orig.to_der().as_bytes(), sig_loaded.to_der().as_bytes());
     }
 
     #[test]
@@ -134,10 +134,10 @@ mod tests {
 
         let loaded = load_ecdsa_p256_key(&key_path).unwrap();
 
-        use signature::Signer;
-        let sig_orig: p256::ecdsa::DerSignature = original.sign(b"msg");
-        let sig_loaded: p256::ecdsa::DerSignature = loaded.sign(b"msg");
-        assert_eq!(sig_orig.to_bytes(), sig_loaded.to_bytes());
+        use p256::ecdsa::signature::Signer;
+        let sig_orig: p256::ecdsa::Signature = original.sign(b"msg");
+        let sig_loaded: p256::ecdsa::Signature = loaded.sign(b"msg");
+        assert_eq!(sig_orig.to_der().as_bytes(), sig_loaded.to_der().as_bytes());
     }
 
     #[test]

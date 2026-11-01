@@ -1757,8 +1757,8 @@ fn run_sign(
     // seal key before producing anything. Runs per loaded signer below; a
     // failure exits before any bundle is written.
     let separation_preflight = |signer: &p256::ecdsa::SigningKey| {
-        hoike_sign::ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
-            signer,
+        hoike_sign::ensure_distinct_ecdsa_seal_key::<_, hoike_sign::EcdsaSignatureBytes>(
+            &hoike_sign::EcdsaP256Signer::new(signer.clone()),
             &cli_seal_key,
         )
         .unwrap_or_else(|e| {
@@ -1780,7 +1780,7 @@ fn run_sign(
                 std::process::exit(1);
             }
         };
-        let mut ecdsa_signer = if let Some(key_path) = &signing_key_path {
+        let mut ecdsa_signer = hoike_sign::EcdsaP256Signer::new(if let Some(key_path) = &signing_key_path {
             let key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load classical signing key: {e}");
                 std::process::exit(1);
@@ -1797,7 +1797,7 @@ fn run_sign(
         } else {
             eprintln!("--dual-alg requires --signing-key (classical) or --demo-key");
             std::process::exit(1);
-        };
+        });
         let mut pq_signer = if let Some(pq_path) = &pq_signing_key_path {
             let v = hoike_sign::load_ml_dsa_key(pq_path).unwrap_or_else(|e| {
                 eprintln!("Failed to load PQ signing key: {e}");
@@ -1823,24 +1823,24 @@ fn run_sign(
         };
         match &mut pq_signer {
             hoike_sign::MlDsaSignerVariant::MlDsa44(s) => {
-                hoike_sign::produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, hoike_sign::MlDsaSignatureBytes>(
+                hoike_sign::produce_dual_bundle::<_, hoike_sign::EcdsaSignatureBytes, _, hoike_sign::MlDsaSignatureBytes>(
                     &ca, &snapshot, &config, &mut ecdsa_signer, s, disc_pq, seal_fn, None, None,
                 )
             }
             hoike_sign::MlDsaSignerVariant::MlDsa65(s) => {
-                hoike_sign::produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, hoike_sign::MlDsaSignatureBytes>(
+                hoike_sign::produce_dual_bundle::<_, hoike_sign::EcdsaSignatureBytes, _, hoike_sign::MlDsaSignatureBytes>(
                     &ca, &snapshot, &config, &mut ecdsa_signer, s, disc_pq, seal_fn, None, None,
                 )
             }
             hoike_sign::MlDsaSignerVariant::MlDsa87(s) => {
-                hoike_sign::produce_dual_bundle::<_, p256::ecdsa::DerSignature, _, hoike_sign::MlDsaSignatureBytes>(
+                hoike_sign::produce_dual_bundle::<_, hoike_sign::EcdsaSignatureBytes, _, hoike_sign::MlDsaSignatureBytes>(
                     &ca, &snapshot, &config, &mut ecdsa_signer, s, disc_pq, seal_fn, None, None,
                 )
             }
         }
     } else { match sig_alg.as_str() {
         "ecdsa-p256" => {
-            let mut signer = if let Some(key_path) = &signing_key_path {
+            let signer = if let Some(key_path) = &signing_key_path {
                 let key = hoike_sign::load_ecdsa_p256_key(key_path).unwrap_or_else(|e| {
                     eprintln!("Failed to load signing key: {e}");
                     std::process::exit(1);
@@ -1859,11 +1859,11 @@ fn run_sign(
                 eprintln!("No signing key provided. Use --signing-key <path> for a PKCS#8 key file, or --demo-key for testing.");
                 std::process::exit(1);
             };
-            hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+            hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
                 &ca,
                 &snapshot,
                 &config,
-                &mut signer,
+                &mut hoike_sign::EcdsaP256Signer::new(signer),
                 seal_fn,
                 None,
             )

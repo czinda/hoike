@@ -73,7 +73,7 @@ impl RevocationSource for MockSource {
 /// than the generator's historic fixed window.
 fn reissued_certificate(key: &p256::ecdsa::SigningKey, not_before: u64, not_after: u64) -> Vec<u8> {
     use der::{Decode, Encode};
-    use signature::Signer;
+    use p256::ecdsa::signature::Signer;
     let mut cert =
         x509_cert::Certificate::from_der(&hoike_sign::generate_seal_cert(key).unwrap()).unwrap();
     let time = |secs: u64| {
@@ -85,8 +85,8 @@ fn reissued_certificate(key: &p256::ecdsa::SigningKey, not_before: u64, not_afte
         not_before: time(not_before),
         not_after: time(not_after),
     };
-    let sig: p256::ecdsa::DerSignature = key.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(sig.as_bytes()).unwrap();
+    let sig: p256::ecdsa::Signature = key.sign(&cert.tbs_certificate.to_der().unwrap());
+    cert.signature = der::asn1::BitString::from_bytes(sig.to_der().as_bytes()).unwrap();
     cert.to_der().unwrap()
 }
 
@@ -495,13 +495,16 @@ fn same_public_key_under_different_paths_is_rejected() {
 
     // Software P-256 signer: same key rejected, independent key accepted.
     assert!(
-        ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(&ocsp_key, &same_key_seal)
-            .is_err(),
+        ensure_distinct_ecdsa_seal_key::<_, hoike_sign::EcdsaSignatureBytes>(
+            &hoike_sign::EcdsaP256Signer::new(ocsp_key.clone()),
+            &same_key_seal
+        )
+        .is_err(),
         "the same key must be rejected as both OCSP signer and seal key"
     );
     assert!(
-        ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(
-            &ocsp_key,
+        ensure_distinct_ecdsa_seal_key::<_, hoike_sign::EcdsaSignatureBytes>(
+            &hoike_sign::EcdsaP256Signer::new(ocsp_key.clone()),
             &independent_seal
         )
         .is_ok(),
@@ -715,11 +718,13 @@ enum BridgeBehavior {
 
 impl signature::Signer<BridgeEcdsaSignature> for SoftwareEcdsaBridge {
     fn try_sign(&self, msg: &[u8]) -> std::result::Result<BridgeEcdsaSignature, signature::Error> {
-        use signature::SignatureEncoding;
         match self.behavior {
             BridgeBehavior::Sign => {
-                let sig: p256::ecdsa::DerSignature = self.key.try_sign(msg)?;
-                Ok(BridgeEcdsaSignature(sig.to_vec()))
+                // ecdsa 0.17 signs via signature v3; convert to DER bytes.
+                use p256::ecdsa::signature::Signer as SignerV3;
+                let sig: p256::ecdsa::Signature =
+                    SignerV3::try_sign(&self.key, msg).map_err(|_| signature::Error::new())?;
+                Ok(BridgeEcdsaSignature(sig.to_der().as_bytes().to_vec()))
             }
             BridgeBehavior::FailSigning => Err(signature::Error::new()),
             BridgeBehavior::GarbageBytes => Ok(BridgeEcdsaSignature(b"not a signature".to_vec())),
@@ -768,11 +773,13 @@ impl signature::Signer<hoike_sign::Pkcs11EcdsaSignature> for SoftwareEcdsaBridge
         &self,
         msg: &[u8],
     ) -> std::result::Result<hoike_sign::Pkcs11EcdsaSignature, signature::Error> {
-        use signature::SignatureEncoding;
         match self.behavior {
             BridgeBehavior::Sign => {
-                let sig: p256::ecdsa::DerSignature = self.key.try_sign(msg)?;
-                hoike_sign::Pkcs11EcdsaSignature::try_from(sig.to_vec().as_slice())
+                // ecdsa 0.17 signs via signature v3; convert to DER bytes.
+                use p256::ecdsa::signature::Signer as SignerV3;
+                let sig: p256::ecdsa::Signature =
+                    SignerV3::try_sign(&self.key, msg).map_err(|_| signature::Error::new())?;
+                hoike_sign::Pkcs11EcdsaSignature::try_from(sig.to_der().as_bytes())
             }
             BridgeBehavior::FailSigning => Err(signature::Error::new()),
             BridgeBehavior::GarbageBytes => {
@@ -815,8 +822,11 @@ fn loaded_signer_errors_fail_separation_preflight() {
         (&[5u8; 32]).into(),
     ));
     assert!(
-        ensure_distinct_ecdsa_seal_key::<_, p256::ecdsa::DerSignature>(&key(0x09), &ml_dsa_seal)
-            .is_ok(),
+        ensure_distinct_ecdsa_seal_key::<_, hoike_sign::EcdsaSignatureBytes>(
+            &hoike_sign::EcdsaP256Signer::new(key(0x09)),
+            &ml_dsa_seal
+        )
+        .is_ok(),
         "an ML-DSA seal key is distinct from any ECDSA OCSP signer by algorithm"
     );
 }

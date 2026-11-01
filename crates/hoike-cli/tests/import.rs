@@ -10,7 +10,7 @@
 
 use base64::Engine;
 use der::{Decode, Encode};
-use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
+use p256::ecdsa::{SigningKey, signature::Signer};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -41,8 +41,8 @@ fn certificate(subject: &SigningKey, start: u64, end: u64) -> Vec<u8> {
         not_before: time(start),
         not_after: time(end),
     };
-    let sig: DerSignature = subject.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(sig.as_bytes()).unwrap();
+    let sig: p256::ecdsa::Signature = subject.sign(&cert.tbs_certificate.to_der().unwrap());
+    cert.signature = der::asn1::BitString::from_bytes(sig.to_der().as_bytes()).unwrap();
     cert.to_der().unwrap()
 }
 
@@ -73,11 +73,7 @@ impl Fixture {
             .unwrap()
             .to_der()
             .unwrap();
-        let issuer_key_bytes = ocsp_key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec();
+        let issuer_key_bytes = ocsp_key.verifying_key().to_sec1_bytes().to_vec();
         fs::write(dir.path().join("signer.der"), &seal_cert).unwrap();
         // Reserve an ephemeral port so failures are attributed correctly.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -109,7 +105,7 @@ impl Fixture {
     /// A real signed, CMS-sealed bundle; serial 42 is `good` or `revoked`.
     fn bundle(&self, epoch: u64, revoked: bool) -> Vec<u8> {
         let now = now();
-        let mut ocsp_key = key(1);
+        let ocsp_key = key(1);
         let ca = hoike_sign::CaIdentity {
             label: "test".into(),
             issuer_name_der: self.issuer_name_der.clone(),
@@ -139,11 +135,11 @@ impl Fixture {
         };
         let seal_key = hoike_sign::SealKey::EcdsaP256(self.seal_key.clone());
         let seal_cert = self.seal_cert.clone();
-        hoike_sign::produce_bundle::<_, DerSignature>(
+        hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &generation,
-            &mut ocsp_key,
+            &mut hoike_sign::EcdsaP256Signer::new(ocsp_key),
             move |m| hoike_sign::create_cms_seal(m, &seal_key, &seal_cert),
             None,
         )
@@ -155,15 +151,11 @@ impl Fixture {
         let now = now();
         let wrong = key(8);
         let wrong_cert = certificate(&wrong, now - 60, now + 3600);
-        let mut ocsp_key = key(2);
+        let ocsp_key = key(2);
         let ca = hoike_sign::CaIdentity {
             label: "test".into(),
             issuer_name_der: self.issuer_name_der.clone(),
-            issuer_key_bytes: ocsp_key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
+            issuer_key_bytes: ocsp_key.verifying_key().to_sec1_bytes().to_vec(),
         };
         let snapshot = hoike_sign::StatusSnapshot {
             entries: [(vec![42], hoike_sign::CertificateStatus::Good)].into(),
@@ -179,11 +171,11 @@ impl Fixture {
             jitter_secs: 0,
             ..Default::default()
         };
-        hoike_sign::produce_bundle::<_, DerSignature>(
+        hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &generation,
-            &mut ocsp_key,
+            &mut hoike_sign::EcdsaP256Signer::new(ocsp_key),
             |m| hoike_sign::create_cms_seal(m, &hoike_sign::SealKey::EcdsaP256(wrong), &wrong_cert),
             None,
         )

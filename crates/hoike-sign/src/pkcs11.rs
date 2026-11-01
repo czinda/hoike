@@ -615,7 +615,7 @@ mod tests {
     }
     #[test]
     fn raw_ecdsa_conversion_preserves_a_real_signature() {
-        use signature::{Signer, Verifier};
+        use p256::ecdsa::signature::{Signer, Verifier};
         let key = crate::demo_ecdsa_p256_key();
         let message = b"PKCS11 encoding regression";
         let signature: p256::ecdsa::Signature = key.sign(message);

@@ -60,7 +60,6 @@ toml = "0.8"
 thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 memmap2 = "0.9"
-zstd = "0.13"
 hex = "0.4"
 byteorder = "1"
 bitflags = "2"

@@ -1,6 +1,7 @@
 pub mod crl;
 #[cfg(feature = "dogtag-sync")]
 pub mod dogtag_sync;
+pub mod ecdsa_bridge;
 pub mod error;
 pub mod generate;
 pub mod keyfile;
@@ -17,6 +18,7 @@ pub mod verify;
 pub use crl::CrlSource;
 #[cfg(feature = "dogtag-sync")]
 pub use dogtag_sync::{DogtagSyncConfig, DogtagSyncSource};
+pub use ecdsa_bridge::{ECDSA_WITH_SHA256_OID, EcdsaP256Signer, EcdsaSignatureBytes};
 pub use error::{Result, SignError};
 pub use generate::datetime_to_epoch;
 pub use generate::{CertIdCompat, GenerationConfig, produce_bundle, produce_dual_bundle};

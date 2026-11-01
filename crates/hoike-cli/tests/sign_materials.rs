@@ -8,7 +8,7 @@
 //! and a failed signing run must not modify a previously written output.
 
 use der::{Decode, Encode};
-use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
+use p256::ecdsa::{SigningKey, signature::Signer};
 use p256::pkcs8::EncodePrivateKey;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -45,8 +45,8 @@ fn certificate(subject: &SigningKey, start: u64, end: u64) -> Vec<u8> {
         not_before: time(start),
         not_after: time(end),
     };
-    let sig: DerSignature = subject.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(sig.as_bytes()).unwrap();
+    let sig: p256::ecdsa::Signature = subject.sign(&cert.tbs_certificate.to_der().unwrap());
+    cert.signature = der::asn1::BitString::from_bytes(sig.to_der().as_bytes()).unwrap();
     cert.to_der().unwrap()
 }
 
@@ -147,11 +147,11 @@ fn signed_crl(issuer_key: &SigningKey, issuer_der: &[u8], now: u64) -> Vec<u8> {
         }]),
         crl_extensions: None,
     };
-    let sig: DerSignature = issuer_key.sign(&tbs.to_der().unwrap());
+    let sig: p256::ecdsa::Signature = issuer_key.sign(&tbs.to_der().unwrap());
     let crl = CertificateList {
         tbs_cert_list: tbs,
         signature_algorithm: alg,
-        signature: der::asn1::BitString::from_bytes(sig.as_bytes()).unwrap(),
+        signature: der::asn1::BitString::from_bytes(sig.to_der().as_bytes()).unwrap(),
     };
     crl.to_der().unwrap()
 }

@@ -9,7 +9,7 @@ use hoike_core::admission::{
 use hoike_core::config::{SealAuthorization, StorageConfig};
 use hoike_core::{Config, CoreError, ResponderState};
 use hoike_sign::{CertIdCompat, SealKey};
-use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
+use p256::ecdsa::{SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use uuid::Uuid;
@@ -139,14 +139,14 @@ fn issued_certificate(subject: &SigningKey, issuer: &SigningKey, ca: bool, now: 
     }
     // The synthetic subject/issuer names are both CN=hoike-seal; issuer key
     // verification, rather than name matching alone, must establish trust.
-    let signature: DerSignature = issuer.sign(&cert.tbs_certificate.to_der().unwrap());
-    cert.signature = der::asn1::BitString::from_bytes(signature.as_bytes()).unwrap();
+    let signature: p256::ecdsa::Signature = issuer.sign(&cert.tbs_certificate.to_der().unwrap());
+    cert.signature = der::asn1::BitString::from_bytes(signature.to_der().as_bytes()).unwrap();
     cert.to_der().unwrap()
 }
 
 fn signed_bundle(seal_key: &SigningKey, cert: &[u8], now: u64, compat: CertIdCompat) -> Bundle {
     // Real OCSP responses, using a key distinct from all synthetic seal keys.
-    let mut ocsp_key = signing_key(1);
+    let ocsp_key = signing_key(1);
     let ca = hoike_sign::CaIdentity {
         label: "admission-ca".into(),
         issuer_name_der: "CN=Admission CA"
@@ -154,11 +154,7 @@ fn signed_bundle(seal_key: &SigningKey, cert: &[u8], now: u64, compat: CertIdCom
             .unwrap()
             .to_der()
             .unwrap(),
-        issuer_key_bytes: ocsp_key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        issuer_key_bytes: ocsp_key.verifying_key().to_sec1_bytes().to_vec(),
     };
     let snapshot = hoike_sign::StatusSnapshot {
         entries: [(vec![42], hoike_sign::CertificateStatus::Good)].into(),
@@ -173,11 +169,11 @@ fn signed_bundle(seal_key: &SigningKey, cert: &[u8], now: u64, compat: CertIdCom
         jitter_secs: 0,
         ..Default::default()
     };
-    let bytes = hoike_sign::produce_bundle::<_, DerSignature>(
+    let bytes = hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
         &ca,
         &snapshot,
         &config,
-        &mut ocsp_key,
+        &mut hoike_sign::EcdsaP256Signer::new(ocsp_key),
         |manifest| {
             hoike_sign::create_cms_seal(manifest, &SealKey::EcdsaP256(seal_key.clone()), cert)
         },

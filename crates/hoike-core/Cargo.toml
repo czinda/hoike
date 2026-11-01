@@ -33,6 +33,6 @@ rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 hoike-sign = { path = "../hoike-sign" }
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 tempfile = "3"
 uuid = { workspace = true }

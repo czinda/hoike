@@ -837,10 +837,10 @@ async fn live_nonce_signing_returns_nonce_in_response() {
         bucket_size: 1,
         ..Default::default()
     };
-    let mut key = hoike_sign::demo_ecdsa_p256_key();
+    let mut key = hoike_sign::EcdsaP256Signer::new(hoike_sign::demo_ecdsa_p256_key());
     let seal_key = p256::ecdsa::SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
     let seal_cert = synthetic_issued_certificate(&seal_key, &seal_key, false);
-    let bundle_bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+    let bundle_bytes = hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
         &ca,
         &snapshot,
         &config,
@@ -986,7 +986,7 @@ type = "demo"
 /// independently configured synthetic issuer and remains currently valid.
 fn build_round_trip_crl_der() -> (Vec<u8>, Vec<u8>) {
     use der::Decode;
-    use signature::Signer;
+    use p256::ecdsa::signature::Signer;
     let key = hoike_sign::demo_ecdsa_p256_key();
     let cert_der = hoike_sign::generate_seal_cert(&key).unwrap();
     let cert = x509_cert::Certificate::from_der(&cert_der).unwrap();
@@ -1036,11 +1036,11 @@ fn build_round_trip_crl_der() -> (Vec<u8>, Vec<u8>) {
         crl_extensions: None,
     };
 
-    let sig: p256::ecdsa::DerSignature = key.sign(&tbs.to_der().unwrap());
+    let sig: p256::ecdsa::Signature = key.sign(&tbs.to_der().unwrap());
     let crl = CertificateList {
         tbs_cert_list: tbs,
         signature_algorithm: alg,
-        signature: BitString::from_bytes(sig.as_bytes()).unwrap(),
+        signature: BitString::from_bytes(sig.to_der().as_bytes()).unwrap(),
     };
 
     (crl.to_der().expect("CRL encoding failed"), cert_der)
@@ -1513,7 +1513,7 @@ fn batched_live_responses_preserve_requested_status_and_source_window() {
             revocation_reason: None,
         }),
     ] {
-        let mut key = hoike_sign::demo_ecdsa_p256_key();
+        let mut key = hoike_sign::EcdsaP256Signer::new(hoike_sign::demo_ecdsa_p256_key());
         let response = OcspResponseBuilder::new(x509_ocsp::ResponderId::ByKey(
             der::asn1::OctetString::new(vec![1; 20]).unwrap(),
         ))
@@ -1525,7 +1525,7 @@ fn batched_live_responses_preserve_requested_status_and_source_window() {
             SingleResponse::new(requested.clone(), status, time(now - 30))
                 .with_next_update(time(now + 60)),
         )
-        .sign::<_, p256::ecdsa::DerSignature>(&mut key, None, time(now))
+        .sign::<_, hoike_sign::EcdsaSignatureBytes>(&mut key, None, time(now))
         .unwrap()
         .to_der()
         .unwrap();
@@ -1541,7 +1541,7 @@ fn batched_live_responses_preserve_requested_status_and_source_window() {
             .is_err()
         );
         let fresh =
-            hoike_sign::live::sign_live_response_with_window::<_, p256::ecdsa::DerSignature>(
+            hoike_sign::live::sign_live_response_with_window::<_, hoike_sign::EcdsaSignatureBytes>(
                 &requested_der,
                 source.status,
                 &[7; 16],
@@ -1562,7 +1562,7 @@ fn batched_live_responses_preserve_requested_status_and_source_window() {
         assert_eq!(single.this_update, time(now - 30));
         assert_eq!(single.next_update, Some(time(now + 60)));
         assert_eq!(basic.nonce().unwrap().0.as_bytes(), &[7; 16]);
-        use signature::Verifier;
+        use p256::ecdsa::signature::Verifier;
         let signature =
             p256::ecdsa::DerSignature::from_bytes(basic.signature.as_bytes().unwrap()).unwrap();
         key.verifying_key()
@@ -1576,12 +1576,12 @@ fn live_signing_rejects_stale_or_future_source() {
     let now = current_time();
     for (this, next) in [(now - 30, now), (now + 1, now + 60)] {
         assert!(
-            hoike_sign::live::sign_live_response_with_window::<_, p256::ecdsa::DerSignature>(
+            hoike_sign::live::sign_live_response_with_window::<_, hoike_sign::EcdsaSignatureBytes>(
                 &build_certid(2).to_der().unwrap(),
                 hoike_sign::LiveCertStatus::Good,
                 &[7; 16],
                 b"KEY",
-                &mut hoike_sign::demo_ecdsa_p256_key(),
+                &mut hoike_sign::EcdsaP256Signer::new(hoike_sign::demo_ecdsa_p256_key()),
                 now,
                 this,
                 next,
@@ -1598,7 +1598,7 @@ fn synthetic_issued_certificate(
     ca: bool,
 ) -> Vec<u8> {
     use der::Decode;
-    use signature::Signer;
+    use p256::ecdsa::signature::Signer;
     let mut cert =
         x509_cert::Certificate::from_der(&hoike_sign::generate_seal_cert(subject).unwrap())
             .unwrap();
@@ -1625,10 +1625,11 @@ fn synthetic_issued_certificate(
             extn_value: der::asn1::OctetString::new(vec![0x30, 0x03, 0x01, 0x01, 0xff]).unwrap(),
         }]);
     }
-    let signature: p256::ecdsa::DerSignature = issuer.sign(&cert.tbs_certificate.to_der().unwrap());
+    let signature: p256::ecdsa::Signature = issuer.sign(&cert.tbs_certificate.to_der().unwrap());
+    let signature = signature.to_der();
     cert.signature = der::asn1::BitString::from_bytes(signature.as_bytes()).unwrap();
     {
-        use signature::Verifier;
+        use p256::ecdsa::signature::Verifier;
         issuer
             .verifying_key()
             .verify(&cert.tbs_certificate.to_der().unwrap(), &signature)
@@ -1645,7 +1646,7 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
     let anchor = synthetic_issued_certificate(&root, &root, true);
     let cert = synthetic_issued_certificate(&leaf, &root, false);
     let wrong_anchor = synthetic_issued_certificate(&wrong, &wrong, true);
-    let mut ocsp_key = p256::ecdsa::SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+    let ocsp_key = p256::ecdsa::SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
     let ca = hoike_sign::CaIdentity {
         label: "test-ca".into(),
         issuer_name_der: "CN=Test CA,O=Hoike Test"
@@ -1653,11 +1654,7 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
             .unwrap()
             .to_der()
             .unwrap(),
-        issuer_key_bytes: ocsp_key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        issuer_key_bytes: ocsp_key.verifying_key().to_sec1_bytes().to_vec(),
     };
     let now = current_time();
     let snapshot = hoike_sign::StatusSnapshot {
@@ -1686,11 +1683,11 @@ fn responder_load_enforces_cms_integrity_anchor_and_scope_authorization() {
         } else {
             leaf.clone()
         });
-        let bytes = hoike_sign::produce_bundle::<_, p256::ecdsa::DerSignature>(
+        let bytes = hoike_sign::produce_bundle::<_, hoike_sign::EcdsaSignatureBytes>(
             &ca,
             &snapshot,
             &generation,
-            &mut ocsp_key,
+            &mut hoike_sign::EcdsaP256Signer::new(ocsp_key.clone()),
             |m| hoike_sign::create_cms_seal(m, &key, &cert),
             None,
         )
@@ -1742,7 +1739,7 @@ async fn default_bundle_paths_keep_ca_scope_and_live_key_together() {
 
 async fn check_live_signers_by_ca(default_paths: bool) {
     use der::Decode;
-    use signature::Verifier;
+    use p256::ecdsa::signature::Verifier;
     use tower::ServiceExt;
     let dir = tempfile::tempdir().unwrap();
     let mut blocks = String::new();
@@ -1754,18 +1751,14 @@ async fn check_live_signers_by_ca(default_paths: bool) {
     for n in 1..=2u8 {
         let key = p256::ecdsa::SigningKey::from_bytes((&[n; 32]).into()).unwrap();
         let name = format!("CA-{n}").into_bytes();
-        let public = key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec();
+        let public = key.verifying_key().to_sec1_bytes().to_vec();
         let cid = build_certid_for_ca(42, &name, &public);
-        let source = hoike_sign::live::sign_live_response::<_, p256::ecdsa::DerSignature>(
+        let source = hoike_sign::live::sign_live_response::<_, hoike_sign::EcdsaSignatureBytes>(
             &cid.to_der().unwrap(),
             hoike_sign::LiveCertStatus::Good,
             &[1; 16],
             &public,
-            &mut key.clone(),
+            &mut hoike_sign::EcdsaP256Signer::new(key.clone()),
             current_time() - 1,
             300,
             None,
