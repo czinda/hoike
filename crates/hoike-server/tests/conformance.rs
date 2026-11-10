@@ -556,6 +556,34 @@ async fn conformance_http_cache_control() {
 }
 
 #[tokio::test]
+async fn conformance_http_cache_control_is_capped() {
+    // Using the standard test config, assert max-age <= 240.
+    let (port, _dir) = start_conformance_server().await;
+
+    let cert_id = build_certid_conformance(1);
+    let resp = post_ocsp(port, &build_request(&cert_id)).await;
+
+    let cc = resp
+        .headers()
+        .get("cache-control")
+        .expect("successful response must have Cache-Control")
+        .to_str()
+        .unwrap();
+
+    let max_age = cc
+        .split(',')
+        .map(|v| v.trim())
+        .find_map(|part| part.strip_prefix("max-age="))
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("Cache-Control must include parseable max-age");
+
+    assert!(
+        max_age <= 240,
+        "Cache-Control max-age must be capped at 240s by default; got {max_age} from: {cc}"
+    );
+}
+
+#[tokio::test]
 async fn conformance_http_etag() {
     let (port, _dir) = start_conformance_server().await;
 

@@ -62,6 +62,11 @@ pub struct ServerConfig {
     pub listen: String,
     #[serde(default = "default_max_request")]
     pub max_request: usize,
+    /// Safety cap for Cache-Control `max-age` on cacheable OCSP success
+    /// responses. The per-CA `max_age_fraction` scales advertised freshness,
+    /// but this global cap bounds what can reach CDNs/load balancers.
+    #[serde(default = "default_max_age_cap_secs")]
+    pub max_age_cap_secs: u64,
     pub admin: Option<AdminConfig>,
     pub webui: Option<WebUiConfig>,
     /// Optional dedicated listener for the Prometheus `/metrics` endpoint, e.g.
@@ -389,6 +394,9 @@ fn default_listen() -> String {
 }
 fn default_max_request() -> usize {
     8192
+}
+fn default_max_age_cap_secs() -> u64 {
+    240
 }
 fn default_state_db() -> PathBuf {
     PathBuf::from("/var/lib/hoike/state")

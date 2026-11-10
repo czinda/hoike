@@ -250,7 +250,8 @@ async fn process_request_inner(
                 "serving pre-signed response"
             );
             let status = presigned_status_label(&result.response_bytes);
-            (ocsp_success_response(&result), ca, status)
+            let cap = state.responder.config.server.max_age_cap_secs;
+            (ocsp_success_response(&result, cap), ca, status)
         }
         None => {
             // Authoritative-complete live path: when the matching scope sees
@@ -449,7 +450,7 @@ async fn forward_request(
     }
 }
 
-fn ocsp_success_response(result: &LookupResult) -> Response {
+fn ocsp_success_response(result: &LookupResult, max_age_cap_secs: u64) -> Response {
     let window = &result.window;
 
     // Per-result expiry check (the bundle-level check in process_request
@@ -476,6 +477,9 @@ fn ocsp_success_response(result: &LookupResult) -> Response {
     // until nextUpdate.
     let scaled = (validity_secs as f64 * result.max_age_fraction) as u64;
     let max_age = scaled.min(window.next_update_min.saturating_sub(now));
+
+    // Global safety cap: never advertise freshness beyond the configured bound.
+    let max_age = max_age.min(max_age_cap_secs);
 
     let cache_control = format!("max-age={max_age}, public, no-transform, must-revalidate");
 
