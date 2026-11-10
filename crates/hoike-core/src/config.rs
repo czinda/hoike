@@ -528,6 +528,12 @@ impl Config {
     }
 
     pub fn validate_for_mode(&self) -> crate::error::Result<()> {
+        if self.server.max_age_cap_secs > 300 {
+            return Err(crate::error::CoreError::Config(format!(
+                "server.max_age_cap_secs must be <= 300 seconds (got {})",
+                self.server.max_age_cap_secs
+            )));
+        }
         if let Some(g) = self.gossip.as_ref() {
             if !g.peer_keys.is_empty() {
                 return Err(crate::error::CoreError::Config("replace gossip.peer_keys with peer_identities mapping node names to public-key files".into()));

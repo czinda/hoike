@@ -555,3 +555,19 @@ fn max_chain_is_no_longer_a_configurable_field() {
     assert!(err.contains("unknown field"), "{err}");
     assert!(err.contains("max_chain"), "{err}");
 }
+
+#[test]
+fn max_age_cap_secs_is_bounded_to_five_minutes() {
+    let config = parse_config(
+        r#"
+[server]
+max_age_cap_secs = 301
+
+[storage]
+bundle_dir = "/tmp/bundles"
+"#,
+    );
+    let err = config.validate_for_mode().unwrap_err().to_string();
+    assert!(err.contains("max_age_cap_secs"), "{err}");
+    assert!(err.contains("<= 300"), "{err}");
+}
