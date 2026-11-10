@@ -514,7 +514,14 @@ fn ocsp_success_response(
     );
 
     if let Some(key) = surrogate_key {
-        headers.insert("Surrogate-Key", HeaderValue::from_str(key).unwrap());
+        match HeaderValue::from_str(key) {
+            Ok(value) => {
+                headers.insert("Surrogate-Key", value);
+            }
+            Err(e) => {
+                warn!(error = %e, surrogate_key = key, "invalid Surrogate-Key header value; skipping");
+            }
+        }
     }
 
     // Last-Modified: thisUpdate (RFC 9919 §7.2)

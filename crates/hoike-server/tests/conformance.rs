@@ -305,6 +305,18 @@ enabled = true
         format!("hoike-ocsp-conformance-ca-{entry_key_hex}"),
     );
 
+    // Invalid configured prefix must not panic the server; Surrogate-Key is skipped.
+    let (port, _dir) = start_conformance_server_with_server_extra(
+        r#"
+[server.akamai]
+enabled = true
+surrogate_key_prefix = "bad\nkey"
+"#,
+    )
+    .await;
+    let resp = post_ocsp(port, &build_request(&cert_id)).await;
+    assert!(resp.headers().get("Surrogate-Key").is_none());
+
     // Error responses must never include Surrogate-Key (even when enabled).
     let missing = build_certid_conformance(99);
     let resp = post_ocsp(port, &build_request(&missing)).await;
