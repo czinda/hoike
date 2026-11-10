@@ -184,6 +184,10 @@ fn build_request_with_nonce(cert_id: &CertId, nonce_len: usize) -> Vec<u8> {
 }
 
 async fn start_conformance_server() -> (u16, tempfile::TempDir) {
+    start_conformance_server_with_server_extra("").await
+}
+
+async fn start_conformance_server_with_server_extra(server_extra_toml: &str) -> (u16, tempfile::TempDir) {
     let (bundle_bytes, seal_cert) = build_conformance_bundle();
     let dir = tempfile::tempdir().unwrap();
     let bundle_path = dir.path().join("conformance.ahu");
@@ -196,6 +200,7 @@ async fn start_conformance_server() -> (u16, tempfile::TempDir) {
 mode = "edge"
 listen = "127.0.0.1:0"
 max_request = 8192
+{server_extra}
 
 [storage]
 bundle_dir = "{dir}"
@@ -210,6 +215,7 @@ completeness = "authoritative-complete"
 "#,
         dir = dir.path().display(),
         bundle = bundle_path.display(),
+        server_extra = server_extra_toml,
     );
 
     let config_path = dir.path().join("hoike.toml");
@@ -266,6 +272,43 @@ async fn conformance_good_serial_returns_successful() {
         ocsp.response_status,
         x509_ocsp::OcspResponseStatus::Successful,
     );
+}
+
+#[tokio::test]
+async fn conformance_surrogate_key_only_when_enabled() {
+    let cert_id = build_certid_conformance(1);
+
+    // Default config: no Surrogate-Key header.
+    let (port, _dir) = start_conformance_server().await;
+    let resp = post_ocsp(port, &build_request(&cert_id)).await;
+    assert!(resp.headers().get("Surrogate-Key").is_none());
+
+    // Enabled: cacheable success responses include Surrogate-Key.
+    let (port, _dir) =
+        start_conformance_server_with_server_extra(
+            r#"
+[server.akamai]
+enabled = true
+"#,
+        )
+        .await;
+    let resp = post_ocsp(port, &build_request(&cert_id)).await;
+    let header = resp
+        .headers()
+        .get("Surrogate-Key")
+        .expect("Surrogate-Key missing when Akamai mode enabled")
+        .to_str()
+        .unwrap();
+    let entry_key_hex = hex::encode(Sha256::digest(cert_id.to_der().unwrap()));
+    assert_eq!(
+        header,
+        format!("hoike-ocsp-conformance-ca-{entry_key_hex}"),
+    );
+
+    // Error responses must never include Surrogate-Key (even when enabled).
+    let missing = build_certid_conformance(99);
+    let resp = post_ocsp(port, &build_request(&missing)).await;
+    assert!(resp.headers().get("Surrogate-Key").is_none());
 }
 
 #[tokio::test]

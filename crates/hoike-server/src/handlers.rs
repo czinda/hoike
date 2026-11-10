@@ -251,7 +251,22 @@ async fn process_request_inner(
             );
             let status = presigned_status_label(&result.response_bytes);
             let cap = state.responder.config.server.max_age_cap_secs;
-            (ocsp_success_response(&result, cap), ca, status)
+            let surrogate_key = state
+                .responder
+                .config
+                .server
+                .akamai
+                .enabled
+                .then(|| {
+                    let prefix = &state.responder.config.server.akamai.surrogate_key_prefix;
+                    let entry_key_hex = hex::encode(cert_id.entry_key);
+                    format!("{prefix}-{ca}-{entry_key_hex}")
+                });
+            (
+                ocsp_success_response(&result, cap, surrogate_key.as_deref()),
+                ca,
+                status,
+            )
         }
         None => {
             // Authoritative-complete live path: when the matching scope sees
@@ -450,7 +465,11 @@ async fn forward_request(
     }
 }
 
-fn ocsp_success_response(result: &LookupResult, max_age_cap_secs: u64) -> Response {
+fn ocsp_success_response(
+    result: &LookupResult,
+    max_age_cap_secs: u64,
+    surrogate_key: Option<&str>,
+) -> Response {
     let window = &result.window;
 
     // Per-result expiry check (the bundle-level check in process_request
@@ -493,6 +512,10 @@ fn ocsp_success_response(result: &LookupResult, max_age_cap_secs: u64) -> Respon
         CACHE_CONTROL,
         HeaderValue::from_str(&cache_control).unwrap(),
     );
+
+    if let Some(key) = surrogate_key {
+        headers.insert("Surrogate-Key", HeaderValue::from_str(key).unwrap());
+    }
 
     // Last-Modified: thisUpdate (RFC 9919 §7.2)
     if let Ok(last_modified_time) = std::time::SystemTime::UNIX_EPOCH

@@ -86,6 +86,37 @@ pub struct ServerConfig {
     /// TLS material for the `metrics_listen` listener. Requires the `tls`
     /// feature. When unset the metrics listener stays plaintext (private-bound).
     pub metrics_tls: Option<TlsConfig>,
+
+    /// Optional Akamai-specific integration knobs.
+    #[serde(default)]
+    pub akamai: AkamaiConfig,
+}
+
+/// Akamai CDN integration settings.
+///
+/// When enabled, the server adds a `Surrogate-Key` header to **cacheable** OCSP
+/// success responses (i.e. pre-signed responses that do not carry a nonce).
+/// This supports fast targeted purges by CA label + entry key.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AkamaiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_akamai_surrogate_key_prefix")]
+    pub surrogate_key_prefix: String,
+}
+
+impl Default for AkamaiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            surrogate_key_prefix: default_akamai_surrogate_key_prefix(),
+        }
+    }
+}
+
+fn default_akamai_surrogate_key_prefix() -> String {
+    "hoike-ocsp".into()
 }
 
 /// PEM certificate/key material for a TLS-terminated listener.
